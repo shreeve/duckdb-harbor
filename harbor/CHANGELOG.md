@@ -4,6 +4,60 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 2.0.2 — 2026-10-22
+
+- **Every way a statement reads the catalog takes the catalog gate.** The
+  engine can crash when a catalog read meets a SQLite ATTACH or DETACH, and
+  harbor keeps the two apart, but three readers went unseen: a view named
+  in single quotes (`FROM 'v'`, which the engine resolves to the view),
+  `json_execute_serialized_sql(…)`, and `EXPORT DATABASE` or `COPY FROM
+  DATABASE`. Each killed the server within seconds beside an ATTACH/DETACH
+  loop, on 2.0.1 as on 2.0.0, and runs 60 s clean. A client's ATTACH or
+  DETACH of a `harbor_probe_*` name, which harbor keeps for its own use, is
+  refused.
+- **An ATTACH or DETACH that waits can be cancelled.** One waiting for a
+  statement that reads the catalog ignored its cancel, its client leaving
+  and its deadline, and held its worker. It gives up as any statement
+  does, and statements that come after it wait for it at most half a second
+  while it waits for a statement that came first, so a long or slowly read
+  answer holds the ATTACH and not the server.
+- **While a locked SQLite file keeps the views unread, statements wait
+  less.** A statement that names nothing, `SELECT 42`, passes as when the
+  views are known; one that started before they were read holds no ATTACH
+  once a listing says it reads nothing (47 s to 0.01 s measured); and the
+  server reads them again each second on its own, beside the statements
+  running, so the wait ends about a second after the file reads again, not
+  at the next ATTACH, DETACH or `/catalog`. Under ATTACH/DETACH churn
+  `SELECT 42`'s median went from 22.6 ms to 0.3 ms.
+- **One client's unread cancel answer keeps no other's waiting.** A
+  `DELETE /sql/queries/<id>` told by its statement was answered by one
+  thread, so a client that did not read its answer held every other
+  waiting cancel's answer for its socket's ten-second write timeout. Four
+  threads answer them, and a stop waits for the answers its statements
+  told. Another client's cancel answers in 0.00 s, where it took 9 s.
+- **A client that leaves while a request it pipelined waits is seen to
+  leave.** The statement ahead of the waiting request ran to its end; it is
+  stopped as any departed client's is, and the waiting request is not run.
+  A pipelining client that half-closes its connection has left.
+- **Brace expansion keeps a subscript, a slice and a comment with their
+  item.** `t.{l,m}[ 1 ]` is `t.l[ 1 ], t.m[ 1 ]`, where the group split at
+  the space; `r.{a[1:2], b}` expands, where the slice's colon made it look
+  like a struct literal; and a comment in a group comes out after each
+  alternative of the item before it, so `r.{a /* x */, b}` is
+  `r.a /* x */, r.b` and an item commented out of a long list stays out.
+  Expansion writes each alternative as it makes it: the worst case peaks
+  at 74 MB, where it took 237 MB.
+- **Brace expansion refuses three more surprises.** A group inside a list's
+  brackets (`[r.{a,b}]`, which made a list of each alternative), an empty
+  group before another (`r.{}.{a,b}`, which stopped the later groups), and
+  an item that a comma or space inside its parentheses would cut (a call
+  or a lambda such as `r.{coalesce(a, b), c}`) are each refused with a 400
+  that names the fix.
+- **`cargo clippy` passes on the harbor workspace, and the pull-request
+  gate runs it with warnings denied.** The engine layer's streams, chunks,
+  readers and VARIANT caster borrow what they point into, so the compiler
+  keeps each from outliving it. Speed is unchanged.
+
 ## 2.0.1 — 2026-10-22
 
 - **A cancel tells the truth.** DuckDB runs every statement but a SELECT to

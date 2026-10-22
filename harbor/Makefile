@@ -8,7 +8,7 @@
 # same way, through .github/actions/duckdb). `make install` copies the
 # binary to $(BIN). No step needs root.
 
-.PHONY: all harbor unit test bench install fetch-duckdb bootstrap clean
+.PHONY: all harbor unit lint test bench install fetch-duckdb bootstrap clean
 
 # The libduckdb `make fetch-duckdb` installs, and one of the places harbor
 # looks at runtime (see crates/harbor/src/engine/mod.rs for the full search
@@ -30,6 +30,10 @@ harbor:
 
 unit:
 	cargo test --release --workspace --all-features
+
+# Clippy over every crate and target, any warning a failure: the PR gate's.
+lint:
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 test: harbor
 	test/scripts/check.sh

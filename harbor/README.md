@@ -198,6 +198,13 @@ its transaction aborted, as a cancel does: a transaction with a statement
 missing does not commit. A result small enough to have been sent whole before
 the client left was not cut short, and its transaction stands.
 
+Shutting down the sending side is departure even with a request still in
+flight. A client that pipelines two requests and then half-closes — sends
+both, then `shutdown(SHUT_WR)` — has the first cancelled and the second never
+run, the same as a client that sends one request and half-closes to say it
+wants nothing more. A client that means to send a second request keeps its
+sending side open until it has the first answer.
+
 Two smaller things follow from the same machinery. Releasing a session whose
 statement is still running stops it — `{"released":false,"cancelling":true}`
 — and the connection comes back on a reaper tick after execution stops. And a
@@ -360,14 +367,20 @@ select id, raw_request.requisitionNumber, raw_request.visitDate,
 ```
 
 Items are separated by commas. Whitespace or a comment alone separates them
-too, so the comma is never required, only clearer; a comment between items
-goes with the separator and is not in the expansion. A group nests. It can sit
-anywhere in a term — `orders_{2025,2026}`, `{first,last}Name`,
-`r.{a,b}::VARCHAR` — where a term ends at whitespace, a comment, a comma, a
-parenthesis or a semicolon, whitespace being whatever the engine takes for it,
-the vertical tab and the Unicode spaces it strips among it. A cast's type
+too, so the comma is never required, only clearer. A comment between items
+goes with the item before it, and one before the first item with the first:
+it comes out after each alternative that item makes, so
+`r.{a /* the a */, b}` is `r.a /* the a */, r.b`, a line comment keeps the
+line break that ends it, and an item commented out stays a comment in the
+statement the engine runs. A group nests. It can sit anywhere in a term —
+`orders_{2025,2026}`, `{first,last}Name`, `r.{a,b}::VARCHAR` — where a term
+ends at whitespace, a comment, a comma, a parenthesis or a semicolon,
+whitespace being whatever the engine takes for it, the vertical tab and the
+Unicode spaces it strips among it. A cast's type
 parameters written right after its type name stay in the term, so
-`r.{a,b}::DECIMAL(10,2)` casts both. A type the engine reads on past a space
+`r.{a,b}::DECIMAL(10,2)` casts both, and a subscript or slice written right
+after a term stays in it whatever it holds, so `r.{a,b}[ 1 ]` and
+`r.{a,b}[i : j]` take it to both. A type the engine reads on past a space
 or comment, parameters or array bounds after one (`::DECIMAL (10,2)`,
 `::INT []`) or a type of several words (`::TIMESTAMP WITH TIME ZONE`,
 `::DOUBLE PRECISION`), would reach only the last alternative, so the
@@ -387,7 +400,13 @@ another way than the statement it came from, as when a quote its parser
 misreads is repeated or an `E` comes to begin the word before a string and
 make it take backslash escapes, is refused with a `400` that says what to
 write instead: most often a space between the group and the quote, or a plain
-space for a Unicode one. A brace that never closes leaves the statement as it
+space for a Unicode one. So is an expansion that would surprise: a group inside
+a list's brackets, `[r.{a,b}]`, which would make a list of each alternative
+rather than one list of them all; an empty group before another in its term,
+`r.{}.{a,b}`, which would leave the other unexpanded; and an item cut inside
+the parentheses of a call or a lambda at a space or comma,
+`r.{list_transform(l, lambda x: x), b}`. A call with nothing to split,
+`r.{f(a), b}`, and a group in a call inside a list, `[f(r.{a,b})]`, expand. A brace that never closes leaves the statement as it
 came; the engine then reports the syntax error at it.
 
 The expansion happens in the server, once, for every client: the REPL,

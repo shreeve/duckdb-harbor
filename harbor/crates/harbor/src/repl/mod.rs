@@ -416,11 +416,11 @@ fn ensure_server(path: &Path, spawn: &[String]) -> Result<Transport, String> {
     #[cfg(windows)]
     {
         let _ = (path, spawn);
-        return Err(
+        Err(
             "spawn-on-use needs unix sockets; on Windows run `harbor <db> start --port <p>` \
              and connect to http://127.0.0.1:<p>"
                 .into(),
-        );
+        )
     }
     #[cfg(unix)]
     {

@@ -218,6 +218,7 @@ fn osc11_appearance() -> Option<Appearance> {
 
 /// Parse an OSC 11 reply (`...rgb:RRRR/GGGG/BBBB...`, components 1-4 hex digits)
 /// into perceptual luminance in 0.0..=1.0. Split out so it is unit-testable.
+#[cfg(any(unix, test))]
 fn luminance_of(bytes: &[u8]) -> Option<f64> {
     let s = std::str::from_utf8(bytes).ok()?;
     let rest = s.split("rgb:").nth(1)?;

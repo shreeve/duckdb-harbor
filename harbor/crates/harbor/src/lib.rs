@@ -12,7 +12,7 @@ use std::{
     io::Read,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+        Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock,
         mpsc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
@@ -549,20 +549,35 @@ enum Said {
 }
 
 /// A `DELETE /sql/queries/<id>` waiting to be told whether its cancel
-/// stopped a retained statement. One thread answers them all
-/// (`answer_cancels`), so a wait holds neither a worker nor the probe lane,
-/// which answers `/ready`, renewals, releases and other cancels: the wait is
-/// the engine's longest stretch without an interrupt check, a commit that
-/// checkpoints or a `CHECKPOINT`, and the lane must not stand behind it.
+/// stopped a retained statement, or one the probe lane answers. A few
+/// threads answer them all (`answer_cancels`), so a wait holds neither a
+/// worker nor the probe lane, which answers `/ready`, renewals, releases and
+/// other cancels: the wait is the engine's longest stretch without an
+/// interrupt check, a commit that checkpoints or a `CHECKPOINT`, and the
+/// lane must not stand behind it, nor behind a client that does not read.
 struct Asked {
     told: Arc<OnceLock<bool>>,
     req: Request,
     line: Option<LogLine>,
 }
 
-/// The cancels waiting to be told, and the signal a statement gives when it
-/// tells one: at its first fetch (`SlotState::keep`) or its end.
-static ASKED: (Mutex<Vec<Asked>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+/// The cancels waiting to be told and answered, and which server's threads
+/// answer them.
+struct Asking {
+    waiting: Vec<Asked>,
+    /// The server whose `answer_cancels` threads answer, numbered from one,
+    /// or zero when none does.
+    serving: u64,
+}
+
+/// The cancels waiting, and the signal a statement gives when it tells one:
+/// at its first fetch (`SlotState::keep`) or its end.
+static ASKED: (Mutex<Asking>, Condvar) = (Mutex::new(Asking { waiting: Vec::new(), serving: 0 }), Condvar::new());
+
+/// How many threads answer the cancels told. Each answer is written whole by
+/// one of them, which a client that does not read its answer holds for as
+/// long as its socket's write timeout, while the others go on answering.
+const CANCEL_WRITERS: usize = 4;
 
 impl Asked {
     /// A statement told its canceller. Signalled under the lock the waiters
@@ -580,42 +595,66 @@ impl Asked {
     }
 }
 
-/// Answer the cancels in ASKED as their statements tell them, for the life
-/// of the process. A statement harbor abandoned at a stop never tells, and
-/// its cancel is left unanswered, as its statement is. A cancel is handed
-/// out only once the response before it on its connection is written, so
-/// its answer waits on no statement.
-fn answer_cancels() {
+/// Answer the cancels in ASKED as their statements tell them, one at a
+/// time, while `serving` is the server's; then the ones told, and end. A
+/// statement harbor abandoned at a stop never tells, and its cancel is left
+/// unanswered, as its statement is. A cancel is handed out only once the
+/// response before it on its connection is written, so its answer waits on
+/// no statement.
+fn answer_cancels(serving: u64) {
     let (asked, said) = &ASKED;
     loop {
-        let mut waiting = said
-            .wait_while(asked.lock().unwrap(), |w| !w.iter().any(|a| a.told.get().is_some()))
+        let mut asking = said
+            .wait_while(asked.lock().unwrap(), |a| {
+                a.serving == serving && !a.waiting.iter().any(|a| a.told.get().is_some())
+            })
             .unwrap();
-        let (told, rest): (Vec<Asked>, Vec<Asked>) =
-            std::mem::take(&mut *waiting).into_iter().partition(|a| a.told.get().is_some());
-        *waiting = rest;
-        drop(waiting);
-        for Asked { told, req, line } in told {
-            let status = answer_cancel(req, *told.get().unwrap()).1;
-            if let Some(line) = line {
-                line.write(status);
-            }
+        let Some(at) = asking.waiting.iter().position(|a| a.told.get().is_some()) else { return };
+        let Asked { told, req, line } = asking.waiting.swap_remove(at);
+        drop(asking);
+        let status = answer_cancel(req, *told.get().unwrap()).1;
+        if let Some(line) = line {
+            line.write(status);
         }
     }
 }
 
-/// Answer `req`, a cancel that must wait for its statement's first fetch,
-/// from `answer_cancels`, or on this thread when that cannot start.
+/// Start the threads that answer cancels for a server, numbered `serving`.
+fn spawn_answering(serving: u64) -> std::io::Result<Vec<JoinHandle<()>>> {
+    ASKED.0.lock().unwrap().serving = serving;
+    (0..CANCEL_WRITERS)
+        .map(|i| thread::Builder::new().name(format!("harbor-cancel-{i}")).spawn(move || answer_cancels(serving)))
+        .collect()
+}
+
+/// Let the threads that answer cancels end once each told is answered, and
+/// wait up to `patience` for them: one writing to a client that does not
+/// read is let go of, as a worker is.
+fn end_answering(answering: Vec<JoinHandle<()>>, patience: Duration) {
+    ASKED.0.lock().unwrap().serving = 0;
+    ASKED.1.notify_all();
+    let started = Instant::now();
+    for h in answering {
+        while !h.is_finished() && started.elapsed() < patience {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Answer `req`, a cancel told or to be told by `told`, from
+/// `answer_cancels`, or on this thread when no server's threads answer.
 fn await_cancel(req: Request, told: Arc<OnceLock<bool>>, line: Option<LogLine>) -> bool {
-    static ANSWERING: OnceLock<bool> = OnceLock::new();
-    let answering = *ANSWERING.get_or_init(|| {
-        thread::Builder::new().name("harbor-cancel".to_string()).spawn(answer_cancels).is_ok()
-    });
-    if answering {
-        ASKED.0.lock().unwrap().push(Asked { told, req, line });
+    let mut asking = ASKED.0.lock().unwrap();
+    if asking.serving != 0 {
+        asking.waiting.push(Asked { told, req, line });
+        drop(asking);
         ASKED.1.notify_all();
         return true;
     }
+    drop(asking);
     let status = answer_cancel(req, Asked::wait(&told)).1;
     if let Some(line) = line {
         line.write(status);
@@ -1262,9 +1301,14 @@ struct Running {
     /// channel is dropped, which is what `stop` does after draining.
     leases: Vec<JoinHandle<Option<Connection>>>,
     reaper: Option<JoinHandle<()>>,
+    /// Learns the names again while they are not all known
+    /// (`learn_while_unknown`).
+    learner: Option<JoinHandle<()>>,
     /// The saturation-proof lane: answers /ready and the control plane when
     /// every worker is busy, and relays sessions' statements. See probe_worker.
     probe: Option<JoinHandle<()>>,
+    /// The threads that answer cancels (`answer_cancels`).
+    answering: Vec<JoinHandle<()>>,
     addr: String,
 }
 
@@ -1283,7 +1327,8 @@ pub fn open_pool(mut con: Connection) -> Result<(), String> {
     // What --init and the workspace attached are in place, and attaching in
     // the background may still be under way. A SQLite file locked at the
     // start leaves the names to a later chance, not the start to its wait.
-    *LEARNER.lock().unwrap_or_else(PoisonError::into_inner) = Some((con.try_clone().map_err(|e| format!("harbor: {e}"))?, None));
+    *LEARNER.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some(Learner::new(con.try_clone().map_err(|e| format!("harbor: {e}"))?));
     learn_again(changing_catalog());
 
     for _ in 0..configured_pool_size() {
@@ -1406,7 +1451,9 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
         workers: Vec::new(),
         leases: Vec::new(),
         reaper: None,
+        learner: None,
         probe: None,
+        answering: Vec::new(),
         addr: addr.clone(),
     };
     let spawned = spawn_threads(&mut r, conns, lease_conns, log);
@@ -1423,7 +1470,8 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
 }
 
 /// Every thread of a server, into `r` as each starts: the workers, an
-/// executor per lease connection, the reaper and the probe lane.
+/// executor per lease connection, the reaper, the learner, the threads that
+/// answer cancels and the probe lane.
 fn spawn_threads(
     r: &mut Running,
     conns: Vec<Connection>,
@@ -1500,6 +1548,16 @@ fn spawn_threads(
             lease_reap();
         }
     })?);
+
+    // While the names of the views and macros are not all known, every
+    // statement that names anything is kept apart from an ATTACH or DETACH,
+    // so they are asked for again on a thread of their own, not only when a
+    // client attaches or detaches.
+    let stop = Arc::clone(&r.stop);
+    r.learner = Some(thread::Builder::new().name("harbor-learner".to_string()).spawn(move || learn_while_unknown(stop))?);
+
+    static SERVING: AtomicU64 = AtomicU64::new(1);
+    r.answering = spawn_answering(SERVING.fetch_add(1, Ordering::SeqCst))?;
 
     // One thread the fleet can always reach. Workers pair 1:1 with
     // connections and stream whole responses, so when every worker is busy an
@@ -1689,6 +1747,18 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
         // Prompt: the reaper sleeps in short ticks and checks the stop flag.
         let _ = h.join();
     }
+    if let Some(h) = r.learner {
+        // It looks at the stop flag between short sleeps; a listing it runs
+        // waits at most a SQLite file's own wait, and one waiting longer is
+        // let go of.
+        let started = Instant::now();
+        while !h.is_finished() && started.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+        }
+    }
     if let Some(h) = r.probe {
         // Same bounded patience as the workers: joined if it made it out of
         // its recv loop, abandoned if it is wedged writing to a dead client.
@@ -1719,6 +1789,10 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
             );
         }
     }
+
+    // The cancels told by the statements drained are answered before the
+    // server says it has stopped, and the process may leave.
+    end_answering(r.answering, Duration::from_secs(10));
 
     *SERVER.lock().unwrap() = None;
     let (lock, cv) = &STOPPED;
@@ -2117,6 +2191,11 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
             // thread (`Asked`).
             (Method::Delete, p) if p.starts_with("/sql/queries/") => {
                 match cancel_query(&percent_decoded(&p["/sql/queries/".len()..])) {
+                    // The probe lane hands its answer off too, so a client
+                    // that does not read holds no lane.
+                    Said::Now(cancelled) if exec.is_none() => {
+                        return await_cancel(req, Arc::new(OnceLock::from(cancelled)), line);
+                    }
                     Said::Now(cancelled) => answer_cancel(req, cancelled),
                     Said::Later(told) => return await_cancel(req, told, line),
                 }
@@ -4415,6 +4494,10 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         return refuse(req, Refusal::sql(lost));
     }
 
+    if let Some(reserved) = reserved_attachment(&parsed.sql) {
+        return refuse(req, Refusal::sql(reserved));
+    }
+
     let shape = if wants_one_shot(&req) { Shape::Json } else { Shape::Ndjson };
 
     // A statement naming a lease goes to that lease's connection, wherever it
@@ -4648,6 +4731,20 @@ fn lost_without_session(sql: &str) -> Option<&'static str> {
     }
 }
 
+/// Refuse a client ATTACH or DETACH of a `harbor_probe_*` name. Those are
+/// the learner's hidden probes of the attached SQLite files (`PROBE`), by
+/// which it learns which of them read: a client detaching one would leave
+/// the learner holding an entry whose file is gone, failing every probe
+/// read until a listing, and attaching one first would take a name the
+/// learner then cannot. The prefix is the server's alone.
+fn reserved_attachment(sql: &str) -> Option<&'static str> {
+    let reserved = |name: Option<Vec<u8>>| name.is_some_and(|n| n.starts_with(PROBE.as_bytes()));
+    (reserved(attached_name(sql)) || reserved(detached_name(sql))).then_some(
+        "a database named harbor_probe_… is Harbor's own: it attaches hidden probes under that prefix \
+         to learn which SQLite files read, so attach and detach your databases under other names",
+    )
+}
+
 /// Statements that can leave connection-local state need a fresh connection
 /// before another caller uses this worker. Only known state-neutral statement
 /// forms keep their parse cache; wrappers, SET, temporary DDL and unknown forms
@@ -4678,9 +4775,219 @@ fn needs_connection_reset(sql: &str) -> bool {
 // catalog, and those run beside each other and beside everything else.
 // ---------------------------------------------------------------------------
 
-/// Held exclusively by a statement that attaches or detaches, and shared by
-/// one that reads the catalog, for as long as it runs.
-static CATALOG_GATE: RwLock<()> = RwLock::new(());
+/// Shared by each statement that reads the catalog, and held alone by each
+/// that attaches or detaches, for as long as it runs ([`Share`],
+/// [`Alone`]); and the signal that it was let go of.
+static CATALOG_GATE: (Mutex<GateState>, Condvar) = (Mutex::new(GateState::new()), Condvar::new());
+
+/// How often a statement that waits at the gate looks whether it was
+/// cancelled: by its client, by leaving or by a deadline.
+const GATE_LOOK: Duration = Duration::from_millis(10);
+
+/// How long a statement waits for an ATTACH or DETACH that keeps new shares
+/// out, before it shares the gate beside it, while what the ATTACH waits for
+/// is a share it found when it began to keep them out: a long statement that
+/// came first holds the ATTACH, and then the statements after it would wait
+/// for as long as it runs.
+const PASS_BESIDE: Duration = Duration::from_millis(500);
+
+/// Who holds the catalog gate, and who waits for it.
+struct GateState {
+    /// Shares held.
+    shares: usize,
+    /// Held alone.
+    alone: bool,
+    /// The statements that wait to hold it alone and keep new shares out.
+    keeping: usize,
+    /// How many shares were given: the next share's number.
+    given: u64,
+    /// The first share given since `keeping` became more than none.
+    kept_from: u64,
+    /// While `keeping`, the shares held that were given before `kept_from`.
+    older: usize,
+    /// The shares of statements in autocommit held only because the names
+    /// were not all known, with their statements, to be let go of once the
+    /// names say a statement reads nothing (`let_unread_go`).
+    unknown: Vec<Unknown>,
+}
+
+/// A share held only because the names were not all known.
+struct Unknown {
+    number: u64,
+    sql: Arc<str>,
+    /// [`RESHAPED`] as the statement passed the gate.
+    reshaped: u64,
+    /// Still counted in `GateState::shares`.
+    held: bool,
+}
+
+impl GateState {
+    const fn new() -> Self {
+        GateState { shares: 0, alone: false, keeping: 0, given: 0, kept_from: 0, older: 0, unknown: Vec::new() }
+    }
+
+    /// A share, numbered.
+    fn give(&mut self) -> u64 {
+        self.shares += 1;
+        self.given += 1;
+        self.given - 1
+    }
+
+    /// Share `number` is let go of.
+    fn let_go(&mut self, number: u64) {
+        self.shares -= 1;
+        if self.keeping > 0 && number < self.kept_from {
+            self.older = self.older.saturating_sub(1);
+        }
+    }
+
+    /// Whether a statement that has waited `waited` may share it now.
+    fn shares_now(&self, waited: Duration) -> bool {
+        !self.alone && (self.keeping == 0 || (self.older > 0 && waited >= PASS_BESIDE))
+    }
+
+    /// Held alone, when nothing holds it.
+    fn take_alone(&mut self) -> bool {
+        let free = !self.alone && self.shares == 0;
+        self.alone |= free;
+        free
+    }
+
+    /// A statement waiting to hold it alone keeps new shares out.
+    fn keep(&mut self) {
+        self.keeping += 1;
+        if self.keeping == 1 {
+            self.kept_from = self.given;
+            self.older = self.shares;
+        }
+    }
+}
+
+fn gate_state() -> std::sync::MutexGuard<'static, GateState> {
+    CATALOG_GATE.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Wait at most `look` for the gate to be let go of.
+fn gate_wait(state: std::sync::MutexGuard<'static, GateState>, look: Duration) -> std::sync::MutexGuard<'static, GateState> {
+    CATALOG_GATE.1.wait_timeout(state, look).unwrap_or_else(PoisonError::into_inner).0
+}
+
+/// The catalog gate shared, until dropped.
+pub(crate) struct Share {
+    number: u64,
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        let mut state = gate_state();
+        let held = match state.unknown.iter().position(|u| u.number == self.number) {
+            Some(at) => state.unknown.swap_remove(at).held,
+            None => true,
+        };
+        if held {
+            state.let_go(self.number);
+        }
+        drop(state);
+        CATALOG_GATE.1.notify_all();
+    }
+}
+
+/// The catalog gate held alone, until dropped or shared (`Alone::share`).
+pub(crate) struct Alone {
+    held: bool,
+}
+
+impl Alone {
+    /// The gate shared in place of alone, with nothing let in between.
+    fn share(mut self) -> Share {
+        let mut state = gate_state();
+        state.alone = false;
+        self.held = false;
+        let number = state.give();
+        drop(state);
+        CATALOG_GATE.1.notify_all();
+        Share { number }
+    }
+}
+
+impl Drop for Alone {
+    fn drop(&mut self) {
+        if self.held {
+            gate_state().alone = false;
+            CATALOG_GATE.1.notify_all();
+        }
+    }
+}
+
+/// The gate shared now, unless it is held alone or kept.
+fn try_share() -> Option<Share> {
+    let mut state = gate_state();
+    (!state.alone && state.keeping == 0).then(|| Share { number: state.give() })
+}
+
+/// The gate shared now, unless it is held alone: for harbor's own short
+/// reads that an ATTACH or DETACH that keeps new shares out waits for.
+fn share_beside() -> Option<Share> {
+    let mut state = gate_state();
+    (!state.alone).then(|| Share { number: state.give() })
+}
+
+/// The gate held alone, by a statement on `slot` or harbor's own (`None`),
+/// once every share is let go of: new shares are kept out once `keep` says
+/// so, asked while they are not. None once the statement was cancelled
+/// while it waits, or once `patience` has passed.
+fn hold_alone(slot: Option<&SlotState>, patience: Option<Duration>, mut keep: impl FnMut() -> bool) -> Option<Alone> {
+    let began = Instant::now();
+    let mut keeping = false;
+    let mut state = gate_state();
+    loop {
+        if state.take_alone() {
+            state.keeping -= keeping as usize;
+            return Some(Alone { held: true });
+        }
+        if slot.is_some_and(SlotState::cancelled) || patience.is_some_and(|p| began.elapsed() >= p) {
+            state.keeping -= keeping as usize;
+            drop(state);
+            CATALOG_GATE.1.notify_all();
+            return None;
+        }
+        if !keeping {
+            drop(state);
+            keeping = keep();
+            state = gate_state();
+            if keeping {
+                state.keep();
+            }
+            if !state.alone && state.shares == 0 {
+                continue;
+            }
+        }
+        state = gate_wait(state, GATE_LOOK);
+    }
+}
+
+/// The gate shared, by a statement on `slot` or harbor's own (`None`), as
+/// a share in `unknown` when given one: once nothing holds it alone, and
+/// nothing keeps new shares out, or for [`PASS_BESIDE`] while an ATTACH
+/// that does waits for a share it found. None once the statement was
+/// cancelled while it waits.
+fn wait_share(slot: Option<&SlotState>, unknown: Option<(Arc<str>, u64)>) -> Option<Share> {
+    let began = Instant::now();
+    let mut state = gate_state();
+    loop {
+        if state.shares_now(began.elapsed()) {
+            let number = state.give();
+            if let Some((sql, reshaped)) = unknown {
+                state.unknown.push(Unknown { number, sql, reshaped, held: true });
+            }
+            return Some(Share { number });
+        }
+        if slot.is_some_and(SlotState::cancelled) {
+            return None;
+        }
+        state = gate_wait(state, GATE_LOOK);
+    }
+}
 
 /// What a statement is to the catalog gate.
 #[derive(Debug, PartialEq, Eq)]
@@ -4696,35 +5003,90 @@ enum Gate {
 /// The gate a statement passes, from its text. `ATTACH` and `DETACH` are
 /// read as the keyword the engine acts on, through comments and an analyzed
 /// `EXPLAIN`. A statement reads the catalog when it is a `SHOW`, `DESCRIBE`,
-/// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
-/// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
-/// `information_schema`, `sql_auto_complete` or `sqlite_query`, which reads
-/// an attached SQLite database by its name; `query` or `query_table`
-/// called, which run a statement or read a table named in a string; or a
-/// view, macro or prepared statement whose body reads it (`CatalogNames`).
-/// A name in a string or a comment does not count, and neither does a
-/// column named `query`. While the views and macros are not all learned
-/// (`CatalogNames::complete`), every statement reads the catalog, since
-/// any name may be one that does.
+/// `SUMMARIZE` or `PRAGMA`, an `EXPORT DATABASE` or a `COPY FROM DATABASE`,
+/// which read a database's catalog; or names, in its code or as a quoted or
+/// single-quoted name, a catalog function or schema: `duckdb_…`, `pragma_…`,
+/// `pg_…`, `information_schema`, `sql_auto_complete` or `sqlite_query`, which
+/// reads an attached SQLite database by its name; `json_execute_serialized_sql`,
+/// `query` or `query_table` called, which run a statement or read a table
+/// named in a string; or a view, macro or prepared statement whose body
+/// reads it (`CatalogNames`). The engine resolves a name single-quoted
+/// (`FROM 'cv'`) to the view or table of that name, so its contents are a
+/// name too; a name in a comment does not count, and neither does a column
+/// named `query`. While the views and macros are not all learned
+/// (`CatalogNames::complete`), every statement that names anything
+/// (`names_any`) reads the catalog, since any name may be one that does.
 fn catalog_gate(sql: &str) -> Gate {
     gate_of(sql, &CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner))
 }
 
+/// The gate a statement passes, and whether it reads the catalog only
+/// because the names are not all known.
+fn catalog_gate_known(sql: &str) -> (Gate, bool) {
+    let names = CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner);
+    let gate = gate_of(sql, &names);
+    let unknown = gate == Gate::Reads && !names.complete && gate_in(sql, &names, true) == Gate::Open;
+    (gate, unknown)
+}
+
 fn gate_of(sql: &str, names: &CatalogNames) -> Gate {
+    gate_in(sql, names, names.complete)
+}
+
+/// The gate as the names say, as if all known when `complete`.
+fn gate_in(sql: &str, names: &CatalogNames, complete: bool) -> Gate {
     match acting_keyword(sql).as_str() {
         "ATTACH" | "DETACH" => return Gate::Changes,
-        "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PRAGMA" => return Gate::Reads,
+        "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PRAGMA" | "EXPORT" => return Gate::Reads,
+        "COPY" if copy_from_database(sql) => return Gate::Reads,
         _ => {}
     }
     match names_in(sql, |name| catalog_word(name) || names.reads.contains(name)) {
         true => Gate::Reads,
-        false if !names.complete => Gate::Reads,
+        false if !complete && names_any(sql) => Gate::Reads,
         false => Gate::Open,
     }
 }
 
+/// The engine's reserved keywords (`duckdb_keywords()`). One is a name only
+/// quoted, or as the part after a `.` of a name whose first part is not
+/// one.
+const RESERVED: &[&[u8]] = &[
+    b"all", b"analyse", b"analyze", b"and", b"any", b"array", b"as", b"asc", b"asymmetric", b"both", b"case",
+    b"cast", b"check", b"collate", b"column", b"constraint", b"create", b"default", b"deferrable", b"desc",
+    b"describe", b"distinct", b"do", b"else", b"end", b"except", b"false", b"fetch", b"for", b"foreign", b"from",
+    b"group", b"having", b"in", b"initially", b"intersect", b"into", b"lambda", b"lateral", b"leading", b"limit",
+    b"not", b"null", b"offset", b"on", b"only", b"or", b"order", b"pivot", b"pivot_longer", b"pivot_wider",
+    b"placing", b"primary", b"qualify", b"references", b"returning", b"select", b"show", b"some", b"summarize",
+    b"symmetric", b"table", b"then", b"to", b"trailing", b"true", b"union", b"unique", b"unpivot", b"using",
+    b"variadic", b"when", b"where", b"window", b"with",
+];
+
+/// Whether a statement names anything a view, a macro or a catalog
+/// function may be: a quoted or single-quoted name (the engine resolves
+/// `FROM 'cv'` to the view `cv`), or a word of its code that is neither
+/// a reserved keyword nor a number, digits and `_` after a digit.
+/// `SELECT 42` names nothing.
+fn names_any(sql: &str) -> bool {
+    let plain = wire::scan::plain_spaces(sql.as_bytes());
+    let bytes = &*plain;
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    wire::scan::spans(bytes).iter().any(|span| {
+        let text = &bytes[span.start..span.end];
+        match span.kind {
+            wire::scan::Kind::Code => text.split(|&c| !is_word(c)).filter(|word| !word.is_empty()).any(|word| {
+                let number = word[0].is_ascii_digit() && word.iter().all(|&c| c.is_ascii_digit() || c == b'_');
+                !number && !RESERVED.contains(&word.to_ascii_lowercase().as_slice())
+            }),
+            wire::scan::Kind::Str => matches!(text.first(), Some(b'"' | b'`' | b'\'')),
+            _ => false,
+        }
+    })
+}
+
 /// Whether a name, lowercased, is one of the engine's catalog functions or
-/// schemas, as `names_in` passes it: `query` and `query_table` count
+/// schemas, as `names_in` passes it: `json_execute_serialized_sql` runs the
+/// SQL text it is given, as `query(` does; `query` and `query_table` count
 /// called, as `query(` and `query_table(`, and a column of either name does
 /// not.
 fn catalog_word(word: &[u8]) -> bool {
@@ -4732,6 +5094,7 @@ fn catalog_word(word: &[u8]) -> bool {
         || word == b"information_schema"
         || word == b"sql_auto_complete"
         || word == b"sqlite_query"
+        || word == b"json_execute_serialized_sql"
         || word == b"query("
         || word == b"query_table("
 }
@@ -4741,10 +5104,14 @@ fn catalog_word(word: &[u8]) -> bool {
 const CALLED: [&[u8]; 2] = [b"query", b"query_table"];
 
 /// Each name a statement uses, lowercased, as the engine matches names: a
-/// word of its code, or a name quoted in `"` or `` ` ``, until `found` says
-/// it is the one looked for. Whether one was. Its spaces are the engine's
-/// (`wire::scan::plain_spaces`), and one of the `CALLED` names followed by
-/// `(`, past spaces and comments, is passed with it: `query(`.
+/// word of its code, a name quoted in `"` or `` ` ``, or a single-quoted
+/// string, until `found` says it is the one looked for. The engine resolves
+/// a single-quoted string to the view or table it names wherever a relation
+/// may stand (`FROM 'cv'`, `FROM ('cv')`, `USING 'cv'`, `COPY 'cv' TO …`),
+/// so every one counts: one that is only a value costs the shared gate at
+/// most. Whether one was. Its spaces are
+/// the engine's (`wire::scan::plain_spaces`), and one of the `CALLED` names
+/// followed by `(`, past spaces and comments, is passed with it: `query(`.
 fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
     let plain = wire::scan::plain_spaces(sql.as_bytes());
@@ -4763,7 +5130,8 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
             wire::scan::Kind::Code => {
                 let mut i = span.start;
                 while i < span.end {
-                    if !is_word(bytes[i]) {
+                    let c = bytes[i];
+                    if !is_word(c) {
                         i += 1;
                         continue;
                     }
@@ -4771,12 +5139,13 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
                     while i < span.end && is_word(bytes[i]) {
                         i += 1;
                     }
-                    if used(&bytes[start..i], &spans[at..], i) {
+                    let word = &bytes[start..i];
+                    if used(word, &spans[at..], i) {
                         return true;
                     }
                 }
             }
-            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) => {
+            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`' | b'\'')) => {
                 let quote = text[0];
                 let name = text[1..].strip_suffix(&[quote]).unwrap_or(&text[1..]);
                 if used(name, &spans[at + 1..], span.end) {
@@ -4995,17 +5364,19 @@ const LISTING: &str = "SELECT json_array(view_name, sql)::VARCHAR FROM duckdb_vi
 /// not complete until a listing succeeds.
 fn learn_catalog_names(conn: &mut Connection) {
     let began = CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).unsettled;
+    let reshaped = RESHAPED.load(Ordering::SeqCst);
     let listed = conn.query_strings(LISTING).map_err(|e| e.into_text());
-    learn_listed(began, listed);
+    learn_listed(began, reshaped, listed);
 }
 
 /// Whether the last listing failed, so the next that succeeds says so.
 static UNLISTED: AtomicBool = AtomicBool::new(false);
 
 /// Learn the rows of a listing begun when the names had been unsettled
-/// `began` times: complete when it succeeded and nothing unsettled them
-/// since.
-fn learn_listed(began: u64, listed: Result<Vec<String>, String>) {
+/// `began` times, and [`RESHAPED`] was `reshaped`: complete when it
+/// succeeded and nothing unsettled them since, and then the statements it
+/// says read nothing are let go of (`let_unread_go`).
+fn learn_listed(began: u64, reshaped: u64, listed: Result<Vec<String>, String>) {
     let rows = match listed {
         Ok(rows) => rows,
         Err(e) => {
@@ -5033,13 +5404,120 @@ fn learn_listed(began: u64, listed: Result<Vec<String>, String>) {
         if UNLISTED.swap(false, Ordering::Relaxed) {
             eprintln!("harbor: the views and macros that read the catalog are read from it");
         }
+        let_unread_go(&names, reshaped);
+    }
+}
+
+/// How many times a statement that may drop, replace or rename a view or
+/// a macro (`reshapes`) began or ended, so a listing knows whether the
+/// views a statement running reads may be ones it did not see.
+static RESHAPED: AtomicU64 = AtomicU64::new(0);
+
+/// How many such statements have begun and not ended.
+static RESHAPING: AtomicUsize = AtomicUsize::new(0);
+
+/// A statement that may drop, replace or rename a view or a macro, counted
+/// from when it has passed the gate until it has ended.
+struct Reshaping;
+
+impl Reshaping {
+    fn begin() -> Self {
+        RESHAPING.fetch_add(1, Ordering::SeqCst);
+        RESHAPED.fetch_add(1, Ordering::SeqCst);
+        Reshaping
+    }
+}
+
+impl Drop for Reshaping {
+    fn drop(&mut self) {
+        RESHAPED.fetch_add(1, Ordering::SeqCst);
+        RESHAPING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether a statement may drop, replace or rename a view or a macro, or
+/// make visible a transaction's that did: every statement but those that
+/// read or write rows, begin a transaction, or set a setting.
+fn reshapes(sql: &str) -> bool {
+    !matches!(
+        acting_keyword(sql).as_str(),
+        "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" | "INSERT" | "UPDATE" | "DELETE" | "BEGIN" | "START"
+            | "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PIVOT" | "UNPIVOT" | "EXPLAIN" | "CHECKPOINT" | "ANALYZE"
+            | "VACUUM" | "SET" | "RESET" | "USE"
+    )
+}
+
+/// Let go of the shares held only because the names were not all known,
+/// by statements in autocommit the names, now complete by a listing begun
+/// when [`RESHAPED`] was `reshaped`, say read nothing: a statement that
+/// passes the gate open now. Only those that passed the gate when it was
+/// `reshaped`, and while nothing has reshaped since nor is reshaping: each
+/// began its transaction after the last view it may read was made, and the
+/// listing read every one of them.
+fn let_unread_go(names: &CatalogNames, reshaped: u64) {
+    if RESHAPING.load(Ordering::SeqCst) != 0 || RESHAPED.load(Ordering::SeqCst) != reshaped {
+        return;
+    }
+    let mut state = gate_state();
+    let mut let_go = Vec::new();
+    for u in state.unknown.iter_mut().filter(|u| u.held && u.reshaped == reshaped) {
+        if gate_of(&u.sql, names) == Gate::Open {
+            u.held = false;
+            let_go.push(u.number);
+        }
+    }
+    for number in &let_go {
+        state.let_go(*number);
+    }
+    drop(state);
+    if !let_go.is_empty() {
+        CATALOG_GATE.1.notify_all();
     }
 }
 
 /// The connection the views and macros are learned on after the pool
-/// opens: one of its own, outside every session's transaction; and when
-/// `learn_again` last found a SQLite file busy.
-static LEARNER: Mutex<Option<(Connection, Option<Instant>)>> = Mutex::new(None);
+/// opens: one of its own, outside every session's transaction.
+static LEARNER: Mutex<Option<Learner>> = Mutex::new(None);
+
+struct Learner {
+    conn: Connection,
+    /// When a probe last found a SQLite file busy.
+    busy_at: Option<Instant>,
+    /// The attached SQLite files' probes, by path: hidden attachments of
+    /// their own, which the engine's listing does not read, kept while the
+    /// names are not all known, so a probe asks whether a file reads beside
+    /// the statements running, with the gate shared, and is attached and
+    /// detached only with it held alone (`busy_sqlite`, `let_probes_go`).
+    probes: Vec<(String, String)>,
+}
+
+impl Learner {
+    fn new(conn: Connection) -> Self {
+        Learner { conn, busy_at: None, probes: Vec::new() }
+    }
+
+    fn asked_lately(&self) -> bool {
+        self.busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN)
+    }
+
+    /// Say a file found busy, as `why`, once until the names are read.
+    fn found_busy(&mut self, why: &str) {
+        self.busy_at = Some(Instant::now());
+        if !UNLISTED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "harbor: the views and macros that read the catalog are not read while {why}, and until they \
+                 are, an ATTACH or DETACH waits for every statement running"
+            );
+        }
+    }
+
+    /// Detach every probe, under the gate held alone.
+    fn let_probes_go(&mut self) {
+        for (_, probe) in std::mem::take(&mut self.probes) {
+            let _ = self.conn.execute_batch(&format!("DETACH {}", wire::open::quote_ident(&probe)));
+        }
+    }
+}
 
 /// How long `learn_again` waits after it found a SQLite file busy before it
 /// asks again.
@@ -5057,42 +5535,113 @@ const PROBE: &str = "harbor_probe_";
 /// again no sooner than [`ASK_AGAIN`], so a client attaching and detaching
 /// over and over does not hold the gate for the asking. Then the gate is
 /// shared for the listing: statements run beside it, and only an ATTACH or
-/// DETACH waits.
-pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
-    if CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete {
-        return;
-    }
+/// DETACH waits. When the names are complete, the probes kept are let go.
+pub(crate) fn learn_again(alone: Alone) {
     {
         let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some((conn, busy_at)) = learner.as_mut() else { return };
-        if busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+        let Some(learner) = learner.as_mut() else { return };
+        if names_complete() {
+            learner.let_probes_go();
             return;
         }
-        *busy_at = None;
-        let busy = busy_sqlite(conn);
-        if busy.is_none() {
-            UNREAD_BESIDE.store(false, Ordering::SeqCst);
-        }
-        if let Some(why) = busy {
-            *busy_at = Some(Instant::now());
-            if !UNLISTED.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "harbor: the views and macros that read the catalog are not read while {why}, and until they \
-                     are, an ATTACH or DETACH waits for every statement running"
-                );
-            }
+        if learner.asked_lately() {
             return;
+        }
+        learner.busy_at = None;
+        match busy_sqlite(learner, true) {
+            Ok(None) => UNREAD_BESIDE.store(false, Ordering::SeqCst),
+            Ok(Some(why)) | Err(why) => return learner.found_busy(&why),
         }
     }
     // The learner is let go first: a statement holding the gate shared may
-    // wait for it, and a share asked for while an ATTACH waits is not given.
-    // A statement that would share the gate only because the names are not
-    // all known waits for the listing (`LEARNING`), and then for what it
-    // learned, rather than hold the gate for as long as it runs.
+    // wait for it. The gate is shared in place of alone, so the listing
+    // waits for nothing. A statement that would share the gate only because
+    // the names are not all known waits for the listing (`LEARNING`), and
+    // then for what it learned, rather than hold the gate for as long as it
+    // runs.
     let _learning = Learning::begin();
-    drop(alone);
-    let _reading = reading_catalog();
+    let _reading = alone.share();
     learn_on_learner();
+}
+
+/// Learn again beside the statements running, sharing the gate even
+/// beside an ATTACH or DETACH that keeps new shares out, which waits for
+/// what this learns: when every attached SQLite file has a probe kept, and
+/// each reads. Whether it asked; it did not when a file has no probe.
+fn learn_on_probes() -> bool {
+    let Some(_reading) = share_beside() else { return false };
+    let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(learner) = learner.as_mut() else { return true };
+    if names_complete() || learner.asked_lately() {
+        return true;
+    }
+    match busy_sqlite(learner, false) {
+        Ok(None) => UNREAD_BESIDE.store(false, Ordering::SeqCst),
+        Ok(Some(why)) => {
+            learner.found_busy(&why);
+            return true;
+        }
+        Err(_) => return false,
+    }
+    let _learning = Learning::begin();
+    learn_catalog_names(&mut learner.conn);
+    true
+}
+
+/// How often harbor asks again on its own while the names are not all
+/// known (`learn_while_unknown`), at first and while a SQLite file does not
+/// read, and the longest it waits between asking after listings that
+/// failed.
+const LEARN_EVERY: Duration = Duration::from_secs(1);
+const LEARN_LONGEST: Duration = Duration::from_secs(30);
+
+/// How long harbor's own asking keeps new shares of the gate out while it
+/// waits for the gate alone, before it gives up for the turn.
+const LEARN_PATIENCE: Duration = Duration::from_millis(20);
+
+/// Learn again on harbor's own, until `stop`, each [`LEARN_EVERY`] while
+/// the names are not all known, so they are known again soon after a
+/// SQLite file that did not read reads again, without waiting for a
+/// client's ATTACH, DETACH or `/catalog`: on the probes kept, beside the
+/// statements running (`learn_on_probes`), or as `learn_again` asks, once
+/// the gate is free for it within [`LEARN_PATIENCE`]. After a listing that
+/// failed, asked half as often each time, up to [`LEARN_LONGEST`]. Once the
+/// names are complete, the probes kept are let go, the readers running kept
+/// out once until they drain, so steady overlapping readers do not keep the
+/// probes attached.
+fn learn_while_unknown(stop: Arc<AtomicBool>) {
+    let mut every = LEARN_EVERY;
+    let mut asked = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(100));
+        if asked.elapsed() < every {
+            continue;
+        }
+        asked = Instant::now();
+        if names_complete() {
+            every = LEARN_EVERY;
+            let kept = LEARNER.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|l| !l.probes.is_empty());
+            // Keep new shares out and wait for the readers running to drain,
+            // then detach the probes. One wait, bounded by those readers,
+            // rather than a 20 ms hold-out retried each second, which under
+            // steady overlapping readers never finds its gap, so the probes
+            // would linger and new readers stall 20 ms every second. A stop
+            // drains the readers, so this does not hold the learner at it.
+            if kept && let Some(alone) = hold_alone(None, None, || true) {
+                learn_again(alone);
+            }
+            continue;
+        }
+        if !learn_on_probes() {
+            let Some(alone) = hold_alone(None, Some(LEARN_PATIENCE), || true) else { continue };
+            learn_again(alone);
+        }
+        let busy = LEARNER.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(Learner::asked_lately);
+        every = match names_complete() || busy {
+            true => LEARN_EVERY,
+            false => (every * 2).min(LEARN_LONGEST),
+        };
+    }
 }
 
 /// How long an ATTACH or DETACH that waits while the names are not all
@@ -5140,22 +5689,18 @@ fn learn_beside() -> bool {
     if UNREAD_BESIDE.load(Ordering::SeqCst) {
         return false;
     }
-    let _reading = match CATALOG_GATE.try_read() {
-        Ok(guard) => guard,
-        Err(TryLockError::Poisoned(p)) => p.into_inner(),
-        Err(TryLockError::WouldBlock) => return true,
-    };
+    let Some(_reading) = try_share() else { return true };
     let Ok(mut learner) = LEARNER.try_lock() else { return true };
-    let Some((conn, busy_at)) = learner.as_mut() else { return false };
+    let Some(learner) = learner.as_mut() else { return false };
     if names_complete() {
         return true;
     }
-    if busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+    if learner.asked_lately() {
         return false;
     }
-    learn_catalog_names(conn);
+    learn_catalog_names(&mut learner.conn);
     if !names_complete() {
-        *busy_at = Some(Instant::now());
+        learner.busy_at = Some(Instant::now());
         UNREAD_BESIDE.store(true, Ordering::SeqCst);
         return false;
     }
@@ -5179,37 +5724,58 @@ fn learn_after_reading() {
 /// Learn on [`LEARNER`], under the gate the caller holds.
 fn learn_on_learner() {
     let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((conn, _)) = learner.as_mut() {
-        learn_catalog_names(conn);
+    if let Some(learner) = learner.as_mut() {
+        learn_catalog_names(&mut learner.conn);
     }
 }
 
 /// An attached SQLite file that does not read for the moment, and why: each
-/// asked as `reads_alone` asks it, on an attachment of its own that waits
-/// [`PROBE_BUSY_MS`] on a lock, under the gate held alone.
-fn busy_sqlite(conn: &mut Connection) -> Option<String> {
+/// asked as `reads_alone` asks it, on a probe of its own that waits
+/// [`PROBE_BUSY_MS`] on a lock, kept in `learner.probes`. With the gate
+/// held alone (`alone`), a file without a probe has one attached, and a
+/// probe whose file is no longer attached is detached; with it shared, a
+/// file without a probe is an `Err`.
+fn busy_sqlite(learner: &mut Learner, alone: bool) -> Result<Option<String>, String> {
+    let conn = &mut learner.conn;
     let paths = match conn.query_strings(
         "SELECT path FROM duckdb_databases() WHERE type = 'sqlite' AND path IS NOT NULL AND path NOT IN ('', ':memory:')",
     ) {
         Ok(paths) => paths,
-        Err(e) => return Some(format!("the attached databases do not list: {}", e.into_text())),
+        Err(e) => return Ok(Some(format!("the attached databases do not list: {}", e.into_text()))),
     };
     let quote = wire::open::quote_literal;
-    paths.iter().find_map(|path| {
-        let probe = format!("{PROBE}{}", next_job_id());
-        let name = wire::open::quote_ident(&probe);
-        let attach = format!("ATTACH {} AS {name} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)", quote(path));
-        let read = conn.execute_batch(&attach).and_then(|()| {
-            let read = conn.query_strings(&format!(
-                "SELECT count(*)::VARCHAR FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
-                quote(&probe)
-            ));
-            let _ = conn.execute_batch(&format!("DETACH {name}"));
-            read
-        });
-        let why = |e: crate::engine::Error| e.into_text().split("\nLINE ").next().unwrap_or_default().trim().to_string();
-        read.err().map(|e| format!("{path} does not read ({})", why(e)))
-    })
+    if alone {
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut learner.probes).into_iter().partition(|(p, _)| paths.contains(p));
+        for (_, probe) in gone {
+            let _ = conn.execute_batch(&format!("DETACH {}", wire::open::quote_ident(&probe)));
+        }
+        learner.probes = kept;
+    }
+    let why = |e: crate::engine::Error| e.into_text().split("\nLINE ").next().unwrap_or_default().trim().to_string();
+    for path in &paths {
+        let probe = match learner.probes.iter().find(|(p, _)| p == path) {
+            Some((_, probe)) => probe.clone(),
+            None if !alone => return Err(format!("{path} has no probe")),
+            None => {
+                let probe = format!("{PROBE}{}", next_job_id());
+                let name = wire::open::quote_ident(&probe);
+                let attach = format!("ATTACH {} AS {name} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)", quote(path));
+                if let Err(e) = conn.execute_batch(&attach) {
+                    return Ok(Some(format!("{path} does not read ({})", why(e))));
+                }
+                learner.probes.push((path.clone(), probe.clone()));
+                probe
+            }
+        };
+        let read = conn.query_strings(&format!(
+            "SELECT count(*)::VARCHAR FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
+            quote(&probe)
+        ));
+        if let Err(e) = read {
+            return Ok(Some(format!("{path} does not read ({})", why(e))));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a statement brings views and macros the engine makes, read from
@@ -5222,17 +5788,21 @@ fn brings_views(sql: &str) -> bool {
     match acting_keyword(sql).as_str() {
         "ATTACH" => !attaches_sqlite(sql),
         "IMPORT" => true,
-        "COPY" => {
-            let mut tokens = Vec::new();
-            names_in_order(sql, &mut tokens);
-            let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(t)) if t == w.as_bytes());
-            tokens
-                .iter()
-                .position(|t| word(Some(t), "copy"))
-                .is_some_and(|at| word(tokens.get(at + 1), "from") && word(tokens.get(at + 2), "database"))
-        }
+        "COPY" => copy_from_database(sql),
         _ => false,
     }
+}
+
+/// Whether a statement is `COPY FROM DATABASE`, which reads a database's
+/// catalog, as against a `COPY` that reads or writes rows.
+fn copy_from_database(sql: &str) -> bool {
+    let mut tokens = Vec::new();
+    names_in_order(sql, &mut tokens);
+    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(t)) if t == w.as_bytes());
+    tokens
+        .iter()
+        .position(|t| word(Some(t), "copy"))
+        .is_some_and(|at| word(tokens.get(at + 1), "from") && word(tokens.get(at + 2), "database"))
 }
 
 /// Whether an `ATTACH` attaches a SQLite file, as the engine reads the
@@ -5467,59 +6037,50 @@ fn names_in_order(sql: &str, tokens: &mut Vec<Token>) {
     }
 }
 
-/// The gate as a statement holds it: one guard or the other, or neither.
+/// The gate as a statement holds it: shared, alone, or neither.
 /// Held, and asked only which it is; dropped when the statement is over.
 #[allow(dead_code)]
 enum Passed {
     Open,
-    Reading(RwLockReadGuard<'static, ()>),
-    Changing(RwLockWriteGuard<'static, ()>),
+    Reading(Share),
+    Changing(Alone),
 }
 
-/// Pass the gate for `sql`, the statement running on `slot`. A reader
-/// waits on an attach or detach, and gives up when the statement is
-/// cancelled while it waits: by its client, by leaving or by a deadline.
-/// One that attaches or detaches waits for the readers running, each a
-/// catalog read the engine answers from memory or a database's file, and
-/// readers that come after it wait for it.
+/// Pass the gate for `sql`, the statement running on `slot`, in
+/// autocommit when `autocommit`. A reader waits on an attach or detach,
+/// and gives up when the statement is cancelled while it waits: by its
+/// client, by leaving or by a deadline. One that attaches or detaches
+/// waits for the readers running, each a catalog read the engine answers
+/// from memory or a database's file, and keeps readers that come after it
+/// out, each for at most [`PASS_BESIDE`] while it waits for a reader it
+/// found; it gives up as a reader does.
 ///
 /// While the names are not all known (`CatalogNames::complete`), every
-/// statement is a reader, and a long one would hold an ATTACH, and every
-/// reader after it, for as long as it runs. So a reader waits for a listing
-/// begun (`LEARNING`) and passes as the names it learned say; and an ATTACH
-/// or DETACH does not keep readers out while it waits, but asks for the
-/// names beside them (`learn_beside`), and waits as any once they are
-/// known, or once it has asked for [`ASK_BESIDE`] and asking cannot learn
-/// them for now: readers that overlap would otherwise keep it out for as
-/// long as they came, and the names may not read for longer, while a SQLite
-/// file stays locked.
-fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
-    let gate = catalog_gate(sql);
-    let mut unknown = gate == Gate::Reads && !names_complete();
-    let asking = Instant::now();
+/// statement that names anything is a reader, and a long one would hold an
+/// ATTACH for as long as it runs. So a reader that reads only because they
+/// are not known waits for a listing begun (`LEARNING`) and passes as the
+/// names it learned say, and one in autocommit is let go of once a listing
+/// says it reads nothing (`let_unread_go`); and an ATTACH or DETACH does
+/// not keep readers out while it waits, but asks for the names beside them (`learn_beside`), and
+/// keeps them out once they are known, or once it has asked for
+/// [`ASK_BESIDE`] and asking cannot learn them for now: readers that
+/// overlap would otherwise keep it out for as long as they came, and the
+/// names may not read for longer, while a SQLite file stays locked.
+fn pass_gate(sql: &str, slot: &SlotState, autocommit: bool) -> Option<Passed> {
+    let (gate, mut unknown) = catalog_gate_known(sql);
     match gate {
         Gate::Open => Some(Passed::Open),
-        Gate::Changes => loop {
-            if names_complete() {
-                return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
-            }
-            match CATALOG_GATE.try_write() {
-                Ok(guard) => return Some(Passed::Changing(guard)),
-                Err(TryLockError::Poisoned(p)) => return Some(Passed::Changing(p.into_inner())),
-                Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
-                Err(TryLockError::WouldBlock) if !learn_beside() && asking.elapsed() >= ASK_BESIDE => {
-                    return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
-                }
-                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
-            }
-        },
-        Gate::Reads => loop {
-            if unknown && LEARNING.load(Ordering::SeqCst) > 0 {
+        Gate::Changes => {
+            let asking = Instant::now();
+            let keep = || names_complete() || (!learn_beside() && asking.elapsed() >= ASK_BESIDE);
+            hold_alone(Some(slot), None, keep).map(Passed::Changing)
+        }
+        Gate::Reads => {
+            while unknown && LEARNING.load(Ordering::SeqCst) > 0 {
                 if slot.cancelled() {
                     return None;
                 }
                 thread::sleep(Duration::from_millis(1));
-                continue;
             }
             if unknown && names_complete() {
                 unknown = false;
@@ -5527,26 +6088,22 @@ fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
                     return Some(Passed::Open);
                 }
             }
-            match CATALOG_GATE.try_read() {
-                Ok(guard) => return Some(Passed::Reading(guard)),
-                Err(TryLockError::Poisoned(p)) => return Some(Passed::Reading(p.into_inner())),
-                Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
-                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
-            }
-        },
+            let unknown = (unknown && autocommit).then(|| (Arc::from(sql), RESHAPED.load(Ordering::SeqCst)));
+            wait_share(Some(slot), unknown).map(Passed::Reading)
+        }
     }
 }
 
 /// The gate shared, for harbor's own reads of the catalog off the pool's
 /// executors: the workspace's record, written as the server stops.
-pub(crate) fn reading_catalog() -> RwLockReadGuard<'static, ()> {
-    CATALOG_GATE.read().unwrap_or_else(PoisonError::into_inner)
+pub(crate) fn reading_catalog() -> Share {
+    wait_share(None, None).expect("a share harbor asks for is not cancelled")
 }
 
 /// The gate held alone, for harbor's own attaching off the pool's
 /// executors: the workspace's SQLite files, attached in the background.
-pub(crate) fn changing_catalog() -> RwLockWriteGuard<'static, ()> {
-    CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)
+pub(crate) fn changing_catalog() -> Alone {
+    hold_alone(None, None, || true).expect("harbor's own wait is not cancelled")
 }
 
 /// Final rollback during server shutdown, before returning connections.
@@ -5699,19 +6256,23 @@ fn run_statement(
     };
     let mut stream = match conn.execute(last, bound, wanted) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            let _ = ready.send(Err(on_slot.refuse(conn, String::new())));
-            return needs_reset;
-        }
-        Err(e) => {
-            // A group's first step failed (`Conn::execute`): what it did
-            // is the error's, as at a first fetch below.
-            if awaiting && !e.interrupted() {
-                on_slot.slot.keep();
+        // Nothing to stream. What came back borrows the connection while it
+        // lives, so it is taken apart before the connection is handed on.
+        executed => match executed.err() {
+            None => {
+                let _ = ready.send(Err(on_slot.refuse(conn, String::new())));
+                return needs_reset;
             }
-            let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
-            return true;
-        }
+            Some(e) => {
+                // A group's first step failed (`Conn::execute`): what it did
+                // is the error's, as at a first fetch below.
+                if awaiting && !e.interrupted() {
+                    on_slot.slot.keep();
+                }
+                let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
+                return true;
+            }
+        },
     };
     let columns = std::mem::take(&mut stream.columns);
     let api = conn.api();
@@ -5794,11 +6355,18 @@ fn run_statement(
             on_slot.slot.keep();
             awaiting = false;
         }
-        let fetched = next.and_then(|next| match next {
-            None => Ok(None),
-            Some(chunk) => chunk.readers(columns.len()).map(|r| Some((chunk, r))),
-        });
-        let (chunk, readers) = match fetched {
+        // The chunk is held out here, for the readers to borrow.
+        let mut held = None;
+        let fetched = match next {
+            Ok(Some(chunk)) => {
+                let chunk = held.insert(chunk);
+                let rows = chunk.rows();
+                chunk.readers(columns.len()).map(|r| Some((rows, r)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let (rows, readers) = match fetched {
             Ok(Some(pair)) => pair,
             // The end, where the statement is retired. One a canceller
             // reached first is answered as cancelled: the engine can finish
@@ -5844,7 +6412,7 @@ fn run_statement(
             }
         };
 
-        for row in 0..chunk.rows {
+        for row in 0..rows {
             // Encoded straight into `buf` behind a mark: a failing cell
             // discards the half-written row with truncate(). Cells are read
             // from vector views, and an engine failure mid-cell surfaces as
@@ -6091,12 +6659,13 @@ fn execute_jobs(
         learn_from_statement(&sql);
         let brings = brings_views(&sql);
         let probe = detached_name(&sql).or_else(|| attached_name(&sql)).is_some_and(|n| n.starts_with(PROBE.as_bytes()));
-        let Some(passed) = pass_gate(&sql, &state) else {
+        let Some(passed) = pass_gate(&sql, &state, !pinned) else {
             on_slot.finish();
             conn.abort_transaction();
             let _ = ready.send(Err(Refusal::cancelled()));
             continue;
         };
+        let _reshaping = reshapes(&sql).then(Reshaping::begin);
         if brings && matches!(passed, Passed::Changing(_)) {
             CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).unsettle();
         }
@@ -6420,11 +6989,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_client_cannot_attach_or_detach_the_learner_s_probe_names() {
+        use super::reserved_attachment;
+        for sql in [
+            "ATTACH '/x/s.sqlite' AS harbor_probe_7 (TYPE sqlite)",
+            "attach '/x/s.sqlite' as \"harbor_probe_7\"",
+            "DETACH harbor_probe_7",
+            "detach database if exists harbor_probe_7",
+            "ATTACH '/x/harbor_probe_9.sqlite'",
+        ] {
+            assert!(reserved_attachment(sql).is_some(), "should be refused: {sql:?}");
+        }
+        for sql in [
+            "ATTACH '/x/s.sqlite' AS s (TYPE sqlite)",
+            "DETACH s",
+            "ATTACH '/x/harbor_probe.sqlite' AS probe",
+            "SELECT * FROM harbor_probe_7",
+            "CREATE TABLE harbor_probe_7(i INT)",
+        ] {
+            assert!(reserved_attachment(sql).is_none(), "should pass: {sql:?}");
+        }
+    }
+
     use super::route_exists;
     use super::index_columns;
     use super::{IndexPart, catalog_count_sql, index_parts};
     use super::{Cancel, SlotRun};
     use std::time::{Duration, Instant};
+
+    /// An ATTACH that waits keeps new shares out, but a share that waits
+    /// half a second passes beside it while a share it found is held, and
+    /// not after: what it waits for then is only what came after it.
+    #[test]
+    fn a_waiting_attach_holds_later_shares_only_while_it_waits_for_earlier_ones() {
+        use super::{GateState, PASS_BESIDE};
+        let soon = Duration::ZERO;
+        let mut gate = GateState::new();
+        let long = gate.give();
+        assert!(!gate.take_alone(), "held alone beside a share");
+        gate.keep();
+        assert!(!gate.shares_now(soon), "a share given beside an ATTACH that keeps them out");
+        assert!(gate.shares_now(PASS_BESIDE), "a share kept out for as long as the long one runs");
+        let beside = gate.give();
+        gate.let_go(long);
+        assert!(!gate.shares_now(PASS_BESIDE), "a share passed beside after the share found was let go");
+        gate.let_go(beside);
+        assert!(gate.take_alone());
+        gate.keeping -= 1;
+        assert!(!gate.shares_now(PASS_BESIDE), "a share beside the gate held alone");
+        gate.alone = false;
+        assert!(gate.shares_now(soon));
+    }
 
     #[test]
     fn attaching_and_reading_the_catalog_pass_the_gate_apart() {
@@ -6453,23 +7069,44 @@ mod tests {
             "PRAGMA show_tables",
             "SELECT library_version FROM pragma_version()",
             "SELECT * FROM sqlite_query('a', 'SELECT 1')",
+            "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))",
+            "EXPORT DATABASE a TO '/x/out' (FORMAT csv)",
+            "export database '/x/out'",
+            "COPY FROM DATABASE a TO b",
+            "FROM 'duckdb_tables'",
+            "SELECT * FROM a, 'information_schema'",
+            // A string the engine might resolve to a relation counts wherever
+            // it stands, a value that only looks like one included.
+            "SELECT 'duckdb_tables()' AS s",
+            "SELECT 'duckdb_tables' AS s",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Reads, "{sql}");
         }
         for sql in [
-            "SELECT 42",
             "SELECT * FROM a.main.t",
-            "SELECT 'duckdb_tables()' AS s",
-            "SELECT 1 -- information_schema",
             "SELECT my_duckdb_tables FROM t",
             "SELECT * FROM \"say duckdb_tables\"",
             "INSERT INTO attached VALUES (1)",
+            "SELECT * FROM \"select\"",
+            "SELECT 0x10",
+            "SELECT now()",
+            "COPY t TO '/x/duckdb_tables.csv'",
+            "COPY t FROM '/x/pg_data.csv'",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
-            // Every statement reads it while the names are not all known.
+            // Every statement that names anything reads it while the names
+            // are not all known.
             assert_eq!(gate_of(sql, &CatalogNames::default()), Gate::Reads, "{sql}");
         }
+        // One that names nothing reads nothing, known or not. A string
+        // counts as a name while the names are unknown (`names_any`), so
+        // these have none.
+        for sql in ["SELECT 42", "select 1 + 2 AS select", "SELECT 1 -- information_schema", "SELECT 1, 1_000"] {
+            assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
+            assert_eq!(gate_of(sql, &CatalogNames::default()), Gate::Open, "{sql}");
+        }
         assert_eq!(gate_of("DETACH a", &CatalogNames::default()), Gate::Changes);
+        assert_eq!(gate_of("SHOW ALL TABLES", &CatalogNames::default()), Gate::Reads);
     }
 
     #[test]
@@ -6482,11 +7119,33 @@ mod tests {
         names.learn(b"w", "CREATE VIEW w AS SELECT * FROM \"Later\"");
         names.learn(b"later", "CREATE VIEW later AS SELECT * FROM main.V");
         names.learn(b"m", "CREATE MACRO m() AS TABLE SELECT * FROM information_schema.tables");
+        // A view's name single-quoted, wherever it stands, since the engine
+        // resolves one in many places (`FROM 'v'`, `FROM ('v')`, `USING
+        // 'v'`), and a view whose body reaches the catalog that way.
+        names.learn(b"u", "CREATE VIEW u AS SELECT * FROM 'v'");
         names.rename(b"v", b"renamed");
-        for sql in ["SELECT * FROM v", "select * from MAIN.\"V\"", "SELECT * FROM w", "FROM m()", "TABLE renamed"] {
+        for sql in [
+            "SELECT * FROM v",
+            "select * from MAIN.\"V\"",
+            "SELECT * FROM w",
+            "FROM m()",
+            "TABLE renamed",
+            "FROM 'v'",
+            "FROM 'V'",
+            "SELECT * FROM a /* c */, 'v'",
+            "FROM u",
+            "FROM ('v')",
+            "SELECT * FROM t JOIN ('v') ON true",
+            "DELETE FROM t USING 'v'",
+            "MERGE INTO t USING 'v' ON true WHEN MATCHED THEN DELETE",
+            "COPY 'v' TO 'x.csv'",
+            "EXPLAIN ANALYZE FROM ('v')",
+            "SELECT 'v'",
+            "SELECT 'v', 1",
+        ] {
             assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
         }
-        for sql in ["SELECT * FROM plain", "SELECT 'v'", "SELECT 1 -- v", "SELECT vv FROM t"] {
+        for sql in ["SELECT * FROM plain", "SELECT 'w2'", "SELECT 1 -- v", "SELECT vv FROM t"] {
             assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
         }
         // A statement in a string, run by query(), and a table named in one.
@@ -6753,7 +7412,7 @@ mod tests {
                 }
             }
         };
-        let count = |run: &dyn Fn(&str, bool) -> Result<String, (u16, String)>| {
+        let count = || {
             let out = run("SELECT count(*) FROM t", true).unwrap();
             out.lines().find(|l| l.contains("\"row\"")).unwrap().to_string()
         };
@@ -6763,7 +7422,7 @@ mod tests {
         for sql in ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"] {
             run(sql, true).unwrap();
         }
-        assert!(count(&run).contains("[1]"));
+        assert!(count().contains("[1]"));
 
         // One an error aborted does not, and the COMMIT says so.
         for sql in ["BEGIN", "INSERT INTO t VALUES (2)"] {
@@ -6774,7 +7433,7 @@ mod tests {
         assert_eq!(status, 400);
         assert!(message.contains("rolled back") && message.contains("nothing since BEGIN"), "{message}");
         // Rolled back, with no transaction left behind it.
-        assert!(count(&run).contains("[1]"));
+        assert!(count().contains("[1]"));
         assert!(run("ROLLBACK", true).is_err(), "no transaction is open after it");
 
         // In every spelling the engine runs as a commit.
@@ -6793,7 +7452,7 @@ mod tests {
         let (_, message) = run("SELECT 1", true).unwrap_err();
         assert!(message.contains("aborted"), "{message}");
         assert_eq!(run("COMMIT", true).unwrap_err().0, 400);
-        assert!(count(&run).contains("[1]"));
+        assert!(count().contains("[1]"));
 
         drop(jobs);
         executor.join().unwrap();
@@ -7066,6 +7725,8 @@ mod tests {
     fn the_tcp_door_is_one_ipv4_listener() {
         let doors = super::ipv4_loopback(0).unwrap();
         assert_eq!(doors.len(), 1);
+        // Without unix sockets a listener can only be a TCP one.
+        #[cfg_attr(not(unix), allow(irrefutable_let_patterns))]
         let justhttp::Listener::Tcp(listener) = &doors[0] else {
             panic!("the TCP door returned a unix listener");
         };

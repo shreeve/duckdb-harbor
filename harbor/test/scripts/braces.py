@@ -16,7 +16,7 @@ checks it against the engine, which no reading of harbor's can stand in for.
 
 The grammar: select lists of paths whose groups nest three deep, items
 separated by commas, spaces, comments and the Unicode spaces the engine
-strips, suffixes (`::VARCHAR`, `::DECIMAL(10,2)`, `->>'$.k'`, `[1]`), and
+strips, suffixes (`::VARCHAR`, `::DECIMAL(10,2)`, `->>'$.k'`, `[1]`, `[ 1 ]`), and
 beside them struct literals, `MAP {…}`, lambdas, and strings and names that
 hold braces. It runs in two modes, since the engine's Unicode-space pre-pass
 misreads E-strings, backticks, dollar quotes and quotes in comments, and an
@@ -31,7 +31,9 @@ string, a dollar quote that opens only after a brace), and a cast whose type
 the engine reads on past a space or comment (`::DECIMAL (10,2)`, `::INT []`,
 `::DOUBLE PRECISION`), which a group's term or item would split. Beside them,
 the same casts after a group of one alternative, which split nothing and
-expand.
+expand. And expansions that would surprise, each refused (a group in a list's
+brackets, an empty group before another, an item cut inside a call's
+parentheses), beside neighbours of theirs that expand.
 
 Every failure prints the seed. Exit 77 when there is no duckdb CLI to parse
 with: the suite could not run, which is not a pass.
@@ -63,11 +65,16 @@ class Grammar:
         self.spaces = [" ", "  ", "\t", "\n", "\x0b", "\x0c", "\r\n"] + (UNICODE_SPACES if a else [])
         self.comments = ["/* c */", "/* {a,b} */", "/* /* nest */ */", "-- {x,y} \n", "-- c\r"]
         self.names = ["a", "b", "c_1", "é", "naïve", "x1", '"q{x}"', '"it\'\'s"', '"a b"', '"e"',
-                      "a::DECIMAL(9,3)", "b::STRUCT(k INT, v VARCHAR(4))"]
+                      "a::DECIMAL(9,3)", "b::STRUCT(k INT, v VARCHAR(4))", "a[ 1 ]", "b[1 : 2]", "c[ 'k' ][-1]"]
         self.suffixes = ["", "", "", "::VARCHAR", "->>'$.k'", "->>'{a,b}'", "[1]", "::INT[]",
-                         "::DECIMAL(10,2)", "::VARCHAR(20)", "::STRUCT(k INT, v DECIMAL(4,1))", "::DECIMAL(4,1)[]"]
+                         "::DECIMAL(10,2)", "::VARCHAR(20)", "::STRUCT(k INT, v DECIMAL(4,1))", "::DECIMAL(4,1)[]",
+                         "[ 1 ]", "[ /* c */ 2 ]", "::INT[ 3 ]"]
+        # After a cast a bracket is the type's array bounds, which must be
+        # constant: these follow names with no cast.
+        self.subscripts = ["[i : j]", "[ f(1, 2) ]", "[ 'k' ][ /* c */ 1 ]", "[ -1 ]"]
         self.joins = [",", ", ", " ,", " ", "\n  ", "\x0b", " /* , */ ", " -- }\n", ",\x0c"]
-        self.leads = ["", "", "\n  ", " "]
+        self.leads = ["", "", "\n  ", " ", " /* lead */ ", "-- lead {\n  "]
+        self.trails = ["", "", "\n", " ", " -- trail }\n", "/* trail */", " -- trail\r"]
         self.plain = ["'{a,b}'", "{'k': 1, 'j': {'m': 'n'}}", '"weird{n}"', "1", "{'a': [1,2]}", "'don''t'",
                       "MAP {'k': 'v'}", "{'k': 'v'}.k", "[1,2][1]", "list_transform([1], lambda x: x)",
                       "1.5::DECIMAL(10,2)", "CAST(x AS DECIMAL(10,2))"]
@@ -90,23 +97,24 @@ class Grammar:
             s += self.r.choice(self.comments) + self.r.choice(self.spaces[:5])
         return s
 
-    def group(self, depth=0):
+    def group(self, depth=0, names=None):
         r = self.r
+        names = names or self.names
         braced, expanded = [], []
         for _ in range(r.randint(1, 4)):
             if depth < 2 and r.random() < 0.25:
                 prefix = r.choice(self.names[:10]) + "."
-                gb, ge = self.group(depth + 1)
+                gb, ge = self.group(depth + 1, names)
                 braced.append(prefix + gb)
                 expanded.extend(prefix + x for x in ge)
             else:
-                name = r.choice(self.names)
+                name = r.choice(names)
                 braced.append(name)
                 expanded.append(name)
         body = braced[0] + "".join(r.choice(self.joins) + item for item in braced[1:])
         if r.random() < 0.2:
             body += ","
-        return "{" + r.choice(self.leads) + body + r.choice(["", "", "\n", " "]) + "}", expanded
+        return "{" + r.choice(self.leads) + body + r.choice(self.trails) + "}", expanded
 
     def term(self):
         r = self.r
@@ -120,8 +128,13 @@ class Grammar:
             gb, ge = self.group()
             return "coalesce(r." + gb + ")", "coalesce(" + ", ".join("r." + x for x in ge) + ")"
         if roll < 0.63:
+            base = r.choice(["r", "t.r"]) + "."
+            gb, ge = self.group(names=[n for n in self.names if "::" not in n])
+            suffix = r.choice(self.subscripts)
+            return base + gb + suffix, ", ".join(base + x + suffix for x in ge)
+        if roll < 0.65:
             return "{a,b}_x", "a_x, b_x"
-        if roll < 0.66:
+        if roll < 0.67:
             return "x_{1,2}", "x_1, x_2"
         p = r.choice(self.plain)
         return p, p
@@ -162,9 +175,35 @@ SPLIT_CASTS = [
     "::DECIMAL{gap}(10,2)", "::VARCHAR{gap}(20)", "::STRUCT{gap}(k INT)", "::INT{gap}[]", "::INT[]{gap}[2]",
     "::INT{gap}ARRAY", "::DECIMAL(9,3){gap}ARRAY", "::DOUBLE{gap}PRECISION", "::TIMESTAMP{gap}WITH TIME ZONE",
     "::time{gap}without time zone", "::CHARACTER{gap}VARYING", "::NATIONAL{gap}CHARACTER", "::BIT{gap}VARYING",
-    "::INTERVAL{gap}YEAR", "::INTERVAL{gap}day to second",
+    "::INTERVAL{gap}YEAR", "::INTERVAL{gap}day to second", "::INT[ 3 ]{gap}ARRAY",
 ]
 GAPS = [" ", "\t", "\n", "/* c */", " -- c\n", NBSP, IDEO]
+
+
+# Expansions that would surprise, each refused with its own message: a group
+# in a list's brackets, an empty group before one that holds an item, and an
+# item cut inside a call's parentheses (a lambda's among them). Beside them,
+# their near neighbours that expand as spelled out.
+SURPRISES = [
+    ("[r.{a,b}]", "inside a list's brackets"), ("[1, r.{a, b}]", "inside a list's brackets"),
+    ("ARRAY[r.{a,b}]", "inside a list's brackets"), ("1 + [r.{a,b}][1]", "inside a list's brackets"),
+    ("r.{}.{a,b}", "an empty brace group"), ("{ /* none */ }_{a,b}", "an empty brace group"),
+    ("r.{list_transform(l, lambda x: x), b}", "inside the parentheses"),
+    ("r.{list_transform(l, x -> x)}", "inside the parentheses"), ("r.{coalesce(a, b), c}", "inside the parentheses"),
+]
+NEIGHBOURS = [
+    ("[f(r.{a,b}), 3]", "[f(r.a, r.b), 3]"), ("l[r.{a,b}]", "l[r.a], l[r.b]"), ("[{'k': 1}, {'k': 2}]", "[{'k': 1}, {'k': 2}]"),
+    ("r.{f(a), b}", "r.f(a), r.b"), ("{'k': list_transform(l, lambda x: x)}", "{'k': list_transform(l, lambda x: x)}"),
+]
+
+
+def surprise(rng):
+    """A statement with an expansion that would surprise, the part of the
+    refusal it must get, and a statement with a neighbour that expands:
+    (statement, why, (braced, expanded))."""
+    sql, why = rng.choice(SURPRISES)
+    g = Grammar(rng, "A")
+    return g.statement(sql)[0], why, g.statement(rng.choice(NEIGHBOURS))
 
 
 def misread(rng):
@@ -271,6 +310,9 @@ def main():
     for _ in range(max(1, args.count // 10)):
         split, (braced, want) = split_cast(rng)
         cases += [("split", split, split), ("one", braced, want)]
+    for _ in range(max(1, args.count // 10)):
+        sql, why, (braced, want) = surprise(rng)
+        cases += [("surprise", sql, why), ("near", braced, want)]
 
     failures, counts = [], {}
     with tempfile.TemporaryDirectory(prefix="hb-braces-", dir="/tmp") as work:
@@ -281,6 +323,8 @@ def main():
             counts[(mode, tag)] = counts.get((mode, tag), 0) + 1
             if mode == "misread":
                 ok = tag == "R" and any(m in out for m in MISREAD_REFUSALS)
+            elif mode == "surprise":
+                ok = tag == "R" and want in out
             elif mode == "split":
                 ok = tag == "R" and "would split" in out
             elif braced == want:

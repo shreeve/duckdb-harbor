@@ -19,12 +19,17 @@
 //! being whatever the engine takes for one: the ASCII spaces, the vertical
 //! tab among them, and the Unicode spaces it strips before it parses. A
 //! cast's type parameters, the `(10,2)` right after `::DECIMAL`, stay in
-//! the term, so `x.{a,b}::DECIMAL(10,2)` casts both. A type the engine
+//! the term, so `x.{a,b}::DECIMAL(10,2)` casts both; so does a subscript
+//! or slice right after a word, whatever it holds, `x.{a,b}[ 1 ]` or
+//! `x.{a,b}[i : j]`, and its `:` is no struct literal's. A type the engine
 //! reads on past a space or comment, as in `::DECIMAL (10,2)`, `::INT []`
 //! or `::DOUBLE PRECISION`, would reach only the last alternative, so a
 //! term or an item that ends inside one is refused. Items
 //! in a group are separated by commas; spaces and comments alone separate
-//! them too, so a comma is never required, only clearer. A group nests; two
+//! them too, so a comma is never required, only clearer. A comment between
+//! items goes with the item before it, those before the first item with the
+//! first, and comes out after each alternative its item makes, after a
+//! space; a line comment keeps the line break that ends it. A group nests; two
 //! groups in one term multiply, as they do in a shell. The alternatives a
 //! term expands to are joined with `, `, which is what a select list, a
 //! `FROM` list and an argument list all take.
@@ -46,7 +51,11 @@
 //! one and not in the other, a space stripped in one and kept in the other)
 //! is refused, with what to write instead: sent as written, its braces
 //! would reach the engine, which reads them as a struct literal or not at
-//! all.
+//! all. So is an expansion that would surprise: a group in a list's
+//! brackets, `[r.{a,b}]`, which would repeat the list; an empty group before
+//! another in its term, `r.{}.{a,b}`, which would leave the other as it
+//! came; and an item a space or comma would cut inside a call's or a
+//! lambda's parentheses, `r.{f(l, lambda x: x), b}`.
 //!
 //! Each group multiplies, so a short statement can stand for an enormous one:
 //! thirty two-item groups in a term are a billion alternatives. Expansion
@@ -55,7 +64,7 @@
 
 use std::borrow::Cow;
 
-use wire::scan::{Kind, is_space, plain_spaces, spans};
+use wire::scan::{Kind, each_span, is_space, plain_spaces};
 
 /// How much text one statement's expansion may write or re-read: twice the
 /// 8 MiB a request body may be, so what it produces is never much larger
@@ -73,17 +82,40 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
     if !sql.contains('{') {
         return Ok(Cow::Borrowed(sql));
     }
+    let Some(out) = expansion(sql)? else {
+        return Ok(Cow::Borrowed(sql));
+    };
+    if out.src == sql.as_bytes() {
+        return Ok(Cow::Borrowed(sql));
+    }
+    // Every cut falls on an ASCII byte or a whole Unicode space, so the text
+    // is UTF-8; and it goes out only if the engine reads it as it was built.
+    match String::from_utf8(out.src) {
+        Ok(expanded) => match misread(&expanded, &out.read) {
+            None => Ok(Cow::Owned(expanded)),
+            Some(why) => Err(why.into()),
+        },
+        Err(_) => Err(QUOTE.into()),
+    }
+}
+
+/// The statement with its groups expanded, beside the reading each byte was
+/// built with; `None` when a brace is unbalanced.
+fn expansion(sql: &str) -> Result<Option<Piece>, String> {
     let mut budget = BUDGET;
     let read = reading(sql);
     let text = Text { src: sql.as_bytes(), read: &read };
     if !text.balanced() {
-        return Ok(Cow::Borrowed(sql));
+        return Ok(None);
     }
     let mut out = Piece::default();
     let mut term_start = 0;
     let mut depth = 0usize;
     let mut braced = false;
-    let mut lists = None;
+    let (mut lists, mut brackets) = (None, None);
+    // The parentheses and brackets open here, each marked when a list's,
+    // and whether the term began inside a list.
+    let (mut nest, mut listed) = (Vec::new(), false);
     let mut i = 0;
     while i < text.len() {
         let boundary = match text.class(i) {
@@ -102,15 +134,32 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
                         i = close + 1;
                         continue;
                     }
-                    None => true,
+                    None => {
+                        nest.push(false);
+                        true
+                    }
                 },
-                c => depth == 0 && matches!(c, b',' | b')' | b';'),
+                b'[' if depth == 0 => match text.subscript(term_start, i, text.len(), &mut brackets) {
+                    Some(close) => {
+                        i = close + 1;
+                        continue;
+                    }
+                    None => {
+                        nest.push(text.opens_list(i));
+                        false
+                    }
+                },
+                b')' | b']' if depth == 0 => {
+                    nest.pop();
+                    text.src[i] == b')'
+                }
+                c => depth == 0 && matches!(c, b',' | b';'),
             },
             Class::Space => depth == 0,
             Class::Opaque => false,
         };
         if boundary {
-            let alts = push_term(&mut out, text.slice(term_start, i), braced, &mut budget)?;
+            let alts = push_term(&mut out, text.slice(term_start, i), braced, listed, &mut budget)?;
             // A term that stands for several ends here, at a space or
             // comment, and a cast's type the engine reads on past it would
             // reach only the last of them.
@@ -123,30 +172,29 @@ pub fn expand(sql: &str) -> Result<Cow<'_, str>, String> {
             out.push(text.slice(i, i + 1));
             term_start = i + 1;
             braced = false;
+            listed = nest.last() == Some(&true);
         }
         i += 1;
     }
-    push_term(&mut out, text.slice(term_start, text.len()), braced, &mut budget)?;
-    if out.src == sql.as_bytes() {
-        return Ok(Cow::Borrowed(sql));
-    }
-    // Every cut falls on an ASCII byte or a whole Unicode space, so the text
-    // is UTF-8; and it goes out only if the engine reads it as it was built.
-    match String::from_utf8(out.src) {
-        Ok(expanded) if reading(&expanded) == out.read => Ok(Cow::Owned(expanded)),
-        Ok(expanded) => Err(misread(&out.read, &reading(&expanded)).into()),
-        Err(_) => Err(QUOTE.into()),
-    }
+    push_term(&mut out, text.slice(term_start, text.len()), braced, listed, &mut budget)?;
+    Ok(Some(out))
 }
 
-/// Why the engine would read an expansion another way than it was built,
-/// from the first byte where the two readings part.
-fn misread(built: &[u8], read: &[u8]) -> &'static str {
-    match built.iter().zip(read).map(|(a, b)| a ^ b).find(|&d| d != 0) {
-        Some(STRIPPED) => UNICODE_SPACE,
-        Some(ESCAPES) => STRING_ESCAPES,
+/// Why the engine would read `src` another way than `built`, the reading it
+/// was built with, from the first byte where the two part; `None` when they
+/// agree.
+fn misread(src: &str, built: &[u8]) -> Option<&'static str> {
+    let mut first = None;
+    reading_each(src.as_bytes(), |i, read| {
+        if first.is_none() && read != built[i] {
+            first = Some(read ^ built[i]);
+        }
+    });
+    first.map(|differ| match differ {
+        STRIPPED => UNICODE_SPACE,
+        ESCAPES => STRING_ESCAPES,
         _ => QUOTE,
-    }
+    })
 }
 
 const UNICODE_SPACE: &str = "brace expansion refused: the engine would read a Unicode space in this statement another way \
@@ -155,73 +203,148 @@ const STRING_ESCAPES: &str = "brace expansion refused: a string beside a brace g
      once the group expands; put a space between the group and the string, or write the alternatives out";
 const QUOTE: &str = "brace expansion refused: a string or dollar quote beside a brace group would begin or end elsewhere \
      once the group expands; put a space between the group and the quote, or write the alternatives out";
+const LIST: &str = "brace expansion refused: a brace group inside a list's brackets would make a list of each \
+     alternative, not one list of them all; write the list's items out";
+const EMPTY: &str = "brace expansion refused: an empty brace group stands for nothing, and the groups after it in its \
+     term would not expand; take it out, or write the alternatives out";
+const CALL: &str = "brace expansion refused: a space or comma inside the parentheses of a brace group's item, as in \
+     a call or a lambda, would split the item there; write the alternatives out";
 
 /// Writes a term's expansion to `out`; returns how many alternatives it
-/// stands for.
-fn push_term(out: &mut Piece, term: Text, braced: bool, budget: &mut usize) -> Result<usize, String> {
+/// stands for. `listed` when the term begins inside a list's brackets,
+/// where a group would repeat the list.
+///
+/// A term with no group stands for itself. One group is resolved at a time,
+/// depth first, from a stack rather than by recursion: a term can hold
+/// thousands of groups, one item each, that multiply nothing and would each
+/// be a frame. Each alternative is written to `out` as it is made, and a
+/// group's items wait as places in the text they came from, so what is held
+/// at once is one text for each group being resolved, not every alternative
+/// built. Each piece is charged its length before it is built, since it is
+/// built once, scanned once and written at most once: a group of many items
+/// behind a long prefix is refused before its alternatives take any memory.
+fn push_term(out: &mut Piece, term: Text, braced: bool, listed: bool, budget: &mut usize) -> Result<usize, String> {
     if !braced {
         out.push(term);
         return Ok(1);
     }
-    let alts = alternatives(term, budget)?;
-    for (k, alt) in alts.iter().enumerate() {
-        if k > 0 {
-            out.push(Text { src: b", ", read: &[CODE, CODE] });
-        }
-        out.push(alt.text());
-    }
-    Ok(alts.len())
-}
-
-/// Every piece of text a term stands for, in order. A term with no group
-/// stands for itself. One group is resolved at a time, depth first, from a
-/// stack rather than by recursion: a term can hold thousands of groups, one
-/// item each, that multiply nothing and would each be a frame. Each piece is
-/// charged its length before it is built, since it is built once, scanned
-/// once and written at most once: a group of many items behind a long prefix
-/// is refused before its alternatives take any memory.
-fn alternatives(term: Text, budget: &mut usize) -> Result<Vec<Piece>, String> {
-    let mut spend = |cost: usize| {
-        *budget = budget.checked_sub(cost).ok_or_else(|| {
-            format!(
-                "brace expansion refused: this statement would expand past {} MiB",
-                BUDGET >> 20
-            )
-        })?;
-        Ok::<(), String>(())
+    spend(budget, term.len())?;
+    let Some((group, items)) = term.next_group()? else {
+        out.push(term);
+        return Ok(1);
     };
-    spend(term.len())?;
-    let mut out = Vec::new();
-    let mut pending = vec![Piece::of(term)];
-    while let Some(piece) = pending.pop() {
-        let text = piece.text();
-        let Some((lbrace, rbrace)) = text.first_group() else {
-            out.push(piece);
+    if listed {
+        return Err(LIST.into());
+    }
+    let mut frames = vec![Frame::new(Whole::Term(term), term.len(), group, items, budget)?];
+    let mut alts = 0;
+    while let Some(frame) = frames.last_mut() {
+        let mark = out.len();
+        if alts > 0 {
+            out.push(JOIN);
+        }
+        let start = out.len();
+        let body = frame.write(frame.next, out) - start;
+        frame.next += 1;
+        if frame.next == frame.items.len() {
+            frames.pop();
+        }
+        let Some((group, items)) = out.text().slice(start, start + body).next_group()? else {
+            alts += 1;
             continue;
         };
-        let items = text.items(lbrace + 1, rbrace)?;
-        if items.is_empty() {
-            // `x.{}` stands for nothing; the engine can say so.
-            out.push(piece);
-            continue;
-        }
-        let (prefix, suffix) = (text.slice(0, lbrace), text.slice(rbrace + 1, text.len()));
-        let each = prefix.len() + suffix.len();
-        spend(items.iter().fold(0usize, |sum, item| sum.saturating_add(each + item.len())))?;
-        let next: Vec<Piece> = items
-            .iter()
-            .rev()
-            .map(|item| {
-                let mut alt = Piece::default();
-                for part in [prefix, *item, suffix] {
-                    alt.push(part);
-                }
-                alt
-            })
-            .collect();
-        pending.extend(next);
+        let alt = out.split_off(start);
+        out.truncate(mark);
+        frames.push(Frame::new(Whole::Alt(alt), body, group, items, budget)?);
     }
-    Ok(out)
+    Ok(alts)
+}
+
+/// `, `, read as code.
+const JOIN: Text = Text { src: b", ", read: &[CODE, CODE] };
+
+/// A space, read as one, that sets a comment a group carries after the
+/// alternative it goes with.
+const SPACE: Text = Text { src: b" ", read: &[CODE] };
+
+/// Charges `cost` to the budget, or refuses the statement.
+fn spend(budget: &mut usize, cost: usize) -> Result<(), String> {
+    *budget = budget
+        .checked_sub(cost)
+        .ok_or_else(|| format!("brace expansion refused: this statement would expand past {} MiB", BUDGET >> 20))?;
+    Ok(())
+}
+
+/// A group being resolved: the text it sits in, how much of that text is
+/// the alternative before the comments it carries, where the group opens and
+/// closes, its items, and the next of them to write.
+struct Frame<'a> {
+    whole: Whole<'a>,
+    body: usize,
+    group: (usize, usize),
+    items: Vec<Item>,
+    next: usize,
+}
+
+/// The text a group sits in: the term itself, or an alternative of it.
+enum Whole<'a> {
+    Term(Text<'a>),
+    Alt(Piece),
+}
+
+/// Where a group's braces sit, and its items.
+type Group = ((usize, usize), Vec<Item>);
+
+/// Where an item sits in the text of its group, and where the separators
+/// after it end: at the next item, or at the group's close.
+#[derive(Clone, Copy)]
+struct Item {
+    start: usize,
+    end: usize,
+    to: usize,
+}
+
+impl<'a> Frame<'a> {
+    /// The frame for the group at `group` in `whole`, charged what its
+    /// alternatives will write.
+    fn new(whole: Whole<'a>, body: usize, group: (usize, usize), items: Vec<Item>, budget: &mut usize) -> Result<Self, String> {
+        let (text, (lbrace, rbrace)) = (whole.text(), group);
+        let each = text.len() - (rbrace + 1 - lbrace);
+        let mut notes = 0usize;
+        text.notes(lbrace + 1, items[0].start, |note| notes += note.len());
+        for item in &items {
+            text.notes(item.end, item.to, |note| notes += note.len());
+        }
+        spend(budget, items.iter().fold(notes, |sum, item| sum.saturating_add(each + item.end - item.start)))?;
+        Ok(Frame { whole, body, group, items, next: 0 })
+    }
+
+    /// Writes the alternative item `k` makes: the text before the group,
+    /// the item, and the text after it; then the comments the text carries,
+    /// and those beside the item in the group. Returns where the
+    /// alternative ends and its comments begin.
+    fn write(&self, k: usize, out: &mut Piece) -> usize {
+        let (text, (lbrace, rbrace), item) = (self.whole.text(), self.group, self.items[k]);
+        out.push(text.slice(0, lbrace));
+        out.push(text.slice(item.start, item.end));
+        out.push(text.slice(rbrace + 1, self.body));
+        let end = out.len();
+        out.push(text.slice(self.body, text.len()));
+        if k == 0 {
+            text.notes(lbrace + 1, item.start, |note| out.push(note));
+        }
+        text.notes(item.end, item.to, |note| out.push(note));
+        end
+    }
+}
+
+impl Whole<'_> {
+    fn text(&self) -> Text<'_> {
+        match self {
+            Whole::Term(text) => *text,
+            Whole::Alt(piece) => piece.text(),
+        }
+    }
 }
 
 // How the engine reads a byte, packed in one: the kind of span it falls in,
@@ -241,28 +364,37 @@ const ESCAPES: u8 = 32;
 /// The engine's reading of each byte of `src`. Two texts with the same bytes
 /// that agree here are one statement to the engine.
 fn reading(src: &str) -> Vec<u8> {
-    let plain = plain_spaces(src.as_bytes());
-    let mut read = vec![CODE; src.len()];
-    for span in spans(&plain) {
+    let mut read = Vec::with_capacity(src.len());
+    reading_each(src.as_bytes(), |_, r| read.push(r));
+    read
+}
+
+/// The engine's reading of each byte of `src`, given to `each` in order with
+/// its offset, so a reader that compares need not hold it all.
+fn reading_each(src: &[u8], mut each: impl FnMut(usize, u8)) {
+    let plain = plain_spaces(src);
+    for span in each_span(&plain) {
         let kind = match span.kind {
-            Kind::Code => continue,
+            Kind::Code => CODE,
             Kind::Str => STR,
             Kind::Dollar => DOLLAR,
             Kind::LineComment => LINE_COMMENT,
             Kind::BlockComment => BLOCK_COMMENT,
         };
-        read[span.start..span.end].fill(kind);
-        read[span.start] |= BEGINS;
-        if span.escapes {
-            read[span.start] |= ESCAPES;
+        for i in span.start..span.end {
+            let mut read = kind;
+            if i == span.start && kind != CODE {
+                read |= BEGINS;
+                if span.escapes {
+                    read |= ESCAPES;
+                }
+            }
+            if src[i] != plain[i] {
+                read |= STRIPPED;
+            }
+            each(i, read);
         }
     }
-    for (r, (a, b)) in read.iter_mut().zip(src.bytes().zip(plain.iter())) {
-        if a != *b {
-            *r |= STRIPPED;
-        }
-    }
-    read
 }
 
 /// What a byte is to the expansion: code it reads, a space or comment that
@@ -291,13 +423,23 @@ struct Piece {
 }
 
 impl Piece {
-    fn of(text: Text) -> Self {
-        Piece { src: text.src.to_vec(), read: text.read.to_vec() }
-    }
-
     fn push(&mut self, text: Text) {
         self.src.extend_from_slice(text.src);
         self.read.extend_from_slice(text.read);
+    }
+
+    fn len(&self) -> usize {
+        self.src.len()
+    }
+
+    /// The piece from `at` on, taken off this one.
+    fn split_off(&mut self, at: usize) -> Piece {
+        Piece { src: self.src.split_off(at), read: self.read.split_off(at) }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.src.truncate(len);
+        self.read.truncate(len);
     }
 
     fn text(&self) -> Text<'_> {
@@ -326,6 +468,75 @@ impl<'a> Text<'a> {
     /// The byte at `i` when the engine reads it as code and not a space.
     fn code(&self, i: usize) -> Option<u8> {
         (self.class(i) == Class::Code).then(|| self.src[i])
+    }
+
+    /// The group to resolve next, and its items; `None` when no group holds
+    /// an item. An error where its expansion would surprise: a group in a
+    /// list's brackets, which would repeat the list; an empty group before
+    /// one that holds an item, which would leave that one unexpanded; or an
+    /// item cut inside its parentheses ([`Text::items`]).
+    fn next_group(&self) -> Result<Option<Group>, String> {
+        let Some(group) = self.first_group() else {
+            return Ok(None);
+        };
+        if !self.holds_item(group) {
+            // `x.{}` stands for nothing; the engine can say so.
+            let mut after = group.1 + 1;
+            while let Some((lbrace, rbrace)) = self.slice(after, self.len()).first_group() {
+                if self.holds_item((after + lbrace, after + rbrace)) {
+                    return Err(EMPTY.into());
+                }
+                after += rbrace + 1;
+            }
+            return Ok(None);
+        }
+        let items = self.items(group.0 + 1, group.1)?;
+        if self.in_list(group.0) {
+            return Err(LIST.into());
+        }
+        Ok(Some((group, items)))
+    }
+
+    /// Whether the group holds an item: anything but spaces, comments and
+    /// commas.
+    fn holds_item(&self, (lbrace, rbrace): (usize, usize)) -> bool {
+        (lbrace + 1..rbrace).any(|i| self.class(i) != Class::Space && self.code(i) != Some(b','))
+    }
+
+    /// Whether `at` is inside the brackets of a list, `[…]` or `ARRAY[…]`,
+    /// with no parentheses between: in a call's inside a list, a group
+    /// makes the call's arguments.
+    fn in_list(&self, at: usize) -> bool {
+        let mut nest = Vec::new();
+        for i in 0..at {
+            match self.code(i) {
+                Some(b'[') => nest.push(self.opens_list(i)),
+                Some(b'(') => nest.push(false),
+                Some(b']' | b')') => {
+                    nest.pop();
+                }
+                _ => {}
+            }
+        }
+        nest.last() == Some(&true)
+    }
+
+    /// Whether the `[` at `i` opens a list rather than a subscript or a
+    /// slice: it begins the text, follows a space, a comment or an
+    /// operator, or follows the word `ARRAY`.
+    fn opens_list(&self, i: usize) -> bool {
+        let word = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$') || c >= 0x80;
+        match i.checked_sub(1).map(|j| (self.class(j), self.src[j])) {
+            None | Some((Class::Space, _)) => true,
+            Some((Class::Opaque, _)) => false,
+            Some((Class::Code, c)) if !word(c) => !matches!(c, b']' | b')' | b'}'),
+            Some(_) => {
+                i >= 5
+                    && (i - 5..i).all(|j| self.code(j).is_some())
+                    && self.src[i - 5..i].eq_ignore_ascii_case(b"array")
+                    && (i == 5 || !self.code(i - 6).is_some_and(word))
+            }
+        }
     }
 
     /// The first group that expands: `(lbrace, rbrace)`. A struct literal and
@@ -364,14 +575,20 @@ impl<'a> Text<'a> {
         None
     }
 
-    /// A lone `:` at the top level of the group — `{'a': 1}`, never `::`.
+    /// A lone `:` at the top level of the group — `{'a': 1}`, never `::`,
+    /// nor a slice's in brackets, `{l[1:2]}`, nor a lambda's in a call,
+    /// `{f(l, lambda x: x)}`.
     fn is_struct_literal(&self, from: usize, to: usize) -> bool {
-        let mut depth = 0usize;
+        let (mut depth, mut square, mut round) = (0usize, 0usize, 0usize);
         for i in from..to {
             match self.code(i) {
                 Some(b'{') => depth += 1,
                 Some(b'}') => depth = depth.saturating_sub(1),
-                Some(b':') if depth == 0 => {
+                Some(b'[') => square += 1,
+                Some(b']') => square = square.saturating_sub(1),
+                Some(b'(') => round += 1,
+                Some(b')') => round = round.saturating_sub(1),
+                Some(b':') if depth == 0 && square == 0 && round == 0 => {
                     let before = i > from && self.code(i - 1) == Some(b':');
                     let after = i + 1 < to && self.code(i + 1) == Some(b':');
                     if !before && !after {
@@ -406,19 +623,34 @@ impl<'a> Text<'a> {
         {
             return None;
         }
-        let lists = lists.get_or_insert_with(|| self.paired_parentheses(from, to));
+        let lists = lists.get_or_insert_with(|| self.paired(from, to, b'(', b')'));
         lists.binary_search_by_key(&open, |pair| pair.0).ok().map(|k| lists[k].1)
     }
 
-    /// Each `(` in code between `from` and `to` beside the `)` that closes
-    /// it, ordered by the `(`. A brace or a `;` closes no list, and every one
-    /// open at it is left unpaired.
-    fn paired_parentheses(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+    /// Where a subscript or slice closes, when the `[` at `open` follows
+    /// something in the word from `from`: `l[ 1 ]`, `l[i : j]`, `m['k']`,
+    /// `::INT[ 3 ]`. What it holds belongs to the word before it, so neither
+    /// a term nor an item ends inside it. A `[` that begins a word is a list,
+    /// and is not taken; nor is one that holds a brace or a `;`, or does not
+    /// close before `to`. `brackets` holds the text's brackets, paired once,
+    /// as `lists` does its parentheses.
+    fn subscript(&self, from: usize, open: usize, to: usize, brackets: &mut Option<Vec<(usize, usize)>>) -> Option<usize> {
+        if open == from {
+            return None;
+        }
+        let brackets = brackets.get_or_insert_with(|| self.paired(from, to, b'[', b']'));
+        brackets.binary_search_by_key(&open, |pair| pair.0).ok().map(|k| brackets[k].1)
+    }
+
+    /// Each `left` in code between `from` and `to` beside the `right` that
+    /// closes it, ordered by the `left`. A brace or a `;` closes no pair, and
+    /// every one open at it is left unpaired.
+    fn paired(&self, from: usize, to: usize, left: u8, right: u8) -> Vec<(usize, usize)> {
         let (mut open, mut pairs) = (Vec::new(), Vec::new());
         for i in from..to {
             match self.code(i) {
-                Some(b'(') => open.push(i),
-                Some(b')') => pairs.extend(open.pop().map(|o| (o, i))),
+                Some(c) if c == left => open.push(i),
+                Some(c) if c == right => pairs.extend(open.pop().map(|o| (o, i))),
                 Some(b'{' | b'}' | b';') => open.clear(),
                 _ => {}
             }
@@ -454,7 +686,10 @@ impl<'a> Text<'a> {
         // the term kept, then the type's name and the `::` before it.
         let mut j = end;
         while j > from && self.code(j - 1) == Some(b']') {
-            let digits = (from..j - 1).rev().take_while(|&k| self.code(k).is_some_and(|c| c.is_ascii_digit())).count();
+            let digits = (from..j - 1)
+                .rev()
+                .take_while(|&k| self.class(k) == Class::Space || self.code(k).is_some_and(|c| c.is_ascii_digit()))
+                .count();
             let open = j - 1 - digits;
             if open == from || self.code(open - 1) != Some(b'[') {
                 return None;
@@ -521,15 +756,38 @@ impl<'a> Text<'a> {
         ))
     }
 
+    /// What the comments between `from` and `to` write, given to `note`
+    /// piece by piece: a space, each comment, and the line break that ends
+    /// a line comment, so the comment ends where it did.
+    fn notes(&self, from: usize, to: usize, mut note: impl FnMut(Text<'a>)) {
+        let mut i = from;
+        while i < to {
+            let kind = self.read[i] & KIND;
+            if self.read[i] & BEGINS == 0 || !matches!(kind, LINE_COMMENT | BLOCK_COMMENT) {
+                i += 1;
+                continue;
+            }
+            let end = (i + 1..to).find(|&j| self.read[j] & (KIND | BEGINS) != kind).unwrap_or(to);
+            note(SPACE);
+            note(self.slice(i, end));
+            if kind == LINE_COMMENT {
+                note(self.slice(end, end + 1));
+            }
+            i = end;
+        }
+    }
+
     /// The items between `from` and `to`, split at top-level spaces, comments
     /// and commas; a nested group travels whole inside its item, as do a
     /// cast's type parameters. An error when an item ends inside a cast's
-    /// type ([`Text::cast_beyond`]).
-    fn items(&self, from: usize, to: usize) -> Result<Vec<Text<'a>>, String> {
-        let mut items = Vec::new();
+    /// type ([`Text::cast_beyond`]), or inside parentheses it opened.
+    fn items(&self, from: usize, to: usize) -> Result<Vec<Item>, String> {
+        let mut items: Vec<Item> = Vec::new();
         let mut depth = 0usize;
         let mut start = from;
-        let mut lists = None;
+        let (mut lists, mut brackets) = (None, None);
+        // Parentheses open in the item, a call's or a lambda's.
+        let mut round = 0usize;
         let mut i = from;
         while i < to {
             let split = match self.class(i) {
@@ -547,6 +805,18 @@ impl<'a> Text<'a> {
                             i = close + 1;
                             continue;
                         }
+                        round += 1;
+                        false
+                    }
+                    b')' if depth == 0 => {
+                        round = round.saturating_sub(1);
+                        false
+                    }
+                    b'[' if depth == 0 => {
+                        if let Some(close) = self.subscript(start, i, to, &mut brackets) {
+                            i = close + 1;
+                            continue;
+                        }
                         false
                     }
                     c => depth == 0 && c == b',',
@@ -555,20 +825,29 @@ impl<'a> Text<'a> {
                 Class::Opaque => false,
             };
             if split {
+                if round > 0 {
+                    return Err(CALL.into());
+                }
                 if i > start {
                     if self.class(i) == Class::Space
                         && let Some(refusal) = self.cast_beyond(start, i, to)
                     {
                         return Err(refusal);
                     }
-                    items.push(self.slice(start, i));
+                    if let Some(last) = items.last_mut() {
+                        last.to = start;
+                    }
+                    items.push(Item { start, end: i, to });
                 }
                 start = i + 1;
             }
             i += 1;
         }
         if to > start {
-            items.push(self.slice(start, to));
+            if let Some(last) = items.last_mut() {
+                last.to = start;
+            }
+            items.push(Item { start, end: to, to });
         }
         Ok(items)
     }
@@ -608,6 +887,7 @@ const INTERVAL_UNITS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wire::scan::spans;
 
     fn x(sql: &str) -> String {
         expand(sql).unwrap().into_owned()
@@ -688,13 +968,71 @@ mod tests {
         assert_eq!(x("select r.{a\u{3000}b\u{b}c} from t"), "select r.a, r.b, r.c from t");
         assert_eq!(x("select r.{a,b}-- c\nfrom t"), "select r.a, r.b-- c\nfrom t");
         assert_eq!(x("select r.{a,b}/* c */from t"), "select r.a, r.b/* c */from t");
-        assert_eq!(x("select r.{a /* , */ b -- }\n c} from t"), "select r.a, r.b, r.c from t");
+        assert_eq!(x("select r.{a /* , */ b -- }\n c} from t"), "select r.a /* , */, r.b -- }\n, r.c from t");
         // Where the pre-pass keeps a Unicode space, here inside the quote a
         // `'` in a comment opens for it, its bytes are part of the word, and
         // of the item.
         assert_eq!(x("select /* ' */ r.{a\u{a0}b} from t"), "select /* ' */ r.a\u{a0}b from t");
         // U+1680 is no space to the engine.
         assert_eq!(x("select r.{a,b}\u{1680}x"), "select r.a\u{1680}x, r.b\u{1680}x");
+    }
+
+    /// An expansion that would surprise is refused, saying what to write:
+    /// a group in a list's brackets would repeat the list, an empty group
+    /// would leave the groups after it unexpanded, and an item cut inside a
+    /// call's parentheses would split the call.
+    #[test]
+    fn a_surprising_expansion_is_refused() {
+        for (sql, why) in [
+            ("select [r.{a,b}]", LIST),
+            ("select [1, r.{a,b}]", LIST),
+            ("select ARRAY[r.{a,b}]", LIST),
+            ("select x+[r.{a,b}]", LIST),
+            ("select r.{p, [x.{a,b}]}", LIST),
+            ("select r.{}.{a,b}", EMPTY),
+            ("select {}{a,b}", EMPTY),
+            ("select r.{ /* none */ }_{a,b}", EMPTY),
+            ("select r.{list_transform(l, lambda x: x), b}", CALL),
+            ("select r.{list_transform(l, x -> x)}", CALL),
+            ("select r.{coalesce(a, b), c}", CALL),
+        ] {
+            assert_eq!(expand(sql), Err(why.to_string()), "{sql:?}");
+        }
+        // A subscript is no list; a list of struct literals or of an empty
+        // one holds no group; an empty group with no group after it, a call
+        // with nothing to split inside it, a lambda's `:` in a struct literal
+        // and a cast's spaced parameters are as ever.
+        assert_eq!(x("select l[r.{a,b}]"), "select l[r.a], l[r.b]");
+        for sql in ["select [{'a': 1}, {'a': 2}]", "select [{}]", "select r.{}", "select {'k': list_transform(l, lambda x: x)}"] {
+            assert!(matches!(expand(sql), Ok(Cow::Borrowed(_))), "{sql:?}");
+        }
+        assert_eq!(x("select r.{a,b}.{}"), "select r.a.{}, r.b.{}");
+        assert_eq!(x("select r.{f(a), b}"), "select r.f(a), r.b");
+        assert_eq!(x("select r.{a::DECIMAL(10, 2), b}"), "select r.a::DECIMAL(10, 2), r.b");
+        assert_eq!(x("select f(r.{a,b}), [1, 2]"), "select f(r.a, r.b), [1, 2]");
+        assert_eq!(x("select [f(r.{a,b}), 3]"), "select [f(r.a, r.b), 3]");
+    }
+
+    /// A comment in a group goes with the item before it, and those before
+    /// the first item with the first: each comes out after every
+    /// alternative its item makes, after a space, a line comment with the
+    /// line break that ends it.
+    #[test]
+    fn a_comment_in_a_group_goes_with_its_item() {
+        assert_eq!(x("select r.{a /* keep */, b} from t"), "select r.a /* keep */, r.b from t");
+        assert_eq!(x("select r.{\n  a,  -- the a\n  -- b,\n  c\n} from t"), "select r.a -- the a\n -- b,\n, r.c from t");
+        assert_eq!(x("select r.{a,b -- last\r}, c"), "select r.a, r.b -- last\r, c");
+        assert_eq!(x("select r.{ /* first */ a b/**/}"), "select r.a /* first */, r.b /**/");
+        // After the whole alternative, so a word after the group stays whole.
+        assert_eq!(x("select {first /* f */, last}Name"), "select firstName /* f */, lastName");
+        assert_eq!(x("select r.{a /* a */, b}::INT[2]"), "select r.a::INT[2] /* a */, r.b::INT[2]");
+        // Each alternative carries its items' comments, in the order their
+        // groups are resolved; a group of nothing keeps its own as written.
+        assert_eq!(x("select {a /* A */, b}.{x /* X */ y}"), "select a.x /* A */ /* X */, a.y /* A */, b.x /* X */, b.y");
+        assert_eq!(x("select r.{p.{x /* X */} /* P */}"), "select r.p.x /* P */ /* X */");
+        assert_eq!(x("select r.{a}.{ /* none */ }"), "select r.a.{ /* none */ }");
+        // A comment in a struct literal, a string or a comment is text.
+        assert_eq!(x("select r.{a {'k': 1 /* c */}}"), "select r.a, r.{'k': 1 /* c */}");
     }
 
     /// The statement is read once, and every alternative keeps that reading:
@@ -767,6 +1105,36 @@ mod tests {
         assert_eq!(x(&open).len(), open.len() + 1);
         let open = format!("select r.{{{}}}", "x::a(".repeat(200_000));
         assert_eq!(x(&open).len(), open.len() - 2);
+    }
+
+    /// A subscript or slice belongs to the word before it, whatever it
+    /// holds: the expansion takes it to every alternative, never its first
+    /// half to one and the rest to another.
+    #[test]
+    fn a_subscript_stays_with_its_term() {
+        assert_eq!(x("select t.{l,m}[ 1 ] from t"), "select t.l[ 1 ], t.m[ 1 ] from t");
+        assert_eq!(x("select t.{l,m}[i : j], 2"), "select t.l[i : j], t.m[i : j], 2");
+        assert_eq!(x("select t.{l,m}[f(1, 2)]"), "select t.l[f(1, 2)], t.m[f(1, 2)]");
+        assert_eq!(x("select t.{l,m}[ 'k' ][ /* c */ 1 ]"), "select t.l[ 'k' ][ /* c */ 1 ], t.m[ 'k' ][ /* c */ 1 ]");
+        assert_eq!(x("select r.{a[ 1 ], b} from t"), "select r.a[ 1 ], r.b from t");
+        assert_eq!(x("select x.{a,b}::INT[ 3 ]"), "select x.a::INT[ 3 ], x.b::INT[ 3 ]");
+        // A slice's `:` is no struct literal's.
+        assert_eq!(x("select r.{a[1:2], b}"), "select r.a[1:2], r.b");
+        assert!(matches!(expand("select {'k': l[1:2]}"), Ok(Cow::Borrowed(_))));
+        // Bounds the engine reads on past a space are refused as ever.
+        assert!(expand("select x.{a,b}::INT[ 3 ] ARRAY").unwrap_err().contains("would split the type `INT[ 3 ] ARRAY`"));
+        // A list begins a word and is no subscript; a space before a bracket
+        // ends the term; a bracket that holds a group, or never closes, is
+        // not taken.
+        assert_eq!(x("select r.{a,b}, [1, 2]"), "select r.a, r.b, [1, 2]");
+        assert_eq!(x("select r.{a,b} [1]"), "select r.a, r.b [1]");
+        assert_eq!(x("select l[r.{a,b}]"), "select l[r.a], l[r.b]");
+        assert_eq!(x("select r.{a,b}[1"), "select r.a[1, r.b[1");
+        // Brackets that never close are paired once, as parentheses are.
+        let unclosed = "x[".repeat(200_000);
+        assert_eq!(x(&format!("select r.{{a,b}}{unclosed}")), format!("select r.a{unclosed}, r.b{unclosed}"));
+        let open = format!("select r.{{{}}}", "x[ ".repeat(200_000));
+        assert!(x(&open).len() > open.len());
     }
 
     /// A type the engine reads on past a space or comment would be split
@@ -874,6 +1242,9 @@ mod tests {
 
     type Unit = (Tok, Vec<u8>);
 
+    /// An alternative, and the comments it carries.
+    type Alternative = (Vec<Unit>, Vec<Unit>);
+
     fn units(sql: &str) -> Vec<Unit> {
         let plain = plain_spaces(sql.as_bytes());
         let mut out = Vec::new();
@@ -910,27 +1281,30 @@ mod tests {
 
     /// The expansion worked out a second way, by recursion over the units of
     /// the statement's one reading: what it should become, and how the
-    /// engine should read that; `None` when a term or an item would end
-    /// inside a cast's type.
-    fn reference(sql: &str) -> Option<(Vec<u8>, Vec<Tok>)> {
+    /// engine should read that; or a part of the refusal it should get, the
+    /// first in the statement: a term or an item that would end inside a
+    /// cast's type, or an expansion that would surprise.
+    fn reference(sql: &str) -> Result<(Vec<u8>, Vec<Tok>), &'static str> {
         let units = units(sql);
-        let unchanged = || Some((sql.as_bytes().to_vec(), reading_of(&units)));
+        let unchanged = || Ok((sql.as_bytes().to_vec(), reading_of(&units)));
         let mut out: Vec<Unit> = Vec::new();
-        let (mut depth, mut term, mut split) = (0usize, Vec::new(), false);
+        let (mut depth, mut term, mut refused) = (0usize, Vec::new(), None);
+        let (mut nest, mut listed) = (Vec::new(), false);
         // The term's alternatives written out; how many there were, or
-        // `None` when an item splits a cast.
-        let flush = |out: &mut Vec<Unit>, term: &mut Vec<Unit>| {
-            let alts = if term.iter().any(|u| u.0 == Tok::Code(b'{')) { reference_alternatives(term)? } else { vec![term.clone()] };
+        // the refusal.
+        let flush = |out: &mut Vec<Unit>, term: &mut Vec<Unit>, listed: bool| {
+            let alts = if term.iter().any(|u| u.0 == Tok::Code(b'{')) { reference_alternatives(term, listed)? } else { vec![(term.clone(), vec![])] };
             let n = alts.len();
-            for (k, alt) in alts.into_iter().enumerate() {
+            for (k, (alt, notes)) in alts.into_iter().enumerate() {
                 if k > 0 {
                     out.push((Tok::Code(b','), b",".to_vec()));
                     out.push((Tok::Space, b" ".to_vec()));
                 }
                 out.extend(alt);
+                out.extend(notes);
             }
             term.clear();
-            Some(n)
+            Ok(n)
         };
         let mut k = 0;
         while k < units.len() {
@@ -941,19 +1315,30 @@ mod tests {
                 Tok::Code(b'}') => depth -= 1,
                 _ => {}
             }
-            if let Some(close) = (depth == 0).then(|| reference_type_parameters(&term, &units, k)).flatten() {
+            let close = (depth == 0).then(|| reference_type_parameters(&term, &units, k)).flatten();
+            if let Some(close) = close.or_else(|| (depth == 0 && !term.is_empty()).then(|| reference_subscript(&units, k)).flatten()) {
                 term.extend_from_slice(&units[k..=close]);
                 k = close + 1;
                 continue;
             }
+            if depth == 0 {
+                match unit.0 {
+                    Tok::Code(b'(') => nest.push(false),
+                    Tok::Code(b'[') => nest.push(reference_opens_list(&units, k)),
+                    Tok::Code(b')' | b']') => _ = nest.pop(),
+                    _ => {}
+                }
+            }
             let boundary = depth == 0 && (separates(&unit.0) || matches!(unit.0, Tok::Code(b',' | b'(' | b')' | b';')));
             if boundary {
                 let cast = separates(&unit.0) && reference_cast_beyond(&term, &units[k..]);
-                match flush(&mut out, &mut term) {
-                    Some(n) => split |= n > 1 && cast,
-                    None => split = true,
+                match flush(&mut out, &mut term, listed) {
+                    Ok(n) if n > 1 && cast => _ = refused.get_or_insert(SPLIT),
+                    Ok(_) => {}
+                    Err(why) => _ = refused.get_or_insert(why),
                 }
                 out.push(unit.clone());
+                listed = nest.last() == Some(&true);
             } else {
                 term.push(unit.clone());
             }
@@ -962,10 +1347,105 @@ mod tests {
         if depth != 0 {
             return unchanged();
         }
-        if flush(&mut out, &mut term).is_none() || split {
-            return None;
+        if let Err(why) = flush(&mut out, &mut term, listed) {
+            refused.get_or_insert(why);
         }
-        Some((out.iter().flat_map(|u| u.1.clone()).collect(), reading_of(&out)))
+        if let Some(why) = refused {
+            return Err(why);
+        }
+        Ok((out.iter().flat_map(|u| u.1.clone()).collect(), reading_of(&out)))
+    }
+
+    /// What every refusal of a cast a group would split says.
+    const SPLIT: &str = "would split";
+
+    /// The first group in `term` that a struct literal's lone `:` does not
+    /// mark, with nothing nested in a struct literal: where it opens and
+    /// closes.
+    fn reference_group(term: &[Unit]) -> Option<(usize, usize)> {
+        let close = |open: usize| {
+            let mut depth = 0;
+            for (k, u) in term.iter().enumerate().skip(open) {
+                match u.0 {
+                    Tok::Code(b'{') => depth += 1,
+                    Tok::Code(b'}') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return k;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            unreachable!("a term reaches here balanced")
+        };
+        let mut open = 0;
+        loop {
+            let k = term[open..].iter().position(|u| u.0 == Tok::Code(b'{'))?;
+            let (o, c) = (open + k, close(open + k));
+            let inner = &term[o + 1..c];
+            let (mut depth, mut square, mut round) = (0, 0usize, 0usize);
+            let colon = (0..inner.len()).any(|j| {
+                match inner[j].0 {
+                    Tok::Code(b'{') => depth += 1,
+                    Tok::Code(b'}') => depth -= 1,
+                    Tok::Code(b'[') => square += 1,
+                    Tok::Code(b']') => square = square.saturating_sub(1),
+                    Tok::Code(b'(') => round += 1,
+                    Tok::Code(b')') => round = round.saturating_sub(1),
+                    _ => {}
+                }
+                let colon = |j: usize| inner.get(j).is_some_and(|u| u.0 == Tok::Code(b':'));
+                depth == 0 && square == 0 && round == 0 && colon(j) && !(j > 0 && colon(j - 1)) && !colon(j + 1)
+            });
+            if !colon {
+                return Some((o, c));
+            }
+            open = c + 1;
+        }
+    }
+
+    /// Whether the units between a group's braces hold an item.
+    fn reference_holds_item(inner: &[Unit]) -> bool {
+        inner.iter().any(|u| !separates(&u.0) && u.0 != Tok::Code(b','))
+    }
+
+    /// Whether the `[` at `units[j]` opens a list: first, after a separator
+    /// or an operator, or after the word `ARRAY`.
+    fn reference_opens_list(units: &[Unit], j: usize) -> bool {
+        let word = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$') || c >= 0x80;
+        let code = |j: usize| match units[j].0 {
+            Tok::Code(c) => Some(c),
+            _ => None,
+        };
+        if j == 0 || separates(&units[j - 1].0) {
+            return true;
+        }
+        match code(j - 1) {
+            None => false,
+            Some(c) if !word(c) => !matches!(c, b']' | b')' | b'}'),
+            Some(_) => {
+                let five: Option<Vec<u8>> = (j.saturating_sub(5)..j).map(code).collect();
+                j >= 5 && five.is_some_and(|w| w.eq_ignore_ascii_case(b"array")) && (j == 5 || !code(j - 6).is_some_and(word))
+            }
+        }
+    }
+
+    /// Whether the unit at `at` sits inside a list's brackets, with no
+    /// parentheses between.
+    fn reference_in_list(term: &[Unit], at: usize) -> bool {
+        let mut nest = Vec::new();
+        for (j, u) in term.iter().enumerate().take(at) {
+            match u.0 {
+                Tok::Code(b'(') => nest.push(false),
+                Tok::Code(b'[') => nest.push(reference_opens_list(term, j)),
+                Tok::Code(b']' | b')') => {
+                    nest.pop();
+                }
+                _ => {}
+            }
+        }
+        nest.last() == Some(&true)
     }
 
     /// Whether `word` ends in a cast whose type the engine reads on past the
@@ -980,7 +1460,7 @@ mod tests {
         let ident = |u: &Unit| code(u).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
         let mut n = word.len();
         while n > 0 && code(&word[n - 1]) == Some(b']') {
-            let digits = word[..n - 1].iter().rev().take_while(|u| code(u).is_some_and(|c| c.is_ascii_digit())).count();
+            let digits = word[..n - 1].iter().rev().take_while(|u| separates(&u.0) || code(u).is_some_and(|c| c.is_ascii_digit())).count();
             if n < digits + 2 || code(&word[n - 2 - digits]) != Some(b'[') {
                 return false;
             }
@@ -1056,50 +1536,52 @@ mod tests {
         None
     }
 
-    fn reference_alternatives(term: &[Unit]) -> Option<Vec<Vec<Unit>>> {
-        let close = |open: usize| {
-            let mut depth = 0;
-            for (k, u) in term.iter().enumerate().skip(open) {
-                match u.0 {
-                    Tok::Code(b'{') => depth += 1,
-                    Tok::Code(b'}') => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return k;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            unreachable!("a term reaches here balanced")
-        };
-        let mut open = 0;
-        let group = loop {
-            match term[open..].iter().position(|u| u.0 == Tok::Code(b'{')) {
-                None => return Some(vec![term.to_vec()]),
-                Some(k) => {
-                    let (o, c) = (open + k, close(open + k));
-                    let inner = &term[o + 1..c];
-                    let mut depth = 0;
-                    let colon = (0..inner.len()).any(|j| {
-                        match inner[j].0 {
-                            Tok::Code(b'{') => depth += 1,
-                            Tok::Code(b'}') => depth -= 1,
-                            _ => {}
-                        }
-                        let colon = |j: usize| inner.get(j).is_some_and(|u| u.0 == Tok::Code(b':'));
-                        depth == 0 && colon(j) && !(j > 0 && colon(j - 1)) && !colon(j + 1)
-                    });
-                    if !colon {
-                        break (o, c);
-                    }
-                    open = c + 1;
-                }
-            }
-        };
-        let (o, c) = group;
-        let mut items: Vec<Vec<Unit>> = vec![Vec::new()];
+    /// Where the brackets that open at `units[open]` close, when they hold
+    /// no brace or `;`: a subscript or slice, part of the word before it.
+    fn reference_subscript(units: &[Unit], open: usize) -> Option<usize> {
+        if units[open].0 != Tok::Code(b'[') {
+            return None;
+        }
         let mut depth = 0;
+        for (j, u) in units.iter().enumerate().skip(open) {
+            match u.0 {
+                Tok::Code(b'[') => depth += 1,
+                Tok::Code(b']') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                Tok::Code(b'{' | b'}' | b';') => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Each alternative a term stands for, beside the comments it carries:
+    /// those beside its item in each group, in the order the groups are
+    /// resolved, each after a space, a line comment with its line break.
+    /// `listed` when the term begins inside a list's brackets.
+    fn reference_alternatives(term: &[Unit], listed: bool) -> Result<Vec<Alternative>, &'static str> {
+        let Some(group) = reference_group(term) else {
+            return Ok(vec![(term.to_vec(), vec![])]);
+        };
+        if !reference_holds_item(&term[group.0 + 1..group.1]) {
+            let mut after = group.1 + 1;
+            while let Some((o, c)) = reference_group(&term[after..]) {
+                if reference_holds_item(&term[after + o + 1..after + c]) {
+                    return Err(super::EMPTY);
+                }
+                after += c + 1;
+            }
+            return Ok(vec![(term.to_vec(), vec![])]);
+        }
+        let (o, c) = group;
+        let mut items: Vec<Alternative> = vec![(Vec::new(), Vec::new())];
+        // Comments before the first item go with it.
+        let mut lead: Vec<Unit> = Vec::new();
+        let (mut depth, mut round) = (0, 0usize);
         let inner = &term[o + 1..c];
         let mut k = 0;
         while k < inner.len() {
@@ -1109,31 +1591,54 @@ mod tests {
                 Tok::Code(b'}') => depth -= 1,
                 _ => {}
             }
-            let item = items.last_mut().unwrap();
-            if let Some(close) = (depth == 0).then(|| reference_type_parameters(item, inner, k)).flatten() {
+            let item = &mut items.last_mut().unwrap().0;
+            let close = (depth == 0).then(|| reference_type_parameters(item, inner, k)).flatten();
+            if let Some(close) = close.or_else(|| (depth == 0 && !item.is_empty()).then(|| reference_subscript(inner, k)).flatten()) {
                 item.extend_from_slice(&inner[k..=close]);
                 k = close + 1;
                 continue;
             }
+            match u.0 {
+                Tok::Code(b'(') if depth == 0 => round += 1,
+                Tok::Code(b')') if depth == 0 => round = round.saturating_sub(1),
+                _ => {}
+            }
             if depth == 0 && (separates(&u.0) || u.0 == Tok::Code(b',')) {
-                if separates(&u.0) && reference_cast_beyond(item, &inner[k..]) {
-                    return None;
+                if round > 0 {
+                    return Err(super::CALL);
                 }
-                items.push(Vec::new());
+                if separates(&u.0) && reference_cast_beyond(item, &inner[k..]) {
+                    return Err(SPLIT);
+                }
+                if let Tok::Comment(read) = &u.0 {
+                    let mut note = vec![(Tok::Space, b" ".to_vec()), u.clone()];
+                    if read.starts_with(b"--") {
+                        note.push(inner[k + 1].clone());
+                    }
+                    match items.iter_mut().rev().find(|(item, _)| !item.is_empty()) {
+                        Some((_, notes)) => notes.extend(note),
+                        None => lead.extend(note),
+                    }
+                }
+                items.push((Vec::new(), Vec::new()));
             } else {
                 item.push(u.clone());
             }
             k += 1;
         }
-        items.retain(|item| !item.is_empty());
-        if items.is_empty() {
-            return Some(vec![term.to_vec()]);
+        items.retain(|(item, _)| !item.is_empty());
+        if reference_in_list(term, o) || listed {
+            return Err(super::LIST);
         }
+        lead.append(&mut items[0].1);
+        items[0].1 = lead;
         let mut alts = Vec::new();
-        for item in items {
-            alts.extend(reference_alternatives(&[&term[..o], &item[..], &term[c + 1..]].concat())?);
+        for (item, notes) in items {
+            for (alt, deeper) in reference_alternatives(&[&term[..o], &item[..], &term[c + 1..]].concat(), false)? {
+                alts.push((alt, [&notes[..], &deeper[..]].concat()));
+            }
         }
-        Some(alts)
+        Ok(alts)
     }
 
     /// What a generated statement is made of: code, groups, casts, the quotes
@@ -1144,6 +1649,9 @@ mod tests {
         "{", "}", "{a,b}", "{a b}", "r.{a,b}", "{'k': 1}", "{}", "{a,{b,c}}", "{a::INT b}", "{x}",
         "::DECIMAL(10,2)", "::T(", "::S(a {b} c)", "{a::V(1, 2) b}", "::X(E'\\', \"(\")", "2(",
         "::DOUBLE", " PRECISION", "::INTERVAL", " year", " ARRAY", "::INT[]", "[2]", " [", "]", " (",
+        "[", "[ 1 ]", "[i : j]", "[ 3 ]", "[f(1, 2)]", "['k']", "{l[1:2]}",
+        "{a /* c */ b}", "{a -- c\n, b}", "{ /* ' */ x}", "{x,y -- c\r}",
+        "[r.{a,b}]", "ARRAY[", "+[", "{f(a, b) c}", "{g(l, lambda y: y)}", "{f(x)}", "{h(a b)}",
         "'", "'{a,b}'", "''", "'\\'", "E'\\''", "e'a\\\\b'", "\"", "\"{a,b}\"", "`", "`{a,b}`", "`it's`",
         "$$", "$$x.{a,b}$$", "$t$", "$t${a,b}$t$", "$t$t$",
         "--", "-- {a,b}\n", "/*", "*/", "/* ' */", "/* {a,b} */", "\n", "\r",
@@ -1170,12 +1678,13 @@ mod tests {
             let sql: String = (0..len).map(|_| FRAGMENTS[(next() % FRAGMENTS.len() as u64) as usize]).collect();
             let got = expand(&sql);
             let (ok, want) = match (reference(&sql), &got) {
-                // A cast's type a term or an item would split.
-                (None, got) => {
+                // A cast's type a term or an item would split, or an
+                // expansion that would surprise.
+                (Err(why), got) => {
                     refused += 1;
-                    (got.as_ref().is_err_and(|e| e.contains("would split")), None)
+                    (got.as_ref().is_err_and(|e| e.contains(why)), None)
                 }
-                (Some((want, read)), got) => {
+                (Ok((want, read)), got) => {
                     let want = String::from_utf8(want).unwrap();
                     let ok = match got {
                         _ if want == sql => *got == Ok(Cow::Borrowed(sql.as_str())),

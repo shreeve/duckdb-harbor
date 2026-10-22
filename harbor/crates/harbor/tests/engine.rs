@@ -33,7 +33,7 @@ macro_rules! ok {
         let code = unsafe { ($eng.api.$call.expect(stringify!($call)))($($arg,)* &mut err) };
         assert!(
             code == ffi::ERROR_NONE,
-            "{}: {}", stringify!($call), Error::take(&$eng.api, code, err)
+            "{}: {}", stringify!($call), unsafe { Error::take(&$eng.api, code, err) }
         );
     }};
 }
@@ -122,11 +122,10 @@ mod smoke {
             code
         };
         assert_ne!(code, ffi::ERROR_NONE, "SELEKT parsed?!");
-        let e = Error::take(&eng.api, code, err);
+        let e = unsafe { Error::take(&eng.api, code, err) };
         assert!(!e.message.is_empty(), "error carried no text");
         eprintln!("v2: parse error as expected — {e}");
 
-        let mut iter = iter;
         unsafe {
             (eng.api.statement_iterator_destroy.unwrap())(&mut iter);
             (eng.api.connection_destroy.unwrap())(&mut conn);
@@ -200,21 +199,22 @@ mod conn {
         params: &[Param],
     ) -> Result<Vec<String>, harbor::engine::Error> {
         let api = &engine().unwrap().api;
-        let json = c.json()?;
         let stmts = c.statements(sql)?;
         let mut out = Vec::new();
         for stmt in stmts.iter() {
             // As the server does: a document aimed at a VARIANT is marked.
             let mut params = params.to_vec();
             let bound = c.bind(stmt, &mut params)?;
+            let json = c.json()?;
             let mut stream = c.execute(stmt, bound, |_| true)?.expect("wanted");
             // Encode through the shared cell encoder so this test exercises
             // the same path the server will.
             let columns = std::mem::take(&mut stream.columns);
             let types: Vec<&harbor::engine::encode::Type> = columns.iter().map(|(_, t)| t).collect();
-            while let Some(chunk) = stream.next_chunk()? {
+            while let Some(mut chunk) = stream.next_chunk()? {
+                let rows = chunk.rows();
                 let readers = chunk.readers(types.len())?;
-                for row in 0..chunk.rows {
+                for row in 0..rows {
                     let mut line = String::new();
                     for (i, ty) in types.iter().enumerate() {
                         if i > 0 {
@@ -548,13 +548,14 @@ mod conn {
         let Some(_) = v2_engine() else { return };
         let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
         c.execute_batch("CREATE TABLE t(i BIGINT)").unwrap();
-        let open = |c: &mut conn::Conn, sql: &str| {
+        // A function, not a closure: the stream it returns borrows `c`.
+        fn open<'c>(c: &'c mut conn::Conn, sql: &str) -> (bool, conn::Stream<'c>) {
             let stmts = c.statements(sql).unwrap();
             let bound = c.bind(&stmts[0], &mut []).unwrap();
             let mut retained = None;
             let stream = c.execute(&stmts[0], bound, |r| { retained = Some(r); true }).unwrap().expect("wanted");
             (retained.expect("told"), stream)
-        };
+        }
         assert!(!open(&mut c, "SELECT 42").0, "a SELECT streams");
         let handle = c.interrupt_handle();
         for (sql, rows_back) in [
@@ -565,9 +566,9 @@ mod conn {
             assert!(retained, "{sql}");
             let first = stream.next_chunk().unwrap().expect("a first chunk");
             handle.interrupt();
-            let mut back = first.rows;
+            let mut back = first.rows();
             while let Some(chunk) = stream.next_chunk().unwrap() {
-                back += chunk.rows;
+                back += chunk.rows();
             }
             assert_eq!(back, rows_back, "{sql}");
         }
@@ -701,7 +702,7 @@ mod wire {
                 let mut err: ffi::error_info_handle = std::ptr::null_mut();
                 let code = unsafe { (api.$f.expect(stringify!($f)))($($a,)* &mut err) };
                 if code != ffi::ERROR_NONE {
-                    return Err(Error::take(api, code, err));
+                    return Err(unsafe { Error::take(api, code, err) });
                 }
             }};
         }
@@ -714,10 +715,13 @@ mod wire {
         ok!(instance_attach(db, std::ptr::null(), &memory, std::ptr::null_mut(), true));
         let mut conn: ffi::connection_handle = std::ptr::null_mut();
         ok!(connection_create(db, &mut conn));
-        let mut json = encode::Json { factory: std::ptr::null_mut(), ty: std::ptr::null_mut() };
-        ok!(connection_get_factory(conn, &mut json.factory));
+        let mut factory: ffi::factory_handle = std::ptr::null_mut();
+        ok!(connection_get_factory(conn, &mut factory));
+        let mut json_ty: ffi::logical_type_handle = std::ptr::null_mut();
         let text = ffi::str_t { ptr: c"JSON".as_ptr(), len: 4 };
-        ok!(factory_create_type_from_text(json.factory, &text, &mut json.ty));
+        ok!(factory_create_type_from_text(factory, &text, &mut json_ty));
+        // Both live until the teardown below.
+        let json = unsafe { encode::Json::new(factory, json_ty) };
 
         let sql_c = std::ffi::CString::new(sql).unwrap();
         let mut iter: ffi::statement_iterator_handle = std::ptr::null_mut();
@@ -733,7 +737,7 @@ mod wire {
             let mut result: ffi::result_handle = std::ptr::null_mut();
             ok!(statement_execute(conn, stmt, std::ptr::null(), std::ptr::null(), 0, &mut result));
 
-            let columns = encode::result_columns(api, result)?;
+            let columns = unsafe { encode::result_columns(api, result) }?;
             let mut schema = String::new();
             for (i, (name, ty)) in columns.iter().enumerate() {
                 if i > 0 {
@@ -755,7 +759,8 @@ mod wire {
                 for i in 0..columns.len() {
                     let mut vector: ffi::vector_handle = std::ptr::null_mut();
                     ok!(data_chunk_get_vector(chunk, i as ffi::idx_t, &mut vector));
-                    readers.push(encode::Reader::of(api, vector)?);
+                    // The chunk is destroyed after its rows are read.
+                    readers.push(unsafe { encode::Reader::of(api, vector) }?);
                 }
                 for row in 0..rows as usize {
                     let mut line = String::new();
@@ -767,6 +772,7 @@ mod wire {
                     }
                     lines.push(line);
                 }
+                drop(readers);
                 unsafe { (api.data_chunk_destroy.unwrap())(&mut chunk) };
             }
             unsafe {
@@ -775,7 +781,7 @@ mod wire {
             }
         }
 
-        unsafe { (api.logical_type_destroy.unwrap())(&mut json.ty) };
+        unsafe { (api.logical_type_destroy.unwrap())(&mut json_ty) };
         unsafe {
             (api.statement_iterator_destroy.unwrap())(&mut iter);
             (api.connection_destroy.unwrap())(&mut conn);

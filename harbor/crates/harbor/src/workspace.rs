@@ -561,7 +561,7 @@ mod tests {
         // workspace gains no schema.
         assert_eq!(rewrite(&[], &[], false, "workspace"), None);
         let app = rec("app", "/x/o'b.sqlite", "sqlite");
-        let sql = rewrite(&[app.clone()], &["gone".into()], false, "workspace").unwrap();
+        let sql = rewrite(std::slice::from_ref(&app), &["gone".into()], false, "workspace").unwrap();
         let ddl = open::record_ddl_in("workspace");
         assert_eq!(
             sql.split(";\n").collect::<Vec<_>>(),

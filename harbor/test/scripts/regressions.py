@@ -557,6 +557,17 @@ class CommitRaces(Harbor, unittest.TestCase):
                 doc = self.sql("SELECT r.{a,b}" + gap + "FROM (SELECT {'a': 1, 'b': 2} AS r)")
                 self.assertEqual(doc["data"], [[1, 2]])
 
+    def test_a_comment_in_a_brace_group_comes_out_with_its_item(self):
+        # A comment between items comes out after each alternative its item
+        # makes, a line comment with its line break: without it, the comment
+        # would hide the rest of the line, the alternatives after it among it.
+        source = "FROM (SELECT {'a': 1, 'b': 2, 'c': 3} AS r)"
+        for sql, data in (("SELECT r.{a -- the a\n, b /* the b */, c} ", [1, 2, 3]),
+                          ("SELECT r.{ -- first\r a,\n  -- b,\n  c -- last\n} ", [1, 3]),
+                          ("SELECT r.{a /* , */ c}, r.{b}-- b\n", [1, 3, 2])):
+            with self.subTest(sql=sql):
+                self.assertEqual(self.sql(sql + source)["data"], [data])
+
     def brace_refusal(self, sql):
         # Harbor's own 400, before the engine sees anything.
         doc = self.sql(sql, status=400)
@@ -608,6 +619,29 @@ class CommitRaces(Harbor, unittest.TestCase):
         # columns inside the one CAST, and the engine refuses it.
         sql = "SELECT CAST(r.{a,b} AS DECIMAL(10,2))" + source
         self.assertIn("CAST(r.a, r.b AS", self.sql(sql, status=400)["message"])
+
+    def test_a_subscript_stays_with_every_alternative(self):
+        # `[ 1 ]` belongs to the word before it: cut at its space, the first
+        # alternative would end in `[`, and the engine would refuse it. A
+        # slice's `:` inside a group is no struct literal's.
+        source = " FROM (SELECT {'a': [10, 20, 30], 'b': [40, 50, 60]} AS r)"
+        doc = self.sql("SELECT r.{a,b}[ 1 ], r.{a,b}[2 : 3], r.{a[ -1 ], b[1:1]}" + source)
+        self.assertEqual(doc["data"], [[10, 40, [20, 30], [50, 60], 30, [40]]])
+
+    def test_a_brace_expansion_that_would_surprise_is_refused(self):
+        # A group in a list's brackets would make a list of each alternative,
+        # an empty group would leave the groups after it unexpanded, and an
+        # item cut inside a call's parentheses would split the call. Each is
+        # refused, saying what to write; the forms beside them run.
+        source = " FROM (SELECT {'a': 1, 'b': 2} AS r, [1, 2] AS l)"
+        for sql, fix in (("SELECT [r.{a,b}]", "write the list's items out"),
+                         ("SELECT [0, r.{a,b}]", "write the list's items out"),
+                         ("SELECT r.{}.{a,b}", "take it out, or write the alternatives out"),
+                         ("SELECT r.{list_transform(l, lambda x: x), b}", "as in a call or a lambda"),
+                         ("SELECT r.{coalesce(a, b), b}", "as in a call or a lambda")):
+            with self.subTest(sql=sql):
+                self.assertIn(fix, self.brace_refusal(sql + source))
+        self.assertEqual(self.sql("SELECT [r.a, r.b], [greatest(r.{a,b})]" + source)["data"], [[[1, 2], [2]]])
 
     def test_a_cast_a_brace_group_would_split_is_refused(self):
         # The engine reads `::DECIMAL (10,2)` and `::TIMESTAMP WITH TIME ZONE`

@@ -1328,6 +1328,56 @@ mod peer {
         assert_eq!((one.as_str(), two.as_str()), ("one", "two"));
     }
 
+    /// While a pipelined request waits for its turn nothing reads the
+    /// connection for the request ahead of it, and its client's leaving is
+    /// still seen; the request that waited is never handed out.
+    #[test]
+    fn a_client_that_leaves_behind_a_pipelined_request_is_gone() {
+        let (server, mut client) = support::new_one_server_one_client();
+        write!(
+            client,
+            "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nPOST /2 HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+        )
+        .unwrap();
+        let first = support::recv(&server);
+        assert!(stays_open(&first.peer()), "a pipelined request read as a departure");
+
+        drop(client);
+        assert!(closes(&first.peer()), "the client left and the request ahead never saw it");
+        let _ = first.respond(justhttp::Response::from_string("one"));
+        let second = server.recv_timeout(Duration::from_millis(500)).unwrap();
+        assert!(second.is_none(), "a request of a client that left was handed out");
+    }
+
+    /// What a look for the client's leaving reads ahead is read in its
+    /// place: a body past the buffered size and the request after it.
+    #[test]
+    fn what_is_read_ahead_is_read_in_order() {
+        let (server, mut client) = support::new_one_server_one_client();
+        let body: String = (0..5000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        write!(
+            client,
+            "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nPOST /2 HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n{body}\
+             GET /3 HTTP/1.1\r\nHost: x\r\n\r\n"
+        )
+        .unwrap();
+        let first = support::recv(&server);
+        assert!(stays_open(&first.peer()), "a pipelined request read as a departure");
+        first.respond(justhttp::Response::from_string("one")).unwrap();
+
+        let mut second = support::recv(&server);
+        assert_eq!(second.url(), "/2");
+        let mut read = String::new();
+        second.as_reader().read_to_string(&mut read).unwrap();
+        assert_eq!(read, body);
+        second.respond(justhttp::Response::from_string("two")).unwrap();
+        let third = support::recv(&server);
+        assert_eq!(third.url(), "/3");
+        third.respond(justhttp::Response::from_string("three")).unwrap();
+        let answers: Vec<String> = (0..3).map(|_| support::read_response(&mut client).1).collect();
+        assert_eq!(answers, ["one", "two", "three"]);
+    }
+
     /// The last request on a connection is still watched: nothing reads the
     /// next request there, so the connection reads on until it is answered.
     #[test]
@@ -1388,6 +1438,23 @@ mod peer {
 
         drop(client);
         assert!(closes(&peer), "the client closed and the request never saw it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_client_that_leaves_behind_a_pipelined_request_is_gone() {
+        let path = std::env::temp_dir().join(format!("justhttp-pipe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let server = justhttp::Server::http_unix(&path).unwrap();
+        let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        write!(client, "GET /1 HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let first = support::recv(&server);
+        assert!(stays_open(&first.peer()), "a pipelined request read as a departure");
+
+        drop(client);
+        assert!(closes(&first.peer()), "the client left and the request ahead never saw it");
+        let _ = first.respond(justhttp::Response::from_string("one"));
+        assert!(server.recv_timeout(Duration::from_millis(500)).unwrap().is_none());
     }
 }
 

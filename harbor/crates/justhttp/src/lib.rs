@@ -222,6 +222,13 @@ impl Server {
 /// The accept loop for one listener: accepted connections are dispatched to
 /// the task pool every listener shares, and every request they produce lands
 /// in the shared queue.
+/// The ceiling on how long a single read may block. A request that has not
+/// started yet (an idle keep-alive connection) waits through these ticks
+/// forever; once a request is under way this is what stops a client from
+/// holding a serving thread — or an unbounded header buffer — open at one
+/// byte per minute. See conn.rs.
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn spawn_accept(
     server: stream::Listener,
     inside_close_trigger: Arc<AtomicBool>,
@@ -237,13 +244,6 @@ fn spawn_accept(
             // write_all resets this per syscall on any forward progress, the
             // real reclaim is somewhat longer, which is fine for a backstop.
             const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-
-            // The ceiling on how long a single read may block. A request that
-            // has not started yet (an idle keep-alive connection) waits through
-            // these ticks forever; once a request is under way this is what
-            // stops a client from holding a serving thread — or an unbounded
-            // header buffer — open at one byte per minute. See conn.rs.
-            const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
             // How long to wait after a transient accept failure before trying
             // again, and the ceiling that backoff climbs to.
@@ -403,8 +403,8 @@ impl Drop for Server {
             self.close_doors();
         }
         // Then sweep every unix socket path off disk.
+        #[cfg(unix)]
         for addr in &self.listening_addrs {
-            #[cfg(unix)]
             if let ListenAddr::Unix(addr) = addr {
                 if let Some(path) = addr.as_pathname() {
                     let _ = std::fs::remove_file(path);

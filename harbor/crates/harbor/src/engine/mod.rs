@@ -23,7 +23,9 @@ macro_rules! call {
         #[allow(unused_unsafe)]
         let code = unsafe { f($($a,)* &mut err) };
         if code != ffi::ERROR_NONE {
-            return Err(Error::take(api, code, err));
+            // The call's own out-param, taken once.
+            #[allow(unused_unsafe)]
+            return Err(unsafe { Error::take(api, code, err) });
         }
     }};
 }
@@ -193,7 +195,7 @@ fn boot(path: &Path) -> Result<Engine, String> {
     let mut err = std::ptr::null_mut();
     let code = unsafe { version_fn(&mut ver, &mut err) };
     if code != ffi::ERROR_NONE {
-        return Err(Error::take(&api, code, err).to_string());
+        return Err(unsafe { Error::take(&api, code, err) }.to_string());
     }
     let version = unsafe { str_view(&ver) }.to_owned();
 
@@ -218,14 +220,18 @@ pub struct Error {
 impl Error {
     /// Consume an error_info out-param: read its text, destroy it, and fold
     /// both into one value. `info` may be null — the code still stands.
-    pub fn take(api: &ffi::Api, code: ffi::ERROR, mut info: ffi::error_info_handle) -> Error {
+    ///
+    /// # Safety
+    /// `info` must be null or an error_info the engine handed out and nobody
+    /// has destroyed; it is destroyed here, and must not be used after.
+    pub unsafe fn take(api: &ffi::Api, code: ffi::ERROR, mut info: ffi::error_info_handle) -> Error {
         let mut message = String::new();
         if !info.is_null() {
             let mut text = ffi::str_t { ptr: std::ptr::null(), len: 0 };
-            if let Some(get) = api.error_info_get_text {
-                if unsafe { get(info, &mut text) } == ffi::ERROR_NONE {
-                    message = unsafe { str_view(&text) }.to_owned();
-                }
+            if let Some(get) = api.error_info_get_text
+                && unsafe { get(info, &mut text) } == ffi::ERROR_NONE
+            {
+                message = unsafe { str_view(&text) }.to_owned();
             }
             if let Some(destroy) = api.error_info_destroy {
                 unsafe { destroy(&mut info) };

@@ -8,6 +8,7 @@
 //! this module owns everything that touches a vector view.
 
 use std::cell::OnceCell;
+use std::marker::PhantomData;
 
 use super::ffi;
 use super::{Error, destroy_value, str_view};
@@ -42,7 +43,7 @@ pub struct Type {
 
 impl Type {
     /// Read a borrowed logical_type handle into an owned tree.
-    pub fn of(api: &ffi::Api, lt: ffi::logical_type_handle) -> Result<Type, Error> {
+    fn of(api: &ffi::Api, lt: ffi::logical_type_handle) -> Result<Type, Error> {
         let mut id: ffi::LOGICAL_TYPE_ID = 0;
         call!(api, logical_type_get_id(lt, &mut id));
         let name = sized_text(api, api.logical_type_to_text, "logical_type_to_text", lt)?;
@@ -133,7 +134,10 @@ fn param(api: &ffi::Api, lt: ffi::logical_type_handle, i: ffi::idx_t) -> Result<
 }
 
 /// The columns of a result: names and owned type trees.
-pub fn result_columns(api: &ffi::Api, result: ffi::result_handle) -> Result<Vec<(String, Type)>, Error> {
+///
+/// # Safety
+/// `result` must be a live result handle.
+pub unsafe fn result_columns(api: &ffi::Api, result: ffi::result_handle) -> Result<Vec<(String, Type)>, Error> {
     let mut schema: ffi::schema_handle = std::ptr::null_mut();
     call!(api, result_get_schema(result, &mut schema));
     let columns = (|| -> Result<Vec<(String, Type)>, Error> {
@@ -302,25 +306,28 @@ fn is_lossless(id: ffi::LOGICAL_TYPE_ID) -> bool {
 // The reader tree: borrowed views over one chunk, built once per chunk.
 // ---------------------------------------------------------------------------
 
-/// One vector's view plus its children, all borrowed from the owning chunk.
-/// Valid until that chunk is destroyed.
-pub struct Reader {
+/// One vector's view plus its children, all borrowed from the owning chunk
+/// for `'k`, which the chunk outlives.
+pub struct Reader<'k> {
     view: ffi::vector_view_t,
     constant: bool,
-    children: Vec<Reader>,
+    children: Vec<Reader<'k>>,
     /// Kept for the single-cell value bridge (GEOMETRY and the like) and
     /// for the cast of a VARIANT vector.
     vector: ffi::vector_handle,
     /// A VARIANT vector as JSON, cast whole on its first cell; None when the
     /// cast failed, and its cells are read one at a time.
-    json: OnceCell<Option<Cast>>,
+    json: OnceCell<Option<Cast<'k>>>,
+    _chunk: PhantomData<&'k ()>,
 }
 
 /// A vector cast whole into a chunk of its own, which this owns.
-struct Cast {
+struct Cast<'k> {
     /// The cast's vector. Built after the cast, so it reads what the cast
-    /// wrote.
-    reader: Box<Reader>,
+    /// wrote. It points into `_chunk`, not into the chunk `'k` borrows;
+    /// it carries `'k` because the cast lives inside the reader that does,
+    /// and it is only ever lent out, never moved out of the cast.
+    reader: Box<Reader<'k>>,
     /// How many rows the cast holds.
     rows: usize,
     /// Whether a row did not convert: such a row is NULL in the cast, and is
@@ -344,13 +351,13 @@ impl Drop for Owned {
     }
 }
 
-impl Cast {
+impl<'k> Cast<'k> {
     /// `source`, every row of it, cast to `json`'s type: one engine call for
     /// the vector in place of three for each of its cells. The engine's cast
     /// may fail the whole vector for one row's sake; the caller then reads
     /// it cell by cell, so the rows before that one still go out and the
     /// error is that row's.
-    fn to_json(api: &ffi::Api, source: ffi::vector_handle, json: Json) -> Result<Cast, Error> {
+    fn to_json(api: &ffi::Api, source: ffi::vector_handle, json: Json<'_>) -> Result<Cast<'k>, Error> {
         let mut chunk = Owned { raw: std::ptr::null_mut(), destroy: api.data_chunk_destroy };
         call!(api, data_chunk_create(json.factory, &json.ty, 1, &mut chunk.raw));
         let mut target: ffi::vector_handle = std::ptr::null_mut();
@@ -361,18 +368,26 @@ impl Cast {
         // The reason is the row's to give when it is read on its own.
         let failed = !why.is_null();
         if failed {
-            drop(Error::take(api, ffi::ERROR_INPUT_INVALID, why));
+            drop(unsafe { Error::take(api, ffi::ERROR_INPUT_INVALID, why) });
         }
         let mut rows: ffi::idx_t = 0;
         call!(api, vector_get_size(target, &mut rows));
-        let reader = Box::new(Reader::of(api, target)?);
+        // The target is the vector of the cast's own chunk, which outlives
+        // the reader: it is dropped after it.
+        let reader = Box::new(unsafe { Reader::of(api, target) }?);
         Ok(Cast { reader, rows: rows as usize, failed, _chunk: chunk })
     }
 }
 
-impl Reader {
+impl<'k> Reader<'k> {
     /// Build the reader for one column vector of a chunk, recursively.
-    pub fn of(api: &ffi::Api, vector: ffi::vector_handle) -> Result<Reader, Error> {
+    /// [`Chunk::readers`](super::conn::Chunk::readers) builds them for a
+    /// chunk off a result.
+    ///
+    /// # Safety
+    /// `vector` must be a vector borrowed from a chunk that stays alive, and
+    /// that nothing else reads into or reshapes, for `'k`.
+    pub unsafe fn of(api: &ffi::Api, vector: ffi::vector_handle) -> Result<Reader<'k>, Error> {
         let mut vtype: ffi::VECTOR_TYPE = 0;
         call!(api, vector_get_vector_type(vector, &mut vtype));
         // FSST / SEQUENCE / SHREDDED have no committed view; materialize.
@@ -396,9 +411,17 @@ impl Reader {
         for i in 0..n {
             let mut child: ffi::vector_handle = std::ptr::null_mut();
             call!(api, vector_get_child(vector, i, &mut child));
-            children.push(Reader::of(api, child)?);
+            // A child lives as long as the chunk its parent belongs to.
+            children.push(unsafe { Reader::of(api, child) }?);
         }
-        Ok(Reader { view, constant: vtype == ffi::VECTOR_TYPE_CONSTANT, children, vector, json: OnceCell::new() })
+        Ok(Reader {
+            view,
+            constant: vtype == ffi::VECTOR_TYPE_CONSTANT,
+            children,
+            vector,
+            json: OnceCell::new(),
+            _chunk: PhantomData,
+        })
     }
 
     /// The physical index behind a logical row: through the selection vector
@@ -429,13 +452,26 @@ impl Reader {
 /// The one cast the encoder performs itself: a VARIANT to JSON, by the
 /// factory of the connection whose result holds the value, with its cast
 /// functions and settings. A connection makes one lazily
-/// ([`Conn::json`](super::conn::Conn::json)) and hands it to [`emit_cell`];
-/// without one, a VARIANT goes out as the engine's display text.
+/// ([`Conn::json`](super::conn::Conn::json)) and lends it for `'c`, as long
+/// as it is borrowed; it is handed to [`emit_cell`]. Without one, a VARIANT
+/// goes out as the engine's display text.
 #[derive(Clone, Copy)]
-pub struct Json {
-    pub factory: ffi::factory_handle,
+pub struct Json<'c> {
+    factory: ffi::factory_handle,
     /// The JSON logical type, owned by whoever made it.
-    pub ty: ffi::logical_type_handle,
+    ty: ffi::logical_type_handle,
+    _owner: PhantomData<&'c ()>,
+}
+
+impl<'c> Json<'c> {
+    /// The caster made of a connection's factory and its JSON type.
+    ///
+    /// # Safety
+    /// Both handles must stay alive for `'c`: the factory's connection is
+    /// not destroyed, and the type is not destroyed.
+    pub unsafe fn new(factory: ffi::factory_handle, ty: ffi::logical_type_handle) -> Json<'c> {
+        Json { factory, ty, _owner: PhantomData }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,8 +482,8 @@ pub struct Json {
 pub fn emit_cell(
     out: &mut String,
     api: &ffi::Api,
-    json: Option<Json>,
-    r: &Reader,
+    json: Option<Json<'_>>,
+    r: &Reader<'_>,
     ty: &Type,
     row: usize,
 ) -> Result<(), Error> {
@@ -487,9 +523,9 @@ pub fn emit_cell(
             LOGICAL_TYPE_ID_DOUBLE => push_float(out, r.get::<f64>(phys)),
             LOGICAL_TYPE_ID_DECIMAL => {
                 let v: i128 = match ty.decimal.0 {
-                    ..=4 => r.get::<i16>(phys) as i128,
-                    ..=9 => r.get::<i32>(phys) as i128,
-                    ..=18 => r.get::<i64>(phys) as i128,
+                    0..=4 => r.get::<i16>(phys) as i128,
+                    5..=9 => r.get::<i32>(phys) as i128,
+                    10..=18 => r.get::<i64>(phys) as i128,
                     _ => hugeint(r.get(phys)),
                 };
                 // Sign, digits, and a dot need no JSON escaping.
@@ -627,8 +663,8 @@ pub fn emit_cell(
             }
             LOGICAL_TYPE_ID_ENUM => {
                 let idx = match ty.enum_values.len() {
-                    ..=255 => r.get::<u8>(phys) as usize,
-                    ..=65535 => r.get::<u16>(phys) as usize,
+                    0..=255 => r.get::<u8>(phys) as usize,
+                    256..=65535 => r.get::<u16>(phys) as usize,
                     _ => r.get::<u32>(phys) as usize,
                 };
                 push_json_string(out, ty.enum_values.get(idx).map(|s| s.as_str()).unwrap_or(""));
@@ -729,10 +765,12 @@ pub fn emit_cell(
                 // whose cast failed, a row past it, and a row it left NULL.
                 let at = cast.as_ref().filter(|c| row < c.rows).map(|c| (c, c.reader.phys(row)));
                 let Some((cast, at)) = at.filter(|(c, at)| c.reader.is_valid(*at) || !c.failed) else {
-                    return Ok(push_json_string(out, &quote_nonfinite(&cell_text(api, r, row, json)?)));
+                    push_json_string(out, &quote_nonfinite(&cell_text(api, r, row, json)?));
+                    return Ok(());
                 };
                 if !cast.reader.is_valid(at) {
-                    return Ok(out.push_str("null"));
+                    out.push_str("null");
+                    return Ok(());
                 }
                 let text = std::str::from_utf8(bytes(&cast.reader, at)).map_err(|_| Error {
                     code: ffi::ERROR_API,
@@ -752,7 +790,7 @@ pub fn emit_cell(
 /// A cell's text through the single-value bridge: the engine's rendering of
 /// the value, or of its cast to `json`'s type. A cast or a rendering that
 /// fails fails the cell, since a null in its place would read as SQL NULL.
-fn cell_text(api: &ffi::Api, r: &Reader, row: usize, json: Option<Json>) -> Result<String, Error> {
+fn cell_text(api: &ffi::Api, r: &Reader<'_>, row: usize, json: Option<Json<'_>>) -> Result<String, Error> {
     let mut value: ffi::value_handle = std::ptr::null_mut();
     call!(api, vector_get_value(r.vector, row as ffi::idx_t, &mut value));
     let text = match json {
@@ -778,8 +816,9 @@ fn hugeint(h: ffi::hugeint_t) -> i128 {
     (h.upper as i128) << 64 | h.lower as i128
 }
 
-/// The payload of a 16-byte bytes cell at a physical index.
-unsafe fn bytes<'a>(r: &'a Reader, phys: usize) -> &'a [u8] {
+/// The payload of a 16-byte bytes cell at a physical index, lent for as long
+/// as the reader is: a cast's reader points into a chunk the cast owns.
+unsafe fn bytes<'a>(r: &'a Reader<'_>, phys: usize) -> &'a [u8] {
     unsafe {
         let cell = &*(r.view.data as *const ffi::bytes_t).add(phys);
         super::bytes_view(cell)
@@ -901,12 +940,12 @@ fn sized_text<H: Copy>(
     let mut err: ffi::error_info_handle = std::ptr::null_mut();
     let code = unsafe { write(handle, std::ptr::null_mut(), 0, &mut len, &mut err) };
     if code != ffi::ERROR_NONE {
-        return Err(Error::take(api, code, err));
+        return Err(unsafe { Error::take(api, code, err) });
     }
     let mut buf = vec![0u8; len as usize + 1];
     let code = unsafe { write(handle, buf.as_mut_ptr().cast(), buf.len() as ffi::idx_t, &mut len, &mut err) };
     if code != ffi::ERROR_NONE {
-        return Err(Error::take(api, code, err));
+        return Err(unsafe { Error::take(api, code, err) });
     }
     buf.truncate(len as usize);
     String::from_utf8(buf)
