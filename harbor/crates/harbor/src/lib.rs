@@ -4357,7 +4357,27 @@ fn run_statement(
         });
         let (chunk, readers) = match fetched {
             Ok(Some(pair)) => pair,
-            Ok(None) => break,
+            // The end, where the statement is retired. One a canceller
+            // reached first is answered as cancelled: the engine can finish
+            // a streaming statement before the interrupt lands, and the
+            // canceller was told it stopped it, which holds, since a stream
+            // keeps nothing of what it read. A retained statement was kept
+            // at its first fetch, and no cancel reaches it after that.
+            Ok(None) => {
+                if !on_slot.finish() {
+                    break;
+                }
+                cut_short = true;
+                let refusal = Refusal::cancelled();
+                if shape == Shape::Ndjson {
+                    push_error(&mut buf, refusal.code, &refusal.message);
+                    buf.push('\n');
+                    let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                    gone = true;
+                }
+                failure = Some(refusal);
+                break;
+            }
             Err(e) => {
                 // Retired here rather than after the loop, because what the
                 // client is told depends on the answer: the same DuckDB
