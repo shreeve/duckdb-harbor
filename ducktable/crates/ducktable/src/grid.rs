@@ -538,7 +538,7 @@ impl Grid {
             }
             Err(message) => (Some(message), 0),
         };
-        let edits = delegate.new_edits(&source, &pk_cols, rowid, !structure.as_ref().is_some_and(|s| s.foreign));
+        let edits = delegate.new_edits(&source, &pk_cols, rowid, structure.as_ref());
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
@@ -1090,7 +1090,7 @@ impl Grid {
     fn settle_schema(&mut self, cx: &mut Context<Self>) {
         let d = self.table.read(cx).delegate();
         let names = d.names.clone();
-        self.edits = d.new_edits(&self.source, &self.pk_cols, self.rowid, !self.structure.as_ref().is_some_and(|s| s.foreign));
+        self.edits = d.new_edits(&self.source, &self.pk_cols, self.rowid, self.structure.as_ref());
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&names, self.structure.as_ref());
         self.not_null = not_null;
@@ -2882,8 +2882,8 @@ impl Grid {
             cx.notify();
             return;
         }
-        let stmts = edits.statements();
-        if stmts.is_empty() {
+        let plan = edits.plan();
+        if plan.is_empty() {
             return;
         }
         self.committing = true;
@@ -2905,7 +2905,7 @@ impl Grid {
                     // the one request whose lost answer leaves the outcome
                     // unknown, since the server may have committed before the
                     // connection failed.
-                    let result = match run_statements(&conn, &sid, &stmts) {
+                    let result = match run_statements(&conn, &sid, &plan) {
                         Err(message) => Committed::Refused(message),
                         Ok(()) => commit_verdict(harbor_client::exec_checked(
                             &conn,
@@ -3239,8 +3239,15 @@ impl GridDelegate {
     /// A staging set for the columns this delegate holds, when they carry
     /// the whole key: the catalog's, or the hidden rowid of a table
     /// without one. None for a source without an identity, which is
-    /// read-only.
-    fn new_edits(&self, source: &str, pk_cols: &[String], rowid: bool, returning: bool) -> Option<Edits> {
+    /// read-only. A table of another engine's catalog takes no `INSERT …
+    /// RETURNING`.
+    fn new_edits(
+        &self,
+        source: &str,
+        pk_cols: &[String],
+        rowid: bool,
+        structure: Option<&crate::structure::TableStructure>,
+    ) -> Option<Edits> {
         if self.pk_ix.is_empty() {
             return None;
         }
@@ -3250,8 +3257,9 @@ impl GridDelegate {
             self.names.iter().map(|n| n.to_string()).collect(),
             self.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
         );
+        let edits = edits.with_uniques(structure.map(|s| s.uniques.clone()).unwrap_or_default());
         let edits = if rowid { edits.keyed_by_rowid() } else { edits };
-        Some(if returning { edits } else { edits.without_returning() })
+        Some(if structure.is_some_and(|s| s.foreign) { edits.without_returning() } else { edits })
     }
 
     /// Clear the selection, the ring, the Tab run and the editor's cell:
@@ -4565,12 +4573,20 @@ enum Page<'a> {
 }
 
 /// Open the transaction on session `sid` and run a staged set's statements
-/// in it, each checked for the one row it must touch. The first that fails
+/// in it, in the order its claims read (`edits::Plan`), each checked for the one row it must touch. The first that fails
 /// stops the run with the reason, and nothing has landed: the caller's
 /// release of the session rolls the transaction back.
-pub(crate) fn run_statements(conn: &Conn, sid: &str, stmts: &[edits::Statement]) -> Result<(), String> {
+pub(crate) fn run_statements(conn: &Conn, sid: &str, plan: &edits::Plan) -> Result<(), String> {
+    // What each statement frees and takes, read before the transaction: a
+    // read that fails costs only the order, where inside the transaction
+    // it would abort it.
+    let learned = plan
+        .claims()
+        .and_then(|(sql, params)| harbor_client::exec(conn, sql, Some(params.to_vec()), Some(sid)).ok())
+        .map(|r| edits::read_claims(&r.rows))
+        .unwrap_or_default();
     harbor_client::exec(conn, "BEGIN", None, Some(sid))?;
-    for stmt in stmts {
+    for stmt in &plan.ordered(&learned) {
         let r = harbor_client::exec(conn, &stmt.sql, Some(stmt.params.clone()), Some(sid))?;
         match stmt.expectation {
             // The engine answers UPDATE/DELETE with one count row; anything
@@ -5153,11 +5169,11 @@ mod tests {
             primary,
             ..Default::default()
         };
-        let keyed = TableStructure { cols: vec![col("a", true), col("b", true), col("v", false)], ddl: None, view: false, foreign: false };
+        let keyed = TableStructure { cols: vec![col("a", true), col("b", true), col("v", false)], ddl: None, view: false, foreign: false, uniques: Vec::new() };
         assert_eq!(identity_columns(Some(&keyed)), ["a", "b"]);
-        let keyless = TableStructure { cols: vec![col("v", false)], ddl: None, view: false, foreign: false };
+        let keyless = TableStructure { cols: vec![col("v", false)], ddl: None, view: false, foreign: false, uniques: Vec::new() };
         assert_eq!(identity_columns(Some(&keyless)), ["rowid"]);
-        let shadowed = TableStructure { cols: vec![col("ROWID", false), col("v", false)], ddl: None, view: false, foreign: false };
+        let shadowed = TableStructure { cols: vec![col("ROWID", false), col("v", false)], ddl: None, view: false, foreign: false, uniques: Vec::new() };
         assert!(identity_columns(Some(&shadowed)).is_empty());
         assert!(identity_columns(None).is_empty());
     }
@@ -5204,6 +5220,7 @@ mod tests {
             ddl: None,
             view: false,
             foreign: false,
+            uniques: Vec::new(),
         };
         let names: Vec<SharedString> = ["g", "d", "r", "n", "rowid"].map(Into::into).into();
         let (_, _, _, hints, types) = super::insert_metadata(&names, Some(&structure));
@@ -5681,7 +5698,7 @@ mod tests {
     /// Run `e` as ⌘S does, in one session's transaction, and commit it.
     fn commit_live(conn: &harbor_client::Conn, e: &Edits) -> Result<(), String> {
         let sid = harbor_client::session_new(conn)?;
-        let run = super::run_statements(conn, &sid, &e.statements())
+        let run = super::run_statements(conn, &sid, &e.plan())
             .and_then(|()| harbor_client::exec(conn, "COMMIT", None, Some(&sid)).map(drop));
         harbor_client::session_release(conn, &sid);
         run

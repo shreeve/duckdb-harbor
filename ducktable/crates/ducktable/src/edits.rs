@@ -112,6 +112,10 @@ pub struct Edits {
     source: String,
     /// Primary-key column names, in key order.
     pk_cols: Vec<String>,
+    /// The table's other unique column sets, from its UNIQUE constraints
+    /// and unique indexes: what the commit order frees before another row
+    /// takes it, beside the key (`Plan`).
+    uniques: Vec<Vec<String>>,
     /// Keyed by DuckDB's implicit rowid: the table has no key of its own.
     /// A rowid only names a position, and a checkpoint that compacts
     /// deleted rows renumbers the rest, so the one identity cell is the
@@ -324,6 +328,7 @@ impl Edits {
         Self {
             source,
             pk_cols,
+            uniques: Vec::new(),
             by_rowid: false,
             returning: true,
             columns,
@@ -342,6 +347,13 @@ impl Edits {
     /// engine's catalog, and check each by its count instead.
     pub fn without_returning(mut self) -> Self {
         self.returning = false;
+        self
+    }
+
+    /// Order this set's statements by these unique column sets too, beside
+    /// the key.
+    pub fn with_uniques(mut self, uniques: Vec<Vec<String>>) -> Self {
+        self.uniques = uniques;
         self
     }
 
@@ -825,31 +837,45 @@ impl Edits {
         self.unread = false;
     }
 
-    /// The staged set as parameterized statements. Missing insert columns
-    /// stay out of the statement so DuckDB supplies DEFAULT. The WHERE
-    /// binds the ORIGINAL key values for existing rows.
+    /// The staged set as parameterized statements, in the order they run
+    /// when nothing has been read of the values they free and take
+    /// (`Plan::ordered`).
+    #[cfg(test)]
+    pub fn statements(&self) -> Vec<Statement> {
+        self.plan().ordered(&[])
+    }
+
+    /// The staged set as parameterized statements, and what orders them.
+    /// Missing insert columns stay out of the statement so DuckDB supplies
+    /// DEFAULT. The WHERE binds the ORIGINAL key values for existing rows.
     ///
-    /// The order is what lets a set commit whatever keys it moves, since
-    /// the engine checks a key as each statement runs. A duplicate with
-    /// `Bind::Source` cells selects them from its source row, so the engine
-    /// copies what the wire could not carry, and that row is read as the
-    /// database holds it, whatever else is staged on it; a source row that
-    /// is gone returns no row, which commit refuses. So a duplicate of a row
-    /// the set updates or deletes comes first, before its source changes.
-    /// Then deletes, which free their keys; then updates, each after the
-    /// one whose key it takes (`claim_order`); then the other duplicates,
-    /// whose sources read the same at any point, and new rows, which may
-    /// take a key any of those freed. A delete of 7 and a re-key of 3 to 7
-    /// runs in that order, and so does a new row, or a duplicate of an
-    /// untouched row, keyed 7 beside a delete of 7. A duplicate of a row the
-    /// set changes cannot take a key the set frees: it runs before the key
-    /// is free, and the engine refuses it.
+    /// The order is what lets a set commit whatever values it moves, since
+    /// the engine checks the key and every UNIQUE constraint as each
+    /// statement runs. A duplicate with `Bind::Source` cells selects them
+    /// from its source row, so the engine copies what the wire could not
+    /// carry, and that row is read as the database holds it, whatever else
+    /// is staged on it; a source row that is gone returns no row, which
+    /// commit refuses. So a duplicate runs before the change to its source
+    /// row that deletes it, moves its identity, or changes a cell it reads
+    /// (`rereads`), and that order is never given up.
+    ///
+    /// Steps are ranked: duplicates of rows the set changes, deletes,
+    /// updates, the other duplicates, whose sources read the same at any
+    /// point, then new rows. A step that takes a value another row holds
+    /// runs after the step that frees it: a key as typed, matched against
+    /// the keys the set deletes or moves (`taken_key`), and every key and
+    /// unique value as the engine compares them, read before the commit
+    /// (`Plan::claims`). A delete of 7 and a re-key of 3 to 7 runs in that
+    /// order, and so does a chain of re-keys, a new row or a duplicate keyed
+    /// 7 beside a delete of 7, and a UNIQUE column's `a` moved to `b` while
+    /// `b` goes to `c`. A swap of two values has no such order, and the
+    /// engine refuses it.
     ///
     /// A held set (`in_doubt`) yields none: it may already be in the
     /// database, and is not sent again until it has been staged again.
-    pub fn statements(&self) -> Vec<Statement> {
+    pub fn plan(&self) -> Plan {
         if self.in_doubt {
-            return Vec::new();
+            return Plan::default();
         }
         // The table as the WHERE sees it: aliased when the row itself is
         // hashed, since `hash("t")` names a column if the table has one
@@ -869,22 +895,18 @@ impl Edits {
                 .join(" AND ");
             (self.source.clone(), clause)
         };
-        let (mut duplicates, mut deletes, mut updates, mut copies_late, mut inserts) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (returning, inserted) = match self.returning {
             true => (" RETURNING *", StatementExpectation::ReturnedOne),
             false => ("", StatementExpectation::CountedInsert),
         };
-        // Each update's key before and after, for `claim_order`.
-        let mut moves = Vec::new();
-        for (key, identity, change) in self.entries() {
+        // Each entry's rank, its row and change, and its statement.
+        let mut ranked = Vec::new();
+        for (_, identity, change) in self.entries() {
             let mut params = Vec::new();
-            match change {
-                RowChange::Insert(cells) if cells.is_empty() => inserts.push(Statement {
-                    sql: format!("INSERT INTO {} DEFAULT VALUES{returning}", self.source),
-                    params,
-                    expectation: inserted,
-                }),
+            let (rank, sql, expectation) = match change {
+                RowChange::Insert(cells) if cells.is_empty() => {
+                    (4, format!("INSERT INTO {} DEFAULT VALUES{returning}", self.source), inserted)
+                }
                 RowChange::Insert(cells) => {
                     let names = cells
                         .keys()
@@ -906,12 +928,12 @@ impl Edits {
                     } else {
                         format!("INSERT INTO {} ({names}) VALUES ({supplied}){returning}", self.source)
                     };
-                    let stmt = Statement { sql, params, expectation: inserted };
-                    match (copies, self.changes.get(&key_of(identity)).map(|e| &e.change)) {
-                        (true, Some(RowChange::Update(_) | RowChange::Delete)) => duplicates.push(stmt),
-                        (true, _) => copies_late.push(stmt),
-                        (false, _) => inserts.push(stmt),
-                    }
+                    let rank = match (copies, self.changes.get(&key_of(identity)).map(|e| &e.change)) {
+                        (true, Some(RowChange::Update(_) | RowChange::Delete)) => 0,
+                        (true, _) => 3,
+                        (false, _) => 4,
+                    };
+                    (rank, sql, inserted)
                 }
                 RowChange::Update(cells) => {
                     let set = cells
@@ -922,45 +944,227 @@ impl Edits {
                         .collect::<Vec<_>>()
                         .join(", ");
                     params.extend(self.bound_identity(identity));
-                    moves.push((key.to_string(), self.moved_key(identity, cells)));
-                    updates.push(Statement {
-                        sql: format!("UPDATE {target} SET {set} WHERE {where_clause}"),
-                        params,
-                        expectation: StatementExpectation::AffectedOne,
-                    });
+                    (2, format!("UPDATE {target} SET {set} WHERE {where_clause}"), StatementExpectation::AffectedOne)
                 }
-                RowChange::Delete => deletes.push(Statement {
-                    sql: format!("DELETE FROM {target} WHERE {where_clause}"),
-                    params: self.bound_identity(identity),
-                    expectation: StatementExpectation::AffectedOne,
-                }),
+                RowChange::Delete => {
+                    params = self.bound_identity(identity);
+                    (1, format!("DELETE FROM {target} WHERE {where_clause}"), StatementExpectation::AffectedOne)
+                }
+            };
+            ranked.push((rank, identity, change, Statement { sql, params, expectation }));
+        }
+        ranked.sort_by_key(|r| r.0);
+        let rows: Vec<(&[Value], &RowChange)> = ranked.iter().map(|r| (r.1, r.2)).collect();
+        // The step that deletes or updates each row, by the row's key.
+        let changing: HashMap<String, usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, change))| !matches!(change, RowChange::Insert(_)))
+            .map(|(ix, (identity, _))| (key_of(identity), ix))
+            .collect();
+        let mut reads = vec![Vec::new(); rows.len()];
+        let mut takes = vec![Vec::new(); rows.len()];
+        for (ix, (identity, change)) in rows.iter().enumerate() {
+            if let Some(&on) = self.taken_key(identity, change).and_then(|k| changing.get(&k))
+                && on != ix
+            {
+                takes[ix].push(on);
+            }
+            if let RowChange::Insert(cells) = change
+                && !identity.is_empty()
+                && let Some(&on) = changing.get(&key_of(identity))
+                && self.rereads(cells, rows[on].1)
+            {
+                reads[on].push(ix);
             }
         }
-        let mut updates: Vec<Option<Statement>> = updates.into_iter().map(Some).collect();
-        let updates = claim_order(&moves).into_iter().filter_map(|ix| updates[ix].take());
-        duplicates.into_iter().chain(deletes).chain(updates).chain(copies_late).chain(inserts).collect()
+        let claims = self.claims(&rows);
+        Plan { steps: ranked.into_iter().map(|r| r.3).collect(), reads, takes, claims }
     }
 
-    /// The key an update gives its row, as `key_of` spells it, when the
-    /// update changes a key column. A table keyed by rowid moves no key.
-    /// The typed value is compared as bound, not as the engine stores it, so
-    /// a key typed in another spelling than the wire's (a DATE, a DECIMAL's
-    /// `1.5` for `1.50`) is not seen to take another row's key, and a chain
-    /// of such moves may run out of order and be refused (EDITING.md,
-    /// "Commit").
-    fn moved_key(&self, identity: &[Value], cells: &BTreeMap<usize, CellEdit>) -> Option<String> {
+    /// The key a step gives a row, as `key_of` spells it, when it names one:
+    /// an update that changes a key column, and a new row that types every
+    /// key column. A table keyed by rowid gives none. The typed value is
+    /// compared as bound, not as the engine stores it, so a key typed in
+    /// another spelling than the wire's (a DATE, a DECIMAL's `1.5` for
+    /// `1.50`) is not seen here; `Plan::claims` compares them by value.
+    fn taken_key(&self, identity: &[Value], change: &RowChange) -> Option<String> {
         if self.by_rowid {
             return None;
         }
-        let mut moved = identity.to_vec();
-        for (slot, name) in moved.iter_mut().zip(&self.pk_cols) {
-            let ix = self.columns.iter().position(|c| c == name);
-            if let Some(Bind::Value(value)) = ix.and_then(|ix| cells.get(&ix)).map(|c| &c.bind) {
-                *slot = value.clone();
+        let slot = |cells: &BTreeMap<usize, CellEdit>, name: &String| {
+            let ix = self.columns.iter().position(|c| c == name)?;
+            match &cells.get(&ix)?.bind {
+                Bind::Value(value) => Some(value.clone()),
+                Bind::Source => None,
+            }
+        };
+        match change {
+            RowChange::Update(cells) => {
+                let moved: Vec<Value> = identity
+                    .iter()
+                    .zip(&self.pk_cols)
+                    .map(|(old, name)| slot(cells, name).unwrap_or_else(|| old.clone()))
+                    .collect();
+                let moved = key_of(&moved);
+                (moved != key_of(identity)).then_some(moved)
+            }
+            RowChange::Insert(cells) => {
+                let typed = self.pk_cols.iter().map(|name| slot(cells, name)).collect::<Option<Vec<_>>>()?;
+                Some(key_of(&typed))
+            }
+            RowChange::Delete => None,
+        }
+    }
+
+    /// Whether `change` to a duplicate's source row would change what the
+    /// duplicate reads: a delete, an update of a column its WHERE names (any
+    /// column, when the row's hash is part of its identity), or of a cell it
+    /// copies in SQL.
+    fn rereads(&self, cells: &BTreeMap<usize, CellEdit>, change: &RowChange) -> bool {
+        match change {
+            RowChange::Update(changed) => changed.keys().any(|ix| {
+                self.by_rowid
+                    || self.pk_cols.iter().any(|name| self.columns.get(*ix) == Some(name))
+                    || cells.get(ix).is_some_and(|c| c.bind == Bind::Source)
+            }),
+            RowChange::Delete => true,
+            RowChange::Insert(_) => false,
+        }
+    }
+
+    /// The query `Plan::claims` describes, over `rows` in step order. For
+    /// each unique column set, the key's and each UNIQUE's, it lists the
+    /// values each step frees, read from its row, and the values each step
+    /// takes, its typed ones cast to the column's type and the rest read
+    /// from its row, and joins the two on the engine's own equality. The
+    /// rows are matched by identity in one join per set, not one read per
+    /// step, so a set of thousands reads in milliseconds. A new row that
+    /// leaves a column of the set to its default takes a value no one knows
+    /// yet, and is left out.
+    fn claims(&self, rows: &[(&[Value], &RowChange)]) -> Option<(String, Vec<Value>)> {
+        type Take<'a> = (usize, &'a [Value], Vec<&'a Value>);
+        let type_of = |ix: usize| self.types.get(ix).filter(|t| !t.is_empty());
+        let position = |name: &String| self.columns.iter().position(|c| c == name);
+        let row = qident(&self.row_alias());
+        // A step's identity as its WHERE binds it, and how it names its row.
+        let (keys, on) = if self.by_rowid {
+            let keys = vec!["CAST(? AS BIGINT)".to_string(), "?::UBIGINT".to_string()];
+            (keys, format!("{row}.\"rowid\" = step.k0 AND hash({row}) = step.k1"))
+        } else {
+            let mut keys = Vec::new();
+            for name in &self.pk_cols {
+                keys.push(format!("CAST({} AS {})", self.key_placeholder(name), type_of(position(name)?)?));
+            }
+            let on = self
+                .pk_cols
+                .iter()
+                .enumerate()
+                .map(|(k, name)| format!("{row}.{} = step.k{k}", qident(name)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            (keys, on)
+        };
+        let key_names = (0..keys.len()).map(|k| format!(", k{k}")).collect::<String>();
+        let keyed = (!self.by_rowid).then_some(&self.pk_cols);
+        let mut sets: Vec<Vec<usize>> = Vec::new();
+        for names in keyed.into_iter().chain(&self.uniques) {
+            // A column whose type is not known cannot be cast to it.
+            let found = names.iter().map(position).collect::<Option<Vec<_>>>();
+            let Some(set) = found.filter(|set| !set.is_empty() && set.iter().all(|&ix| type_of(ix).is_some())) else {
+                continue;
+            };
+            if !sets.contains(&set) {
+                sets.push(set);
             }
         }
-        let moved = key_of(&moved);
-        (moved != key_of(identity)).then_some(moved)
+        let (mut ctes, mut joins, mut params) = (Vec::new(), Vec::new(), Vec::new());
+        for (u, set) in sets.iter().enumerate() {
+            // The steps that free a value of this set, by number and identity.
+            let mut frees: Vec<(usize, &[Value])> = Vec::new();
+            // The steps that take one, by which of the set's columns they
+            // type (the rest read from the row): number, identity, values.
+            let mut takes: BTreeMap<Vec<bool>, Vec<Take>> = BTreeMap::new();
+            for (n, (identity, change)) in rows.iter().enumerate() {
+                let cells = match change {
+                    RowChange::Delete => None,
+                    RowChange::Update(cells) if set.iter().any(|ix| cells.contains_key(ix)) => Some(cells),
+                    RowChange::Insert(cells) if set.iter().all(|ix| cells.contains_key(ix)) => Some(cells),
+                    _ => continue,
+                };
+                if !matches!(change, RowChange::Insert(_)) {
+                    frees.push((n, identity));
+                }
+                let Some(cells) = cells else { continue };
+                let typed: Vec<Option<&Value>> = set
+                    .iter()
+                    .map(|ix| match cells.get(ix).map(|c| &c.bind) {
+                        Some(Bind::Value(value)) => Some(value),
+                        _ => None,
+                    })
+                    .collect();
+                let pattern = typed.iter().map(Option::is_some).collect();
+                takes.entry(pattern).or_default().push((n, identity, typed.into_iter().flatten().collect()));
+            }
+            if frees.is_empty() || takes.is_empty() {
+                continue;
+            }
+            let held = set.iter().map(|&ix| format!(", {row}.{}", qident(self.column_name(ix)))).collect::<String>();
+            let free_rows = frees.iter().map(|(n, _)| format!("({n}, {})", keys.join(", "))).collect::<Vec<_>>();
+            let mut sql = format!(
+                "free{u}(n{cols}) AS (SELECT step.n{held} FROM {} AS {row} JOIN (VALUES {}) AS step(n{key_names}) ON {on})",
+                self.source,
+                free_rows.join(", "),
+                cols = (0..set.len()).map(|c| format!(", c{c}")).collect::<String>(),
+            );
+            params.extend(frees.iter().flat_map(|(_, identity)| self.bound_identity(identity)));
+            let mut selects = Vec::new();
+            for (pattern, steps) in &takes {
+                let casts = set
+                    .iter()
+                    .zip(pattern)
+                    .filter(|(_, typed)| **typed)
+                    .map(|(&ix, _)| format!("CAST({} AS {})", self.placeholder(ix), self.types[ix]))
+                    .collect::<Vec<_>>();
+                let typed_names = (0..casts.len()).map(|v| format!(", v{v}")).collect::<String>();
+                let mut typed_ix = 0..;
+                let values = set
+                    .iter()
+                    .zip(pattern)
+                    .map(|(&ix, typed)| match typed {
+                        true => format!(", step.v{}", typed_ix.next().unwrap_or_default()),
+                        false => format!(", {row}.{}", qident(self.column_name(ix))),
+                    })
+                    .collect::<String>();
+                // A step that types every column of the set reads no row.
+                let reads = pattern.contains(&false);
+                let bound = match reads {
+                    true => [keys.clone(), casts].concat(),
+                    false => casts,
+                };
+                let bound = bound.join(", ");
+                let step_rows = steps.iter().map(|(n, _, _)| format!("({n}, {bound})")).collect::<Vec<_>>().join(", ");
+                for (_, identity, typed) in steps {
+                    if reads {
+                        params.extend(self.bound_identity(identity));
+                    }
+                    params.extend(typed.iter().map(|v| (*v).clone()));
+                }
+                selects.push(match reads {
+                    true => format!(
+                        "SELECT step.n{values} FROM {} AS {row} JOIN (VALUES {step_rows}) AS step(n{key_names}{typed_names}) ON {on}",
+                        self.source
+                    ),
+                    false => format!("SELECT step.n{values} FROM (VALUES {step_rows}) AS step(n{typed_names})"),
+                });
+            }
+            let cols = (0..set.len()).map(|c| format!("c{c}")).collect::<Vec<_>>();
+            sql.push_str(&format!(", take{u}(n, {}) AS ({})", cols.join(", "), selects.join(" UNION ALL ")));
+            ctes.push(sql);
+            let same = cols.iter().map(|c| format!(" AND t.{c} = f.{c}")).collect::<String>();
+            joins.push(format!("SELECT t.n, f.n FROM take{u} AS t JOIN free{u} AS f ON t.n <> f.n{same}"));
+        }
+        (!joins.is_empty()).then(|| (format!("WITH {} {}", ctes.join(", "), joins.join(" UNION ALL ")), params))
     }
 
     /// What a WHERE binds for `identity`: the key values, or the rowid and
@@ -1006,33 +1210,111 @@ impl Edits {
     }
 }
 
-/// The order to run updates in, as indices into `moves`: each update's key
-/// before, and after when it changes one. An update that takes the key
-/// another leaves runs after that one, so a chain of re-keys (2 to 4, then 1
-/// to 2) commits. Otherwise the updates keep their order. A cycle (a swap of
-/// two keys) has no order that commits, and the engine refuses it.
-fn claim_order(moves: &[(String, Option<String>)]) -> Vec<usize> {
-    let leaves: HashMap<&str, usize> =
-        moves.iter().enumerate().map(|(ix, (before, _))| (before.as_str(), ix)).collect();
-    // The update each one waits on: the one whose key it takes.
-    let waits_on: Vec<Option<usize>> = moves
-        .iter()
-        .enumerate()
-        .map(|(ix, (_, after))| after.as_deref().and_then(|k| leaves.get(k)).copied().filter(|&on| on != ix))
-        .collect();
-    let mut placed = vec![false; moves.len()];
-    let mut order = Vec::with_capacity(moves.len());
-    for start in 0..moves.len() {
-        // Walk back along what this update waits on, then run that chain
-        // from its far end.
-        let mut chain = Vec::new();
-        let mut at = Some(start);
-        while let Some(ix) = at.filter(|&ix| !placed[ix]) {
-            placed[ix] = true;
-            chain.push(ix);
-            at = waits_on[ix];
+/// A commit's statements and what orders them (`Edits::plan`).
+#[derive(Default)]
+pub struct Plan {
+    /// By rank: the order they run in when none waits on another.
+    steps: Vec<Statement>,
+    /// For each step, the duplicates that read its row before it changes
+    /// it.
+    reads: Vec<Vec<usize>>,
+    /// For each step, the steps that free a key it takes as typed.
+    takes: Vec<Vec<usize>>,
+    /// The query that reads which step takes a value which other frees.
+    claims: Option<(String, Vec<Value>)>,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// The query that reads which step takes a key or unique value which
+    /// other step frees, as rows of the two steps' numbers, taker first
+    /// (`read_claims`). It runs before the transaction, on what the
+    /// database holds. Each typed value is cast to its column's type, as
+    /// its statement's assignment casts it, and compared by the engine's
+    /// own equality, so a DATE, a TIMESTAMP or a DECIMAL typed in another
+    /// spelling than the wire's (`1.5` for `1.50`) is the value it names.
+    /// None when no step both could take and could free one.
+    pub fn claims(&self) -> Option<(&str, &[Value])> {
+        self.claims.as_ref().map(|(sql, params)| (sql.as_str(), params.as_slice()))
+    }
+
+    /// The statements in the order they run: each after the steps that
+    /// free what it takes, a key as typed or a value `learned` from the
+    /// claims, and each change to a row after the duplicates that read it.
+    /// The other steps keep their rank. Where both cannot hold, a cycle such
+    /// as a swap, the duplicates still read first, and the engine refuses
+    /// the take.
+    pub fn ordered(&self, learned: &[(usize, usize)]) -> Vec<Statement> {
+        let n = self.steps.len();
+        let mut waits = self.reads.clone();
+        for (ix, on) in self.takes.iter().enumerate() {
+            waits[ix].extend(on);
         }
-        order.extend(chain.into_iter().rev());
+        for &(taker, freer) in learned {
+            if taker < n && freer < n && taker != freer {
+                waits[taker].push(freer);
+            }
+        }
+        let mut order = run_order(&waits);
+        let mut at = vec![0; n];
+        for (pos, &ix) in order.iter().enumerate() {
+            at[ix] = pos;
+        }
+        if self.reads.iter().enumerate().any(|(ix, on)| on.iter().any(|&dup| at[dup] > at[ix])) {
+            order = run_order(&self.reads);
+        }
+        order.into_iter().map(|ix| self.steps[ix].clone()).collect()
+    }
+}
+
+/// The claims' answer as (taker, freer) pairs of step numbers.
+pub fn read_claims(rows: &[Vec<Value>]) -> Vec<(usize, usize)> {
+    let step = |v: &Value| v.as_u64().and_then(|n| usize::try_from(n).ok());
+    rows.iter()
+        .filter_map(|row| match row.as_slice() {
+            [taker, freer] => Some((step(taker)?, step(freer)?)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The order to run steps in, given the steps each waits on: each runs
+/// after those, and otherwise in its own place. A step that waits runs
+/// its chain from the far end, so a chain of re-keys (2 to 4, then 1 to 2)
+/// commits. A cycle (a swap of two keys) has no order that commits; each
+/// of its steps runs once all the same, and the engine refuses it.
+fn run_order(waits: &[Vec<usize>]) -> Vec<usize> {
+    // 0: not reached; 1: on the walk; 2: placed.
+    let mut state = vec![0u8; waits.len()];
+    let mut order = Vec::with_capacity(waits.len());
+    for start in 0..waits.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        // Walk back along what each step waits on, placing a step once
+        // everything it waits on is placed or is on the walk (a cycle).
+        let mut walk = vec![(start, 0)];
+        while let Some(top) = walk.last_mut() {
+            let ix = top.0;
+            match waits[ix].get(top.1) {
+                Some(&on) => {
+                    top.1 += 1;
+                    if state[on] == 0 {
+                        state[on] = 1;
+                        walk.push((on, 0));
+                    }
+                }
+                None => {
+                    state[ix] = 2;
+                    order.push(ix);
+                    walk.pop();
+                }
+            }
+        }
     }
     order
 }
@@ -1843,24 +2125,187 @@ mod tests {
         assert_eq!(order, vec![vec![json!(3), json!(1), json!(2)], vec![json!(2), json!(1), json!(1)]]);
     }
 
+    /// A table keyed by `id`, with a UNIQUE `slug` and a UNIQUE `(a, b)`.
+    fn unique() -> Edits {
+        Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["id".into()],
+            vec!["id".into(), "slug".into(), "a".into(), "b".into(), "name".into()],
+            vec!["INTEGER".into(), "VARCHAR".into(), "INTEGER".into(), "INTEGER".into(), "VARCHAR".into()],
+        )
+        .with_uniques(vec![vec!["slug".into()], vec!["a".into(), "b".into()]])
+    }
+
     #[test]
-    fn updates_run_after_the_ones_whose_keys_they_take() {
-        let moves = |m: &[(&str, Option<&str>)]| -> Vec<(String, Option<String>)> {
-            m.iter().map(|(a, b)| (a.to_string(), b.map(str::to_string))).collect()
-        };
-        // Nothing moves: the order stands.
-        assert_eq!(claim_order(&moves(&[("1", None), ("2", None)])), vec![0, 1]);
+    fn the_claims_read_what_each_step_frees_and_takes_by_value() {
+        // A UNIQUE column's chain: 1 takes the `b` that 2 leaves for `c`.
+        let mut e = unique();
+        e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
+        e.stage_cell(vec![json!(2)], 1, txt("b"), txt("c"), json!("c"));
+        let plan = e.plan();
+        let (sql, params) = plan.claims().unwrap();
+        assert_eq!(
+            sql,
+            "WITH free1(n, c0) AS (SELECT step.n, \"row\".\"slug\" FROM \"main\".\"t\" AS \"row\" \
+             JOIN (VALUES (0, CAST(? AS INTEGER)), (1, CAST(? AS INTEGER))) AS step(n, k0) \
+             ON \"row\".\"id\" = step.k0), \
+             take1(n, c0) AS (SELECT step.n, step.v0 \
+             FROM (VALUES (0, CAST(? AS VARCHAR)), (1, CAST(? AS VARCHAR))) AS step(n, v0)) \
+             SELECT t.n, f.n FROM take1 AS t JOIN free1 AS f ON t.n <> f.n AND t.c0 = f.c0"
+        );
+        assert_eq!(params, [json!(1), json!(2), json!("b"), json!("c")]);
+        // Unread, the updates run in key order, and the first collides.
+        assert_eq!(plan.ordered(&[]).iter().map(|s| s.params[1].clone()).collect::<Vec<_>>(), [json!(1), json!(2)]);
+        // Read, 1 waits on the step that frees what it takes.
+        let learned = read_claims(&[vec![json!(0), json!(1)]]);
+        assert_eq!(learned, [(0, 1)]);
+        assert_eq!(plan.ordered(&learned).iter().map(|s| s.params[1].clone()).collect::<Vec<_>>(), [json!(2), json!(1)]);
+
+        // A composite set: an update reads the columns it leaves from its
+        // row; a new row that types them all reads nothing, and one that
+        // leaves one to its default takes nothing on that set.
+        let mut e = unique();
+        e.stage_cell(vec![json!(1)], 3, txt("1"), txt("2"), json!(2));
+        let draft = e.stage_insert().unwrap();
+        e.stage_insert_cell(&draft, 2, txt("1"), json!(1));
+        e.stage_insert_cell(&draft, 3, txt("1"), json!(1));
+        let other = e.stage_insert().unwrap();
+        e.stage_insert_cell(&other, 3, txt("5"), json!(5));
+        let plan = e.plan();
+        let (sql, params) = plan.claims().unwrap();
+        assert_eq!(
+            sql,
+            "WITH free2(n, c0, c1) AS (SELECT step.n, \"row\".\"a\", \"row\".\"b\" FROM \"main\".\"t\" AS \"row\" \
+             JOIN (VALUES (0, CAST(? AS INTEGER))) AS step(n, k0) ON \"row\".\"id\" = step.k0), \
+             take2(n, c0, c1) AS (SELECT step.n, \"row\".\"a\", step.v0 FROM \"main\".\"t\" AS \"row\" \
+             JOIN (VALUES (0, CAST(? AS INTEGER), CAST(? AS INTEGER))) AS step(n, k0, v0) ON \"row\".\"id\" = step.k0 \
+             UNION ALL SELECT step.n, step.v0, step.v1 \
+             FROM (VALUES (1, CAST(? AS INTEGER), CAST(? AS INTEGER))) AS step(n, v0, v1)) \
+             SELECT t.n, f.n FROM take2 AS t JOIN free2 AS f ON t.n <> f.n AND t.c0 = f.c0 AND t.c1 = f.c1"
+        );
+        assert_eq!(params, [json!(1), json!(1), json!(2), json!(1), json!(1)]);
+
+        // A delete frees every set; a duplicate reads in SQL the cells it
+        // copies. Nothing that takes, nothing to read.
+        let mut e = unique();
+        e.stage_delete(vec![json!(4)]);
+        assert!(e.plan().claims().is_none());
+        e.stage_duplicate(vec![json!(3)], vec![(1, txt("s"), Bind::Source), (4, txt("n"), Bind::Source)]);
+        e.stage_duplicate(vec![json!(3)], vec![(0, txt("9"), Bind::Value(json!(9))), (4, txt("n"), Bind::Source)]);
+        let (sql, params) = e.plan().claims().map(|(s, p)| (s.to_string(), p.to_vec())).unwrap();
+        let read = "FROM \"main\".\"t\" AS \"row\" JOIN (VALUES (0, CAST(? AS INTEGER))) AS step(n, k0) \
+                    ON \"row\".\"id\" = step.k0";
+        assert!(sql.starts_with(&format!(
+            "WITH free0(n, c0) AS (SELECT step.n, \"row\".\"id\" {read}), \
+             take0(n, c0) AS (SELECT step.n, step.v0 FROM (VALUES (2, CAST(? AS INTEGER))) AS step(n, v0)), \
+             free1(n, c0) AS (SELECT step.n, \"row\".\"slug\" {read}), \
+             take1(n, c0) AS (SELECT step.n, \"row\".\"slug\" {}) ",
+            read.replace("(0,", "(1,")
+        )), "{sql}");
+        assert_eq!(params, [json!(4), json!(9), json!(4), json!(3)]);
+
+        // A keyless table frees and takes on its UNIQUE columns, its rows
+        // named by rowid and hash.
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec![],
+            vec!["rowid".into(), "slug".into()],
+            vec!["UBIGINT[]".into(), "VARCHAR".into()],
+        )
+        .with_uniques(vec![vec!["slug".into()]])
+        .keyed_by_rowid();
+        e.stage_delete(vec![json!([0, 11])]);
+        e.stage_cell(vec![json!([1, 12])], 1, txt("b"), txt("a"), json!("a"));
+        let plan = e.plan();
+        let (sql, params) = plan.claims().unwrap();
+        assert!(sql.starts_with(
+            "WITH free0(n, c0) AS (SELECT step.n, \"row\".\"slug\" FROM \"main\".\"t\" AS \"row\" \
+             JOIN (VALUES (0, CAST(? AS BIGINT), ?::UBIGINT), (1, CAST(? AS BIGINT), ?::UBIGINT)) AS step(n, k0, k1) \
+             ON \"row\".\"rowid\" = step.k0 AND hash(\"row\") = step.k1), "
+        ), "{sql}");
+        assert_eq!(params, [json!(0), json!(11), json!(1), json!(12), json!("a")]);
+    }
+
+    #[test]
+    fn a_duplicate_of_a_changed_row_takes_what_the_set_frees_and_reads_its_row_first() {
+        // Row 5 copied as id 7 beside a delete of 7, and 5's name changed:
+        // the delete frees 7, the duplicate takes it and reads 5's name as
+        // it was, and only then does 5 change.
+        let mut e = unique();
+        e.stage_cell(vec![json!(5)], 4, txt("x"), txt("y"), json!("y"));
+        e.stage_delete(vec![json!(7)]);
+        e.stage_duplicate(vec![json!(5)], vec![(0, txt("7"), Bind::Value(json!(7))), (4, txt("x"), Bind::Source)]);
+        assert_eq!(plan(&e), vec![verb("DELETE", 7), verb("INSERT", 5), verb("UPDATE", 5)]);
+
+        // A UNIQUE value freed by a delete is taken by value, once read.
+        let mut e = unique();
+        e.stage_cell(vec![json!(5)], 4, txt("x"), txt("y"), json!("y"));
+        e.stage_delete(vec![json!(7)]);
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("z"), Bind::Value(json!("z"))), (4, txt("x"), Bind::Source)]);
+        let plan = e.plan();
+        let verbs = |order: Vec<Statement>| order.into_iter().map(|s| s.sql[..6].to_string()).collect::<Vec<_>>();
+        assert_eq!(verbs(plan.ordered(&[])), ["INSERT", "DELETE", "UPDATE"]);
+        assert_eq!(verbs(plan.ordered(&[(0, 1)])), ["DELETE", "INSERT", "UPDATE"]);
+
+        // The duplicate takes the slug its own source gives up, and reads a
+        // cell the source changes: no order does both. It still reads its
+        // row first, and the engine refuses the slug.
+        let mut e = unique();
+        e.stage_cell(vec![json!(5)], 1, txt("s"), txt("t"), json!("t"));
+        e.stage_cell(vec![json!(5)], 4, txt("x"), txt("y"), json!("y"));
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("s"), Bind::Value(json!("s"))), (4, txt("x"), Bind::Source)]);
+        assert_eq!(verbs(e.plan().ordered(&[(0, 1)])), ["INSERT", "UPDATE"]);
+        // With the cell typed and not read, the source changes first.
+        let mut e = unique();
+        e.stage_cell(vec![json!(5)], 1, txt("s"), txt("t"), json!("t"));
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("s"), Bind::Value(json!("s"))), (4, txt("x"), Bind::Source)]);
+        assert_eq!(verbs(e.plan().ordered(&[(0, 1)])), ["UPDATE", "INSERT"]);
+        // A move of the source's key, or a table keyed by its rows' hash,
+        // changes the row the duplicate's WHERE names.
+        let mut e = unique();
+        e.stage_cell(vec![json!(5)], 0, txt("5"), txt("6"), json!(6));
+        e.stage_duplicate(vec![json!(5)], vec![(1, txt("s"), Bind::Value(json!("s"))), (4, txt("x"), Bind::Value(json!("x")))]);
+        assert_eq!(verbs(e.plan().ordered(&[(0, 1)])), ["INSERT", "UPDATE"]);
+    }
+
+    #[test]
+    fn a_key_typed_in_another_spelling_is_ordered_by_its_value() {
+        // DECIMAL keys 1.50 and 2.50, as the wire spells them: 2.50 goes to
+        // 7 and 1.50 to `2.5`, which names 2.50 only once cast.
+        let mut e = Edits::new(
+            "\"main\".\"t\"".into(),
+            vec!["k".into()],
+            vec!["k".into(), "v".into()],
+            vec!["DECIMAL(5,2)".into(), "VARCHAR".into()],
+        );
+        e.stage_cell(vec![json!("1.50")], 0, txt("1.50"), txt("2.5"), json!("2.5"));
+        e.stage_cell(vec![json!("2.50")], 0, txt("2.50"), txt("7"), json!("7"));
+        let plan = e.plan();
+        let (sql, params) = plan.claims().unwrap();
+        assert!(sql.contains("(VALUES (0, CAST(? AS DECIMAL(5,2))), (1, CAST(? AS DECIMAL(5,2))))"), "{sql}");
+        assert_eq!(params, [json!("1.50"), json!("2.50"), json!("2.5"), json!("7")]);
+        let keys = |order: Vec<Statement>| order.into_iter().map(|s| s.params[1].clone()).collect::<Vec<_>>();
+        assert_eq!(keys(plan.ordered(&[])), [json!("1.50"), json!("2.50")]);
+        assert_eq!(keys(plan.ordered(&[(0, 1)])), [json!("2.50"), json!("1.50")]);
+        // A claim that names no step is ignored.
+        assert_eq!(keys(plan.ordered(&[(0, 9), (1, 1)])), [json!("1.50"), json!("2.50")]);
+        assert_eq!(read_claims(&[vec![json!(1)], vec![json!(-1), json!(0)], vec![json!(2), json!(0)]]), [(2, 0)]);
+    }
+
+    #[test]
+    fn steps_run_after_the_ones_they_wait_on() {
+        // Nothing waits: the order stands.
+        assert_eq!(run_order(&[vec![], vec![]]), vec![0, 1]);
         // 0 takes the key 1 leaves, and 1 the key 2 leaves.
-        assert_eq!(claim_order(&moves(&[("1", Some("2")), ("2", Some("3")), ("3", Some("4"))])), vec![2, 1, 0]);
+        assert_eq!(run_order(&[vec![1], vec![2], vec![]]), vec![2, 1, 0]);
         // Two chains and a bystander keep their own places otherwise.
-        let order = claim_order(&moves(&[("a", Some("b")), ("x", None), ("b", Some("c")), ("y", Some("z"))]));
-        assert_eq!(order, vec![2, 0, 1, 3]);
+        assert_eq!(run_order(&[vec![2], vec![], vec![], vec![]]), vec![2, 0, 1, 3]);
+        // A step that waits on two runs after both.
+        assert_eq!(run_order(&[vec![2, 1], vec![], vec![]]), vec![2, 1, 0]);
         // A swap has no order that commits; each runs once all the same.
-        let mut swap = claim_order(&moves(&[("1", Some("2")), ("2", Some("1"))]));
+        let mut swap = run_order(&[vec![1], vec![0]]);
         swap.sort();
         assert_eq!(swap, vec![0, 1]);
-        // A key moved to itself waits on nothing.
-        assert_eq!(claim_order(&moves(&[("1", Some("1"))])), vec![0]);
     }
 
     #[test]

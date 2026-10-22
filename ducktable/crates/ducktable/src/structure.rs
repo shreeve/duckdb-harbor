@@ -35,6 +35,10 @@ pub(crate) struct TableStructure {
     /// A table of another engine's catalog attached to the database (a
     /// SQLite file's), which takes no `INSERT … RETURNING`.
     pub(crate) foreign: bool,
+    /// The column sets the table holds unique beside its key: its UNIQUE
+    /// constraints and its unique indexes on plain columns. A commit frees
+    /// a value on each before another row takes it (docs/EDITING.md).
+    pub(crate) uniques: Vec<Vec<String>>,
 }
 
 impl TableStructure {
@@ -51,13 +55,16 @@ impl TableStructure {
 /// connection already holds — no query, so the Structure view is as
 /// current as the sidebar and never a frame behind it.
 pub(crate) fn table_structure(table: &harbor_client::Table) -> TableStructure {
-    TableStructure { cols: table.columns.clone(), ddl: table.ddl.clone(), view: false, foreign: false }
+    let constraints = table.unique_constraints.iter().map(|u| u.columns.clone());
+    let indexes = table.indexes.iter().filter(|i| i.unique && i.expressions.is_empty()).map(|i| i.columns.clone());
+    let uniques = constraints.chain(indexes).filter(|cols| !cols.is_empty()).collect();
+    TableStructure { cols: table.columns.clone(), ddl: table.ddl.clone(), view: false, foreign: false, uniques }
 }
 
 /// A view's structure, as the catalog read it: the columns it binds to,
 /// and its CREATE VIEW.
 pub(crate) fn view_structure(view: &wire::catalog::View) -> TableStructure {
-    TableStructure { cols: view.columns.clone(), ddl: view.ddl.clone(), view: true, foreign: false }
+    TableStructure { cols: view.columns.clone(), ddl: view.ddl.clone(), view: true, foreign: false, uniques: Vec::new() }
 }
 
 /// The structure of `rel` in `catalog`: a table's or a view's, of the

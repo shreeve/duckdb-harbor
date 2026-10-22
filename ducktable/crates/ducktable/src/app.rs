@@ -2644,7 +2644,7 @@ mod tests {
         // keyed by its primary key, and a keyless one by rowid and hash.
         let commit = |e: &crate::edits::Edits| {
             let sid = harbor_client::session_new(&conn).expect("session");
-            let outcome = crate::grid::run_statements(&conn, &sid, &e.statements())
+            let outcome = crate::grid::run_statements(&conn, &sid, &e.plan())
                 .and_then(|()| harbor_client::exec(&conn, "COMMIT", None, Some(&sid)).map(drop));
             harbor_client::session_release(&conn, &sid);
             outcome
