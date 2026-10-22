@@ -19,7 +19,10 @@
 //! attached database with its reason in `error` ([`unattached`]); the
 //! server starts all the same, and the row stays, so the file is attached
 //! again at a later start once it reads. A row deleted from the record is
-//! forgotten.
+//! forgotten. A SQLite file that stops reading while the server runs is
+//! detached by the catalog read that finds it, on any server, and set
+//! aside ([`set_aside`]) until a later read attaches it again; the record
+//! written at the stop holds it as attached.
 
 use std::sync::Mutex;
 
@@ -135,6 +138,38 @@ pub fn unattached() -> Vec<Unattached> {
     SERVING.lock().unwrap().clone().unwrap_or_default()
 }
 
+/// A SQLite file a catalog read found attached and not reading, and
+/// detached, on any server: the engine reads every attached database's
+/// catalog together, so one that does not read fails every catalog read.
+/// Listed in `/catalog` with why, and attached again by the first catalog
+/// read that finds it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAside {
+    pub unattached: Unattached,
+    /// Its name was in the workspace's record when it was set aside: a row
+    /// deleted since forgets it, as it forgets a file attached.
+    pub recorded: bool,
+}
+
+static SET_ASIDE: Mutex<Vec<SetAside>> = Mutex::new(Vec::new());
+
+/// Set aside a file detached, in place of any of its name.
+pub fn set_aside(aside: SetAside) {
+    let mut all = SET_ASIDE.lock().unwrap();
+    all.retain(|a| !a.unattached.record.name.eq_ignore_ascii_case(&aside.unattached.record.name));
+    all.push(aside);
+}
+
+/// What is set aside.
+pub fn set_aside_now() -> Vec<SetAside> {
+    SET_ASIDE.lock().unwrap().clone()
+}
+
+/// Forget the file set aside as `name`: attached again, or its name taken.
+pub fn taken_back(name: &str) {
+    SET_ASIDE.lock().unwrap().retain(|a| !a.unattached.record.name.eq_ignore_ascii_case(name));
+}
+
 /// Make the workspace whole on `con`, the connection the pool is cloned
 /// from, before it serves: what is loaded and attached here is the whole
 /// instance's. Said in the server's log; nothing here stops a start.
@@ -187,14 +222,14 @@ pub fn open(con: &mut Conn) {
         }
     }
     let sqlite = plan.attaches.iter().any(|r| r.storage == "sqlite") && !installed(con, "sqlite_scanner");
-    let (later, now): (Vec<Record>, Vec<Record>) =
+    let (later, at_start): (Vec<Record>, Vec<Record>) =
         plan.attaches.into_iter().partition(|r| sqlite && r.storage == "sqlite");
     if !later.is_empty() {
         eprintln!("harbor: workspace: sqlite is not installed, and is installed in the background");
         install.push("sqlite_scanner");
     }
     let mut unattached = plan.unattached;
-    for record in now {
+    for record in at_start {
         if let Err(reason) = attach(con, &record) {
             unattached.push(Unattached { record, reason });
         }
@@ -366,6 +401,19 @@ pub fn record(con: &mut Conn) {
             return;
         }
     };
+    // A file set aside is recorded as attached, as it was until it stopped
+    // reading, unless its row was deleted since.
+    let rows: Vec<String> = read_records(con).into_iter().map(|r| r.name).collect();
+    let mut current = current;
+    for aside in set_aside_now() {
+        let record = aside.unattached.record;
+        let named = |name: &String| name.eq_ignore_ascii_case(&record.name);
+        if (aside.recorded && !rows.iter().any(named)) || current.iter().any(|r| named(&r.name)) || by_init(&record.name) {
+            continue;
+        }
+        current.push(record);
+    }
+    current.sort_by(|a, b| a.name.cmp(&b.name));
     let kept: Vec<String> = unattached
         .into_iter()
         .map(|u| u.record.name)

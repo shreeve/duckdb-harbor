@@ -436,14 +436,18 @@ another engine's carry `rowCount: null`, since a count there reads every row.
 On the workspace, a file it records as attached and could not attach at its
 start, or whose catalog did not read once attached, is listed too, holding
 nothing, with why in `error` (`"/data/app.sqlite: no such file"`); `error` is
-`null` for a database that is attached. An attached SQLite file whose catalog
-does not read — not SQLite after all, or held locked by another program —
-fails the whole read with a `400` that names it and says why, since the
-engine reads every attached database's catalog together and lists none while
-one does not; it reads again once that file does, or once it is detached. A
-SQLite file harbor attaches waits a second on a lock (`BUSY_TIMEOUT 1000`;
-the engine's own default is five), so a locked one fails a read in about a
-second rather than holding it.
+`null` for a database that is attached. The engine reads every attached
+database's catalog together and lists none while one does not, so an
+attached SQLite file whose catalog does not read — not SQLite after all,
+replaced, or held locked by another program — is detached by the read that
+finds it, on any server, and listed the same way, holding nothing, with the
+engine's reason in `error`, while the rest of the catalog lists; the first
+read after it reads attaches it again under its name, as harbor attaches a
+SQLite file. While it is detached a read asks it on an attachment of its own
+that waits a tenth of a second on a lock, and the workspace records it as
+attached. A SQLite file harbor attaches waits a second on a lock
+(`BUSY_TIMEOUT 1000`; the engine's own default is five), so the read that
+finds a locked one waits about a second on it.
 A table or view another client drops, or a database it detaches, while the
 catalog is being read is left out; it never fails the read. An `ATTACH` or
 `DETACH` runs alone against every statement that reads the catalog — `/catalog`

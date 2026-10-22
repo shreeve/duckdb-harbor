@@ -2919,78 +2919,242 @@ struct CatalogDatabase {
     storage: String,
     read_only: bool,
     served: bool,
+    /// Detached by this read, its catalog not reading (`catalog_listing`).
+    aside: bool,
 }
 
-/// What the workspace recorded and could not attach when it started, each
-/// still in its record and not attached since: listed among the attached
-/// databases with its reason. Nothing, and no query, on any other server.
+/// The names the workspace's record holds, read on the served database;
+/// None on any other server, and none when the record was dropped.
+fn recorded_names(
+    exec: Executor,
+    peer: &justhttp::Peer,
+    databases: &[CatalogDatabase],
+) -> Result<Option<Vec<String>>, CatalogFailure> {
+    if !workspace::serving() {
+        return Ok(None);
+    }
+    let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
+    let sql = format!("SELECT name FROM {}", wire::open::record_in(served));
+    match catalog_rows(exec, peer, &sql) {
+        Ok(rows) => Ok(Some(rows.iter().map(|row| cell_str(row, 0)).collect())),
+        Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => Ok(Some(Vec::new())),
+        Err(failure) => Err(failure),
+    }
+}
+
+/// What is attached by none of `databases` and listed among them, holding
+/// nothing, with why: what the workspace recorded and could not attach when
+/// it started, each still in its record, and the SQLite files set aside
+/// (`catalog_listing`), each still in the record when it was in it when set
+/// aside. A file set aside whose name is attached again is forgotten.
 fn unattached_now(
     exec: Executor,
     peer: &justhttp::Peer,
     databases: &[CatalogDatabase],
 ) -> Result<Vec<workspace::Unattached>, CatalogFailure> {
     let unattached = workspace::unattached();
-    if unattached.is_empty() {
+    let aside = workspace::set_aside_now();
+    if unattached.is_empty() && aside.is_empty() {
         return Ok(unattached);
     }
-    let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
-    let sql = format!("SELECT name FROM {}", wire::open::record_in(served));
-    let recorded: Vec<String> = match catalog_rows(exec, peer, &sql) {
-        Ok(rows) => rows.iter().map(|row| cell_str(row, 0)).collect(),
-        // The record dropped: nothing is recorded.
-        Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => Vec::new(),
-        Err(failure) => return Err(failure),
-    };
-    Ok(unattached
+    let recorded = recorded_names(exec, peer, databases)?.unwrap_or_default();
+    let attached = |name: &str| databases.iter().any(|d| !d.aside && d.name.eq_ignore_ascii_case(name));
+    let mut listed: Vec<workspace::Unattached> = unattached
         .into_iter()
         .filter(|u| recorded.contains(&u.record.name))
-        .filter(|u| !databases.iter().any(|d| d.name.eq_ignore_ascii_case(&u.record.name)))
-        .collect())
+        .filter(|u| !attached(&u.record.name))
+        .collect();
+    for a in aside {
+        let name = &a.unattached.record.name;
+        if attached(name) || (a.recorded && !recorded.contains(name)) {
+            workspace::taken_back(name);
+        } else if !listed.iter().any(|u| u.record.name.eq_ignore_ascii_case(name)) {
+            listed.push(a.unattached);
+        }
+    }
+    Ok(listed)
 }
+
+/// Why a SQLite file set aside is not attached, after the engine's reason.
+const SET_ASIDE: &str = "detached by the server, since an attached database whose catalog does not read \
+                         fails every catalog read, and attached again by the first catalog read after it reads";
 
 /// One of the catalog functions' listings, which read every attached
 /// database's catalog at once: one database whose catalog does not read
 /// fails the listing of all of them, and the engine names the statement it
 /// sent the database and not the database. A SQLite file that is not
 /// SQLite, or that another program holds locked, does that, and attaching
-/// one reads nothing of it. So a listing that fails asks each attached
-/// SQLite database alone, and names in its refusal each one that does not
-/// read, with its reason; one that does not wait on a lock is not slowed.
+/// one reads nothing of it; and the engine lists no database's catalog
+/// alone. So a listing that fails asks each attached SQLite database alone,
+/// detaches each one that does not read and sets it aside, with its reason,
+/// as `aside` among `databases`, and lists again; a later read attaches it
+/// again once it reads (`take_back`). One that does not wait on a lock is
+/// not slowed. One that cannot be detached fails the listing, named.
 fn catalog_listing(
     exec: Executor,
     peer: &justhttp::Peer,
     sql: &str,
-    databases: &[CatalogDatabase],
+    databases: &mut [CatalogDatabase],
 ) -> Result<Vec<Vec<serde_json::Value>>, CatalogFailure> {
     let refusal = match catalog_rows(exec, peer, sql) {
         Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => refusal,
         other => return other,
     };
+    let mut recorded: Option<Option<Vec<String>>> = None;
     let mut unreadable = Vec::new();
-    for database in databases.iter().filter(|d| !d.served && d.storage == "sqlite") {
-        let probe = format!(
-            "SELECT count(*) FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
-            wire::open::quote_literal(&database.name)
-        );
-        match catalog_rows(exec, peer, &probe) {
+    let mut set_aside = false;
+    for i in 0..databases.len() {
+        let database = &databases[i];
+        if database.served || database.aside || database.storage != "sqlite" {
+            continue;
+        }
+        let path = database.path.clone().unwrap_or_default();
+        let why = match reads_alone(exec, peer, &database.name, &path)? {
+            Ok(()) => continue,
+            Err(why) => why,
+        };
+        let detach = format!("DETACH {}", wire::open::quote_ident(&database.name));
+        match catalog_rows(exec, peer, &detach) {
             Ok(_) => {}
-            Err(CatalogFailure::Refused(why)) if why.code == code::SQL_ERROR => {
-                let why = why.message.split("\nLINE ").next().unwrap_or_default().trim().to_string();
-                let path = database.path.as_deref().unwrap_or_default();
-                unreadable.push(format!("{} ({path}): {why}", database.name));
+            // Another catalog read set it aside first.
+            Err(CatalogFailure::Refused(_))
+                if workspace::set_aside_now().iter().any(|a| a.unattached.record.name == database.name) =>
+            {
+                databases[i].aside = true;
+                set_aside = true;
+                continue;
+            }
+            Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => {
+                unreadable.push(format!("{} ({path}): {why}, and it was not detached: {}", database.name, refusal.message));
+                continue;
             }
             Err(failure) => return Err(failure),
         }
+        if recorded.is_none() {
+            recorded = Some(recorded_names(exec, peer, databases)?);
+        }
+        let database = &mut databases[i];
+        database.aside = true;
+        set_aside = true;
+        eprintln!("harbor: {} ({path}) is detached, since its catalog does not read: {why}", database.name);
+        let record = wire::open::Record {
+            name: database.name.clone(),
+            path,
+            storage: database.storage.clone(),
+            read_only: database.read_only,
+        };
+        let in_record = recorded.as_ref().and_then(|r| r.as_ref()).is_some_and(|r| r.contains(&record.name));
+        workspace::set_aside(workspace::SetAside {
+            unattached: workspace::Unattached { record, reason: format!("{why}: {SET_ASIDE}") },
+            recorded: in_record,
+        });
     }
-    if unreadable.is_empty() {
-        return Err(CatalogFailure::Refused(refusal));
+    if !unreadable.is_empty() {
+        return Err(CatalogFailure::Refused(Refusal::sql(format!(
+            "the catalog does not read while an attached database's does not, since the engine reads \
+             every attached database's catalog together: {}. It reads again once that one does, or \
+             once it is detached",
+            unreadable.join("; ")
+        ))));
     }
-    Err(CatalogFailure::Refused(Refusal::sql(format!(
-        "the catalog does not read while an attached database's does not, since the engine reads \
-         every attached database's catalog together: {}. It reads again once that one does, or \
-         once it is detached",
-        unreadable.join("; ")
-    ))))
+    match set_aside {
+        true => catalog_rows(exec, peer, sql),
+        false => Err(CatalogFailure::Refused(refusal)),
+    }
+}
+
+/// Whether the SQLite file at `path`, attached as `name`, reads its own
+/// catalog, and the engine's reason when it does not. Asked on an
+/// attachment of its own, hidden from the catalog functions and waiting
+/// [`PROBE_BUSY_MS`] on a lock, so the catalog read that asks does not wait
+/// out the file's own wait a second time; an in-memory one, on its own
+/// attachment.
+fn reads_alone(
+    exec: Executor,
+    peer: &justhttp::Peer,
+    name: &str,
+    path: &str,
+) -> Result<Result<(), String>, CatalogFailure> {
+    let quote = wire::open::quote_literal;
+    let read = |name: &str| format!("SELECT count(*) FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')", quote(name));
+    let why = |refusal: Refusal| refusal.message.split("\nLINE ").next().unwrap_or_default().trim().to_string();
+    if path.is_empty() || path == ":memory:" {
+        return match catalog_rows(exec, peer, &read(name)) {
+            Ok(_) => Ok(Ok(())),
+            Err(CatalogFailure::Refused(refusal)) => Ok(Err(why(refusal))),
+            Err(CatalogFailure::Gone) => Err(CatalogFailure::Gone),
+        };
+    }
+    let probe = format!("harbor_probe_{}", next_job_id());
+    let attach = format!(
+        "ATTACH {} AS {} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)",
+        quote(path),
+        wire::open::quote_ident(&probe)
+    );
+    match catalog_rows(exec, peer, &attach) {
+        Ok(_) => {}
+        Err(CatalogFailure::Refused(refusal)) => return Ok(Err(why(refusal))),
+        Err(CatalogFailure::Gone) => return Err(CatalogFailure::Gone),
+    }
+    let read = catalog_rows(exec, peer, &read(&probe));
+    let _ = catalog_rows(exec, peer, &format!("DETACH {}", wire::open::quote_ident(&probe)));
+    match read {
+        Ok(_) => Ok(Ok(())),
+        Err(CatalogFailure::Refused(refusal)) => Ok(Err(why(refusal))),
+        Err(CatalogFailure::Gone) => Err(CatalogFailure::Gone),
+    }
+}
+
+/// How long the question whether a SQLite file reads waits on a lock, in
+/// milliseconds: long enough to ride over a writer's commit.
+const PROBE_BUSY_MS: u32 = 100;
+
+/// Attach again each SQLite file set aside whose file reads (`reads_alone`),
+/// under its name, as its record attaches it, so one still locked costs a
+/// catalog read a few milliseconds. One whose row the workspace's record no
+/// longer holds is forgotten, not attached.
+fn take_back(exec: Executor, peer: &justhttp::Peer) -> Result<(), CatalogFailure> {
+    let aside = workspace::set_aside_now();
+    if aside.is_empty() {
+        return Ok(());
+    }
+    let recorded = match workspace::serving() {
+        true => {
+            let served = catalog_rows(exec, peer, "SELECT current_database()")?;
+            let served = served.first().map(|row| cell_str(row, 0)).unwrap_or_default();
+            let databases = [CatalogDatabase {
+                name: served,
+                path: None,
+                storage: String::new(),
+                read_only: false,
+                served: true,
+                aside: false,
+            }];
+            recorded_names(exec, peer, &databases)?
+        }
+        false => None,
+    };
+    for a in aside {
+        let record = &a.unattached.record;
+        if a.recorded && recorded.as_ref().is_some_and(|r| !r.contains(&record.name)) {
+            workspace::taken_back(&record.name);
+            continue;
+        }
+        // A file gone is not attached, since attaching a missing path makes
+        // an empty database there.
+        if !std::path::Path::new(&record.path).is_file() || reads_alone(exec, peer, &record.name, &record.path)?.is_err() {
+            continue;
+        }
+        match catalog_rows(exec, peer, &record.attach_sql()) {
+            Ok(_) => {
+                eprintln!("harbor: {} ({}) reads again, and is attached again", record.name, record.path);
+                workspace::taken_back(&record.name);
+            }
+            Err(CatalogFailure::Refused(_)) => {}
+            Err(CatalogFailure::Gone) => return Err(CatalogFailure::Gone),
+        }
+    }
+    Ok(())
 }
 
 /// Bind the view a `duckdb_views()` row names (database, schema, name,
@@ -3081,9 +3245,10 @@ fn view_error(refusal: &Refusal) -> Option<String> {
 /// since a count there reads every row of the file. On the workspace, a
 /// file it records and could not attach at its start is listed there too,
 /// holding nothing, with why in `error`, and the record itself, in the
-/// `_harbor` schema, is not listed (`workspace`). An attached database whose
-/// own catalog does not read fails every listing, and the refusal names it
-/// (`catalog_listing`).
+/// `_harbor` schema, is not listed (`workspace`). An attached SQLite file
+/// whose own catalog does not read, which would fail every listing, is
+/// detached and listed there the same way, and attached again by a later
+/// read once it reads (`catalog_listing`, `take_back`).
 ///
 /// Ordering is part of the contract: tables and views by (schema, name),
 /// attached databases by name, columns in ordinal position, indexes and
@@ -3103,6 +3268,9 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
+    if let Err(failure) = take_back(exec, &peer) {
+        return catalog_refuse(req, failure);
+    }
     // `system` and `temp` are the internal databases; every other one is the
     // served database, which current_database() names, or one attached
     // beside it. Relations of any database not in this list are passed over
@@ -3115,7 +3283,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
-    let databases: Vec<CatalogDatabase> = database_rows
+    let mut databases: Vec<CatalogDatabase> = database_rows
         .iter()
         .map(|row| CatalogDatabase {
             name: cell_str(row, 0),
@@ -3123,6 +3291,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
             storage: cell_str(row, 2),
             read_only: cell_bool(row, 3),
             served: cell_bool(row, 4),
+            aside: false,
         })
         .collect();
     let database_of: HashMap<String, usize> =
@@ -3139,7 +3308,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
              ORDER BY database_name, schema_name, table_name"
         }
     };
-    let table_rows = match catalog_listing(exec, &peer, table_sql, &databases) {
+    let table_rows = match catalog_listing(exec, &peer, table_sql, &mut databases) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
@@ -3148,7 +3317,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         "SELECT database_name, schema_name, view_name, sql FROM duckdb_views() \
          WHERE NOT internal AND NOT temporary \
          ORDER BY database_name, schema_name, view_name",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3162,10 +3331,6 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     };
     let table_rows: Vec<_> = table_rows.into_iter().filter(listed).collect();
     let view_rows: Vec<_> = view_rows.into_iter().filter(listed).collect();
-    let unattached = match unattached_now(exec, &peer, &databases) {
-        Ok(unattached) => unattached,
-        Err(failure) => return catalog_refuse(req, failure),
-    };
     let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
     let harbor_version = env!("CARGO_PKG_VERSION").to_string();
     let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
@@ -3174,6 +3339,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     // and the count, the views' binding and the four shape queries below
     // never run.
     if let CatalogStyle::Lite = style {
+        let unattached = match unattached_now(exec, &peer, &databases) {
+            Ok(unattached) => unattached,
+            Err(failure) => return catalog_refuse(req, failure),
+        };
         let named_in = |rows: &[Vec<serde_json::Value>], database: &str| -> Vec<Named> {
             rows.iter()
                 .filter(|row| cell_str(row, 0) == database)
@@ -3183,7 +3352,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
         let mut attached: Vec<AttachedInventory> = databases
             .iter()
-            .filter(|d| !d.served)
+            .filter(|d| !d.served && !d.aside)
             .map(|d| AttachedInventory {
                 name: d.name.clone(),
                 path: d.path.clone(),
@@ -3284,7 +3453,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
          FROM duckdb_columns() \
          WHERE NOT internal \
          ORDER BY database_name, schema_name, table_name, column_index",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3296,7 +3465,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
          FROM duckdb_constraints() \
          WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY') \
          ORDER BY database_name, schema_name, table_name, constraint_index",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3310,7 +3479,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         "SELECT database_name, schema_name, table_name, index_name, is_unique, expressions \
          FROM duckdb_indexes() \
          ORDER BY database_name, schema_name, table_name, index_name",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3439,7 +3608,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
          UNION ALL SELECT database_name, schema_name, view_name FROM duckdb_views() \
          WHERE NOT internal AND NOT temporary \
          UNION ALL SELECT database_name, NULL, NULL FROM duckdb_databases() WHERE NOT internal",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
@@ -3499,12 +3668,16 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         }
     }
     let still_attached = |name: &str| present.contains(&(name.to_string(), String::new(), String::new()));
+    let unattached = match unattached_now(exec, &peer, &databases) {
+        Ok(unattached) => unattached,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
 
     // Each relation to its database, in the order delivered: by database
     // name, then (schema, name), so each database's lists stay in order.
     let mut attached: Vec<Attached> = Vec::new();
     let mut slot: Vec<Option<usize>> = vec![None; databases.len()];
-    for (i, database) in databases.iter().enumerate().filter(|(_, d)| !d.served && still_attached(&d.name)) {
+    for (i, database) in databases.iter().enumerate().filter(|(_, d)| !d.served && !d.aside && still_attached(&d.name)) {
         slot[i] = Some(attached.len());
         attached.push(Attached {
             name: database.name.clone(),
@@ -3646,6 +3819,11 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         Ok(std::borrow::Cow::Owned(expanded)) => parsed.sql = expanded,
         Ok(std::borrow::Cow::Borrowed(_)) => {}
         Err(e) => return refuse(req, Refusal::bad_request(e)),
+    }
+    // A client's DETACH of a SQLite file the server set aside detaches it as
+    // the client meant: it is not attached again.
+    if let Some(name) = detached_name(&parsed.sql) {
+        workspace::taken_back(&String::from_utf8_lossy(&name));
     }
 
     // `USE` sets the CURRENT DATABASE on the connection it runs on, and
@@ -4091,6 +4269,14 @@ pub(crate) fn learn_catalog_names(conn: &mut Connection) {
     }
 }
 
+/// Whether a statement attaches a database that may hold views and macros
+/// of the engine's own: an `ATTACH` but of a SQLite file, whose views are
+/// SQLite's, so that reading its catalog, which waits on its file, is
+/// spared, and so is harbor's own question whether one reads.
+fn attaches_views(sql: &str) -> bool {
+    acting_keyword(sql) == "ATTACH" && !names_in(sql, |word| word == b"sqlite" || word == b"sqlite3")
+}
+
 /// What a `CREATE` or `ALTER` makes, by its last name part, lowercased.
 #[derive(Debug, PartialEq, Eq)]
 enum Made {
@@ -4159,7 +4345,29 @@ fn made_name(sql: &str) -> Option<Made> {
     None
 }
 
-/// A statement's leading tokens, as `made_name` reads them.
+/// The database a `DETACH [DATABASE] [IF EXISTS] name` names, lowercased.
+fn detached_name(sql: &str) -> Option<Vec<u8>> {
+    if acting_keyword(sql) != "DETACH" {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    names_in_order(sql, &mut tokens);
+    let word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(t)) if t == w.as_bytes());
+    let mut at = 1;
+    if word(at, "database") {
+        at += 1;
+    }
+    if word(at, "if") && word(at + 1, "exists") {
+        at += 2;
+    }
+    match tokens.get(at) {
+        Some(Token::Word(name) | Token::Quoted(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// A statement's leading tokens, as `made_name` and `detached_name` read
+/// them.
 enum Token {
     Word(Vec<u8>),
     Quoted(Vec<u8>),
@@ -4744,7 +4952,7 @@ fn execute_jobs(
         // its transaction is left aborted, as for a cancel before it began.
         // A view or macro the statement makes is known to the gate first.
         learn_from_statement(&sql);
-        let attaches = acting_keyword(&sql) == "ATTACH";
+        let attaches = attaches_views(&sql);
         let Some(_passed) = pass_gate(catalog_gate(&sql), &state) else {
             on_slot.finish();
             conn.abort_transaction();
@@ -5135,6 +5343,18 @@ mod tests {
         for sql in ["CREATE TABLE v AS SELECT 1", "ALTER VIEW v SET SCHEMA s", "CREATE VIEW 'v' AS SELECT 1", "SELECT 1"] {
             assert_eq!(made_name(sql), None, "{sql}");
         }
+    }
+
+    #[test]
+    fn a_detach_names_its_database_and_a_sqlite_attach_brings_no_views() {
+        use super::{attaches_views, detached_name};
+        assert_eq!(detached_name("DETACH app"), Some(b"app".to_vec()));
+        assert_eq!(detached_name("/* x */ detach database if exists \"My App\""), Some(b"my app".to_vec()));
+        assert_eq!(detached_name("SELECT 1"), None);
+        assert!(attaches_views("ATTACH '/x/a.duckdb' AS a"));
+        assert!(attaches_views("ATTACH 'sqlite.duckdb'"));
+        assert!(!attaches_views("ATTACH '/x/a.db' AS a (TYPE sqlite, READ_ONLY)"));
+        assert!(!attaches_views("DETACH a"));
     }
 
     #[test]
