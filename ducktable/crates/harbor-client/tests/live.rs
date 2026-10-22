@@ -756,7 +756,8 @@ fn a_document_cell_takes_strict_json_a_hundred_levels_deep() {
     assert_eq!(document(&back.rows[0][1]).unwrap(), parsed, "and so does the JSON column");
 
     // The same text into both: a JSON column keeps it, character for
-    // character; a VARIANT keeps its values.
+    // character; a VARIANT keeps its values, its keys in the engine's
+    // sorted order.
     let typed = "{ \"p\": 100.00,  \"a\": 1, \"a\": 2 }";
     let kept = run(
         "INSERT INTO _dt_depth_probe (\"id\", \"doc\", \"j\") VALUES (?, ?::JSON, ?::JSON) \
@@ -769,7 +770,7 @@ fn a_document_cell_takes_strict_json_a_hundred_levels_deep() {
     );
     assert_eq!(kept.rows[0][1], json!(typed), "a JSON column stores the text as typed");
     assert_eq!(kept.rows[0][2], json!("DOUBLE"), "and a JSON decimal is a DOUBLE in a VARIANT");
-    assert_eq!(kept.rows[0][0], json!("{\"p\":100.0,\"a\":2}"), "a VARIANT reads back compact");
+    assert_eq!(kept.rows[0][0], json!("{\"a\":2,\"p\":100.0}"), "a VARIANT reads back compact");
 
     let nan = run(
         "INSERT INTO _dt_depth_probe (\"id\", \"doc\") VALUES (?, ?::JSON) RETURNING doc, variant_typeof(doc.x)",
@@ -1354,10 +1355,12 @@ fn explain_analyze_runs_the_transaction_statement_it_explains() {
         assert_eq!(stored, json!("a"), "{statement}");
     }
     // A name is not the keyword it begins with, quoted or not: the engine
-    // looks for a table, and the transaction stays open, aborted.
+    // refuses it (a bare name is a table only in DuckDB's own CLI), and the
+    // transaction stays open, aborted.
     for statement in ["COMMIT_X", "COMMIT1", "COMMIT$x", "COMMITé", "\"COMMIT\"", "(COMMIT)", "EXPLAIN (FORMAT JSON) ANALYZE COMMIT"] {
         let (answer, open, stored) = inside(statement);
-        assert!(matches!(&answer, Err(Failure::Refused { message, .. }) if message.starts_with("Catalog Error")), "{statement}: {answer:?}");
+        assert!(matches!(&answer, Err(Failure::Refused { message, .. })
+            if message.starts_with("Catalog Error") || message.starts_with("Parser Error")), "{statement}: {answer:?}");
         assert!(open, "{statement}");
         assert_eq!(stored, json!("a"), "{statement}");
     }

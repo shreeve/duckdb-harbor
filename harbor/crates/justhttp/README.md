@@ -27,8 +27,9 @@ below.
   so a handler can stop work nobody will read; a quiet or pipelining client
   is not a departure
 - Keep-alive and pipelining handled internally: requests from one
-  connection are answered in order, connections are reused, and a
-  half-closed socket is shut down cleanly
+  connection are handed out one at a time, each once the response before
+  it is written, connections are reused, and a half-closed socket is shut
+  down cleanly
 
 ## What it refuses to do
 

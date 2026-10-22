@@ -214,7 +214,9 @@ mod refined {
 
     impl Socket {
         /// Ends the connection after a request whose body was abandoned
-        /// part-way. Called once that request is answered, as it drops.
+        /// part-way, called once that request is answered, as it drops; or
+        /// after a response that failed to write, cut where the client
+        /// cannot tell it ends.
         ///
         /// The stream sits at an offset neither side agrees on, and the bytes
         /// still to come — already in the connection's buffer, or still

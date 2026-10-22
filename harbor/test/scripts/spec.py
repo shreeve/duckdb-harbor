@@ -262,6 +262,12 @@ CASES = [
     # engine's own text for it (WKT), and the schema names that cast.
     ("geometry",       "SELECT 'POINT (1 2)'::GEOMETRY AS v",
                        "GEOMETRY", False, "POINT (1 2)"),
+    # A container loses what any member loses, so the column's own flag
+    # answers for all of it: a client need not walk the nested entries.
+    ("geometry-list",  "SELECT ['POINT (1 2)'::GEOMETRY] AS v",
+                       "GEOMETRY[]", False, ["POINT (1 2)"]),
+    ("variant-struct", "SELECT {'n': 1, 'v': 1::VARIANT} AS v",
+                       "STRUCT(n INTEGER, v VARIANT)", False, {"n": 1, "v": "1"}),
 
     # -- HUGEINT minimum ----------------------------------------------------
     # i128::MIN has no positive counterpart, so the "is this JSON-safe" test
@@ -286,6 +292,8 @@ SCHEMA_EXTRAS = {
     "variant-nan":    {"encoding": "json"},
     "variant-inf-nested": {"encoding": "json"},
     "geometry":       {"encoding": "varchar-cast"},
+    "geometry-list":  {"child": {"duckdbType": "GEOMETRY", "lossless": False,
+                                 "encoding": "varchar-cast"}},
 }
 
 

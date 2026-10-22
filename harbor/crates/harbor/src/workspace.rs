@@ -7,9 +7,10 @@
 //! reads with `ST_Read` reads only in a server that has loaded `spatial`,
 //! which the engine does not load on demand. So a server that opens the
 //! workspace, before it serves anyone, loads the extensions its views call
-//! into (installing in the background one that is not installed) and
-//! attaches each recorded file again ([`open`]), and when it stops
-//! it rewrites the record from what is attached then ([`record`]), so an
+//! into and attaches each recorded file again ([`open`]), installing in the
+//! background an extension that is not installed, `sqlite` among them, and
+//! attaching there the SQLite files that wait on it; and when it stops it
+//! rewrites the record from what is attached then ([`record`]), so an
 //! `ATTACH` or `DETACH` from any client lasts as the client meant it.
 //!
 //! A recorded file that is gone, that the engine will not attach, or whose
@@ -18,7 +19,12 @@
 //! attached database with its reason in `error` ([`unattached`]); the
 //! server starts all the same, and the row stays, so the file is attached
 //! again at a later start once it reads. A row deleted from the record is
-//! forgotten.
+//! forgotten. A SQLite file whose catalog stops reading for good while the
+//! server runs, gone or not SQLite, is detached by the catalog read that
+//! finds it, on any server, and set aside ([`set_aside`]); one this server
+//! attached from the record is attached again by a later read once it
+//! reads ([`ours`]), and the record written at the stop holds either as
+//! attached. One that is only busy is not detached.
 
 use std::sync::Mutex;
 
@@ -134,6 +140,103 @@ pub fn unattached() -> Vec<Unattached> {
     SERVING.lock().unwrap().clone().unwrap_or_default()
 }
 
+/// A SQLite file a catalog read found attached and not reading for good,
+/// and detached, on any server: the engine reads every attached database's
+/// catalog together, so one that does not read fails every catalog read.
+/// Listed in `/catalog` with why; attached again by the first catalog read
+/// that finds it reads when this server attached it from the record
+/// ([`ours`]), and otherwise left for a client to attach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAside {
+    pub unattached: Unattached,
+    /// Its name was in the workspace's record when it was set aside: a row
+    /// deleted since forgets it, as it forgets a file attached.
+    pub recorded: bool,
+    /// This server attached it from the record ([`ours`]), so attaching it
+    /// again as the record does keeps it as it was.
+    pub ours: bool,
+}
+
+static SET_ASIDE: Mutex<Vec<SetAside>> = Mutex::new(Vec::new());
+
+/// The names this server attached from the record, at its start or in the
+/// background, and no client has detached since.
+static OURS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Held by a catalog read while it attaches a file set aside again, and
+/// for a moment by a client's `ATTACH` or `DETACH` of its name as it is
+/// claimed once it ran ([`claimed`]), so one does not undo the other.
+static TAKING: Mutex<()> = Mutex::new(());
+
+/// The names a client's `ATTACH` or `DETACH` names, from before it runs
+/// until it is claimed or found not to have run: a catalog read does not
+/// attach a file set aside under one of them again. Once for each
+/// statement, so two of one name are each counted.
+static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether this server attached `name` from the record, with the options
+/// the record attaches it with, and no client has detached it since.
+pub fn ours(name: &str) -> bool {
+    OURS.lock().unwrap().iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Held while a file set aside is attached again ([`TAKING`]).
+pub fn taking() -> std::sync::MutexGuard<'static, ()> {
+    TAKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A client's `ATTACH` or `DETACH` of `name` is about to run: until it is
+/// [`settled`], a file set aside under `name` is not attached again
+/// ([`is_pending`]). A file being attached again at this moment and the
+/// statement run one after the other, at the catalog gate, and whichever
+/// runs second finds what the first did.
+pub fn pending(name: &str) {
+    PENDING.lock().unwrap().push(name.to_string());
+}
+
+/// Whether a client's `ATTACH` or `DETACH` of `name` is pending, asked
+/// holding [`taking`].
+pub fn is_pending(name: &str, _taking: &std::sync::MutexGuard<'static, ()>) -> bool {
+    PENDING.lock().unwrap().iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// A client's `ATTACH` or `DETACH` of `name`, [`pending`], is over, and
+/// changed what `name` is when `ran`: then it is [`claimed`].
+pub fn settled(name: &str, ran: bool) {
+    if ran {
+        claimed(name, &taking());
+    }
+    let mut pending = PENDING.lock().unwrap();
+    if let Some(at) = pending.iter().position(|n| n == name) {
+        pending.swap_remove(at);
+    }
+}
+
+/// A client detached or attached `name`, holding [`taking`]: it is not
+/// this server's to attach again, and a file set aside under it is
+/// forgotten.
+fn claimed(name: &str, _taking: &std::sync::MutexGuard<'static, ()>) {
+    OURS.lock().unwrap().retain(|n| !n.eq_ignore_ascii_case(name));
+    taken_back(name);
+}
+
+/// Set aside a file detached, in place of any of its name.
+pub fn set_aside(aside: SetAside) {
+    let mut all = SET_ASIDE.lock().unwrap();
+    all.retain(|a| !a.unattached.record.name.eq_ignore_ascii_case(&aside.unattached.record.name));
+    all.push(aside);
+}
+
+/// What is set aside.
+pub fn set_aside_now() -> Vec<SetAside> {
+    SET_ASIDE.lock().unwrap().clone()
+}
+
+/// Forget the file set aside as `name`: attached again, or its name taken.
+pub fn taken_back(name: &str) {
+    SET_ASIDE.lock().unwrap().retain(|a| !a.unattached.record.name.eq_ignore_ascii_case(name));
+}
+
 /// Make the workspace whole on `con`, the connection the pool is cloned
 /// from, before it serves: what is loaded and attached here is the whole
 /// instance's. Said in the server's log; nothing here stops a start.
@@ -165,53 +268,135 @@ pub fn open(con: &mut Conn) {
     // Installed by whoever made the view, and loaded here from the disk. One
     // that is not installed (a fresh extension directory, an engine of
     // another version) is installed in the background, since an install is
-    // a download, and a repository that does not answer would
-    // hold the start, and every client waiting on it, for as long as a
-    // connection takes to time out. Until it is loaded, the views that need
-    // it say so in the engine's words.
+    // a download, and a repository that does not answer would hold the
+    // start, and every client waiting on it, for as long as a connection
+    // takes to time out; and so is one the engine would install on demand,
+    // as `LOAD` does and as attaching a SQLite file does `sqlite`. Until it
+    // is loaded, the views that need it say so in the engine's words, and
+    // the SQLite files that wait on it are listed with why.
     let mut install = Vec::new();
     for &extension in &plan.loads {
-        if let Err(e) = con.execute_batch(&format!("LOAD {extension}")) {
-            eprintln!("harbor: workspace: {extension} did not load, and is installed in the background: {e}");
-            install.push(extension);
+        match installed(con, extension) {
+            true => {
+                if let Err(e) = con.execute_batch(&format!("LOAD {extension}")) {
+                    eprintln!("harbor: workspace: {extension} did not load: {e}");
+                }
+            }
+            false => {
+                eprintln!("harbor: workspace: {extension} is not installed, and is installed in the background");
+                install.push(extension);
+            }
         }
     }
-    if !install.is_empty() {
-        install_later(con, install);
+    let sqlite = plan.attaches.iter().any(|r| r.storage == "sqlite") && !installed(con, "sqlite_scanner");
+    let (later, at_start): (Vec<Record>, Vec<Record>) =
+        plan.attaches.into_iter().partition(|r| sqlite && r.storage == "sqlite");
+    if !later.is_empty() {
+        eprintln!("harbor: workspace: sqlite is not installed, and is installed in the background");
+        install.push("sqlite_scanner");
     }
     let mut unattached = plan.unattached;
-    for record in plan.attaches {
-        if let Err(reason) = attach(con, &record) {
-            unattached.push(Unattached { record, reason });
+    for record in at_start {
+        match attach(con, &record) {
+            Ok(()) => OURS.lock().unwrap().push(record.name.clone()),
+            Err(reason) => unattached.push(Unattached { record, reason }),
         }
     }
     for u in &unattached {
         eprintln!("harbor: workspace: {} is not attached — {}", u.record.name, u.reason);
     }
+    unattached.extend(later.iter().map(|record| Unattached { record: record.clone(), reason: WAITING.to_string() }));
     *SERVING.lock().unwrap() = Some(unattached);
+    if !install.is_empty() {
+        install_later(con, install, later);
+    }
+}
+
+/// Why a recorded SQLite file is not attached while the extension that
+/// attaches it is installed.
+const WAITING: &str = "attached once sqlite, which is not installed here, is installed in the background";
+
+/// Whether `extension` is installed, or loaded, as the engine finds it on
+/// the disk, which asks no repository.
+fn installed(con: &mut Conn, extension: &str) -> bool {
+    con.query_strings(&format!(
+        "SELECT (installed OR loaded)::VARCHAR FROM duckdb_extensions() WHERE extension_name = {}",
+        open::quote_literal(extension)
+    ))
+    .is_ok_and(|rows| rows.first().is_some_and(|v| v == "true"))
 }
 
 /// Install and load `extensions` on a connection of their own, on a thread
-/// of their own: a load is the whole instance's. Said in the server's log,
-/// done or not.
-fn install_later(con: &Conn, extensions: Vec<&'static str>) {
+/// of their own: a load is the whole instance's. Then attach `records`, the
+/// SQLite files that waited on one of them, each alone against the
+/// catalog's readers, as any `ATTACH` is. Said in the server's log, done or
+/// not, and what does not attach in `/catalog`.
+fn install_later(con: &Conn, extensions: Vec<&'static str>, records: Vec<Record>) {
+    let named = extensions.join(", ");
+    let failed = |records: &[Record], reason: String| {
+        for record in records {
+            attached_or(&record.name, Some(reason.clone()));
+        }
+    };
     let mut own = match con.try_clone() {
         Ok(own) => own,
         Err(e) => {
-            eprintln!("harbor: workspace: no connection to install {} on: {e}", extensions.join(", "));
+            eprintln!("harbor: workspace: no connection to install {named} on: {e}");
+            failed(&records, format!("no connection to install sqlite on: {e}"));
             return;
         }
     };
+    let waiting = records.clone();
     let spawned = std::thread::Builder::new().name("harbor-install".to_string()).spawn(move || {
+        let mut sqlite = Ok(());
         for extension in extensions {
             match own.execute_batch(&format!("INSTALL {extension}; LOAD {extension}")) {
                 Ok(()) => eprintln!("harbor: workspace: {extension} installed and loaded"),
-                Err(e) => eprintln!("harbor: workspace: {extension} did not install, and the views that need it say so: {e}"),
+                Err(e) => {
+                    eprintln!("harbor: workspace: {extension} did not install, and what needs it says so: {e}");
+                    if extension == "sqlite_scanner" {
+                        sqlite = Err(format!("sqlite did not install: {e}"));
+                    }
+                }
             }
+        }
+        for record in records {
+            let attached = match &sqlite {
+                Ok(()) => {
+                    let alone = crate::changing_catalog();
+                    let attached = attach(&mut own, &record);
+                    crate::learn_again(alone);
+                    attached
+                }
+                Err(reason) => Err(reason.clone()),
+            };
+            match &attached {
+                Ok(()) => {
+                    OURS.lock().unwrap().push(record.name.clone());
+                    eprintln!("harbor: workspace: {} is attached", record.name)
+                }
+                Err(reason) => eprintln!("harbor: workspace: {} is not attached — {reason}", record.name),
+            }
+            attached_or(&record.name, attached.err());
         }
     });
     if let Err(e) = spawned {
-        eprintln!("harbor: workspace: no thread to install on: {e}");
+        eprintln!("harbor: workspace: no thread to install {named} on: {e}");
+        failed(&waiting, format!("no thread to install sqlite on: {e}"));
+    }
+}
+
+/// The recorded file `name` attached, given `None`, or not, and why.
+fn attached_or(name: &str, reason: Option<String>) {
+    let mut serving = SERVING.lock().unwrap();
+    let Some(unattached) = serving.as_mut() else { return };
+    match reason {
+        None => unattached.retain(|u| u.record.name != name),
+        Some(reason) => {
+            for u in unattached.iter_mut().filter(|u| u.record.name == name) {
+                u.reason = reason.clone();
+            }
+        }
     }
 }
 
@@ -289,6 +474,19 @@ pub fn record(con: &mut Conn) {
             return;
         }
     };
+    // A file set aside is recorded as attached, as it was until it stopped
+    // reading, unless its row was deleted since.
+    let rows: Vec<String> = read_records(con).into_iter().map(|r| r.name).collect();
+    let mut current = current;
+    for aside in set_aside_now() {
+        let record = aside.unattached.record;
+        let named = |name: &String| name.eq_ignore_ascii_case(&record.name);
+        if (aside.recorded && !rows.iter().any(named)) || current.iter().any(|r| named(&r.name)) || by_init(&record.name) {
+            continue;
+        }
+        current.push(record);
+    }
+    current.sort_by(|a, b| a.name.cmp(&b.name));
     let kept: Vec<String> = unattached
         .into_iter()
         .map(|u| u.record.name)

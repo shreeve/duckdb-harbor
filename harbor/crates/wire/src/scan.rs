@@ -35,10 +35,13 @@ pub struct Span {
     pub end: usize, // exclusive
     pub kind: Kind,
     pub terminated: bool,
+    /// A `'` string that takes backslash escapes: the `E` before it began
+    /// a word. The span starts at the quote, so the `E` is code either way.
+    pub escapes: bool,
 }
 
 /// A space to the engine's tokenizer: the ASCII set with the vertical tab.
-pub(crate) fn is_space(c: u8) -> bool {
+pub fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t'..=b'\r')
 }
 
@@ -54,7 +57,7 @@ pub(crate) fn is_space(c: u8) -> bool {
 /// lexer: a reader that knew fewer spaces than the engine would take a
 /// statement behind one for part of a word, and one that knew more would
 /// end a word the engine keeps going.
-pub(crate) fn plain_spaces(b: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+pub fn plain_spaces(b: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let lead = |c: &u8| matches!(c, 0xC2 | 0xE2 | 0xE3 | 0xEF);
     if !b.iter().any(lead) {
         return b.into();
@@ -171,7 +174,7 @@ pub(crate) fn comment_at(b: &[u8], i: usize) -> Option<Span> {
         }
         _ => return None,
     };
-    Some(Span { start: i, end, kind, terminated })
+    Some(Span { start: i, end, kind, terminated, escapes: false })
 }
 
 /// The string, quoted name or dollar quote that opens at `i`, if one does.
@@ -180,16 +183,16 @@ pub(crate) fn comment_at(b: &[u8], i: usize) -> Option<Span> {
 /// that takes backslash escapes. The `e` that ends `LIKE'` or `date'` began no
 /// word, so the backslash in `LIKE'\'` is data.
 fn quote_at(b: &[u8], i: usize, word: Option<usize>) -> Option<Span> {
-    let (kind, end, terminated) = match b[i] {
+    let (kind, end, terminated, escapes) = match b[i] {
         q @ (b'\'' | b'"' | b'`') => {
             let escapes = q == b'\'' && i > 0 && word == Some(i - 1) && (b[i - 1] | 0x20) == b'e';
             let mut j = i + 1;
             loop {
                 match b.get(j) {
-                    None => break (Kind::Str, j, false),
+                    None => break (Kind::Str, j, false, escapes),
                     Some(b'\\') if escapes && j + 1 < b.len() => j += 2,
                     Some(&c) if c == q && b.get(j + 1) == Some(&q) => j += 2,
-                    Some(&c) if c == q => break (Kind::Str, j + 1, true),
+                    Some(&c) if c == q => break (Kind::Str, j + 1, true, escapes),
                     Some(_) => j += 1,
                 }
             }
@@ -204,13 +207,13 @@ fn quote_at(b: &[u8], i: usize, word: Option<usize>) -> Option<Span> {
             // reaches past the next: the search stays linear in the body.
             let tag = &b[i..=close];
             match (close + 1..b.len()).find(|&j| b[j..].starts_with(tag)) {
-                Some(j) => (Kind::Dollar, j + tag.len(), true),
-                None => (Kind::Dollar, b.len(), false),
+                Some(j) => (Kind::Dollar, j + tag.len(), true, false),
+                None => (Kind::Dollar, b.len(), false, false),
             }
         }
         _ => return None,
     };
-    Some(Span { start: i, end, kind, terminated })
+    Some(Span { start: i, end, kind, terminated, escapes })
 }
 
 /// `src` cut into spans that cover it end to end, in order.
@@ -219,14 +222,14 @@ pub fn scan(src: &str) -> Vec<Span> {
 }
 
 /// The spans of text whose spaces are already plain ([`plain_spaces`]).
-pub(crate) fn spans(b: &[u8]) -> Vec<Span> {
+pub fn spans(b: &[u8]) -> Vec<Span> {
     let (mut spans, mut code, mut i) = (Vec::new(), 0, 0);
     // Where the bare word the scan is in began, if it is in one.
     let mut word = None;
     while i < b.len() {
         if let Some(span) = comment_at(b, i).or_else(|| quote_at(b, i, word)) {
             if i > code {
-                spans.push(Span { start: code, end: i, kind: Kind::Code, terminated: true });
+                spans.push(Span { start: code, end: i, kind: Kind::Code, terminated: true, escapes: false });
             }
             spans.push(span);
             (i, code, word) = (span.end, span.end, None);
@@ -248,7 +251,7 @@ pub(crate) fn spans(b: &[u8]) -> Vec<Span> {
         i += 1;
     }
     if b.len() > code {
-        spans.push(Span { start: code, end: b.len(), kind: Kind::Code, terminated: true });
+        spans.push(Span { start: code, end: b.len(), kind: Kind::Code, terminated: true, escapes: false });
     }
     spans
 }
@@ -456,6 +459,10 @@ mod tests {
         }
         // unterminated E-string stays open
         assert!(!kinds(r"SELECT E'\''oops' -- ").last().unwrap().2);
+        // Each string says whether it takes escapes, even where no escape
+        // moves its end.
+        let escapes = |src: &str| scan(src).iter().filter(|s| s.kind == Kind::Str).map(|s| s.escapes).collect::<Vec<_>>();
+        assert_eq!(escapes("SELECT E'a\\tb', 'a\\tb', xe'a\\tb', }'a\\tb', \"e\""), vec![true, false, false, false, false]);
     }
 
     #[test]

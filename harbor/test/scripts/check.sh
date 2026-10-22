@@ -37,7 +37,7 @@ s.close()')}
 # port this runner has already given to the shared server — the run dies at
 # startup with "address already in use" and it looks like a harbor bug.
 unset PORT
-suites=${SUITES:-unit regressions lifecycle roundtrip types asserts spec fuzz hostile deployment stress catalog sessions cancel}
+suites=${SUITES:-unit braces regressions lifecycle roundtrip types asserts spec fuzz hostile deployment stress catalog sessions cancel}
 
 bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
 green=$(tput setaf 2 2>/dev/null || true); dim=$(tput dim 2>/dev/null || true)
@@ -135,6 +135,10 @@ fi
 # and `config`/`membership` are off by default, so it never compiles the config
 # reader either.
 run unit     cargo test --release --workspace --all-features
+# Brace expansion, parsed by the engine: the unit tests' binary expands, the
+# CLI beside the engine parses, and the two trees must agree. Built with the
+# unit suite's flags, so after it nothing is rebuilt.
+run braces   python3 "$here/test/scripts/braces.py"
 run regressions python3 "$here/test/scripts/regressions.py"
 # The lifetime doctrine runs the real binary in its own $HARBOR_HOME sandbox —
 # no shared server, and nothing it starts outlives it.

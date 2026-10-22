@@ -911,8 +911,10 @@ workspace_stop
 check "its row stays in the record" 0 "1" \
   "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'notsq'"
 wait_gone
-# A writer that holds a SQLite file locked: a catalog read fails, naming the
-# file, in about the second harbor's attachment waits, not the engine's five.
+# A writer that holds a SQLite file locked, any connection or another
+# program: the file stays attached, and a catalog read answers as the
+# server last read it, the file saying why, in about the second harbor's
+# attachment waits, not the engine's five; a later read asks the file alone.
 lock_sqlite() { # lock_sqlite <file>: hold it locked until killed; returns once held
   python3 -c '
 import sqlite3, sys, time
@@ -923,21 +925,96 @@ time.sleep(60)' "$1" > "$work/lock.out" 2>&1 &
   locker=$!
   for _ in $(seq 1 50); do grep -q locked "$work/lock.out" 2>/dev/null && return; sleep 0.1; done
 }
+# A file replaced by one that is not SQLite, and put back.
+replace_sqlite() {
+  mv "$work/files/app.sqlite" "$work/files/app.keep"
+  printf 'not a SQLite file, and long enough to be read as one: %.0s' 1 2 3 4 > "$work/files/app.sqlite"
+}
+restore_sqlite() { mv "$work/files/app.keep" "$work/files/app.sqlite"; }
 workspace_start
 check "a SQLite file attaches in the workspace again" 0 "app: the SQLite database" \
   "$harbor" "$work/files/app.sqlite" --mode csv -c "SELECT count(*) FROM app.people"
+catalog_timed() { # the status and seconds of a catalog read, its lines in $work/cat.json
+  curl -s -o "$work/cat.json" -w '%{http_code} %{time_total}\n' --max-time 20 \
+    --unix-socket "$(live_sock)" http://harbor/catalog
+}
+# Attached by the start, from the record, as harbor attaches a SQLite file.
+workspace_stop
+workspace_start
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "the start attaches it, and the catalog reads it" \
+  || bad "before the lock: $(catalog_lines)"
 lock_sqlite "$work/files/app.sqlite"
-read -r status secs < <(curl -s -o "$work/cat.json" -w '%{http_code} %{time_total}\n' --max-time 20 \
-  --unix-socket "$(live_sock)" http://harbor/catalog)
-body=$(cat "$work/cat.json")
-[[ $status == 400 && $body == *"app ($work/files/app.sqlite)"*"database is locked"* ]] \
-  && ok "a locked one fails the catalog with a 400 that names it" || bad "the catalog of a locked file: $status $body"
+read -r status secs < <(catalog_timed)
+lines=$(catalog_lines)
+[[ $status == 200 && $lines == *"attached app ['people'] "*"database is locked"*"may be stale"* ]] \
+  && ok "a locked one stays attached, and the catalog lists it as last read, with why" \
+  || bad "the catalog of a locked file: $status $lines"
+[[ $lines == *"view it_s_q1 reads"* ]] && ok "and the rest of the catalog reads" || bad "the catalog beside it: $lines"
 python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 4 else 1)" "$secs" \
   && ok "in about a second (${secs}s)" || bad "the catalog of a locked file took ${secs}s"
+read -r status secs < <(catalog_timed)
+python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 1 else 1)" "$secs" \
+  && ok "and a read while it stays locked waits on it no longer (${secs}s)" || bad "the next read took ${secs}s"
+out=$("$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM app.people" 2>&1)
+[[ $out == *"locked"* && $out != *"does not exist"* ]] && ok "and a statement that reads it waits on its lock" \
+  || bad "a statement on a locked file: $out"
 kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
-[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and reads again once the lock is gone" \
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is read anew once the lock is gone" \
   || bad "after the lock: $(catalog_lines)"
+# A client's ATTACH of its name that fails, or changes nothing, leaves it
+# the server's, attached again below once it reads.
+out=$("$harbor" "$work/workspace.duckdb" -c "ATTACH ':memory:' AS app" 2>&1)
+[[ $out == *"already exists"* ]] && ok "a client's ATTACH of its name fails" || bad "a client's ATTACH of its name: $out"
+check "and one IF NOT EXISTS changes nothing" 0 "" \
+  "$harbor" "$work/workspace.duckdb" -c "ATTACH IF NOT EXISTS ':memory:' AS app"
+# A recorded file that stops being SQLite: detached, listed with why, and,
+# since this server attached it from the record, attached again once it
+# reads.
+replace_sqlite
+lines=$(catalog_lines)
+[[ $lines == *"attached app [] "*"file is not a database"*"detached by the server"*"attached again"* ]] \
+  && ok "a recorded file replaced by one that is not SQLite is detached, and the catalog says why" \
+  || bad "the catalog of a replaced file: $lines"
+[[ $lines == *"view it_s_q1 reads"* ]] && ok "and the rest of the catalog reads" || bad "the catalog beside it: $lines"
+restore_sqlite
+# A catalog read that attaches it again, and a client's ATTACH pipelined
+# behind it on one connection: each is answered, the ATTACH in its turn.
+out=$(python3 -c '
+import json, socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.settimeout(15)
+body = json.dumps({"sql": "ATTACH '"'"':memory:'"'"' AS piped"}).encode()
+s.sendall(b"GET /catalog HTTP/1.1\r\nHost: harbor\r\n\r\n"
+          + b"POST /sql HTTP/1.1\r\nHost: harbor\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+got = b""
+try:
+    while not (got.count(b"HTTP/1.1 200") == 2 and b"\"type\":\"end\"" in got and got.endswith(b"0\r\n\r\n")):
+        more = s.recv(65536)
+        if not more: break
+        got += more
+except socket.timeout:
+    pass
+print("answered", got.count(b"HTTP/1.1 200"))' "$(live_sock)" 2>&1)
+[[ $out == "answered 2" ]] && ok "a catalog read that attaches it again, and an ATTACH pipelined behind it, are both answered" \
+  || bad "a pipelined catalog read and ATTACH: $out"
+check "and the ATTACH ran" 0 "" "$harbor" "$work/workspace.duckdb" -c "DETACH piped"
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is attached again once it reads" \
+  || bad "after it is back: $(catalog_lines)"
+replace_sqlite
+catalog_timed >/dev/null
+check "a file set aside whose row is deleted" 0 "" \
+  "$harbor" "$work/workspace.duckdb" -c "DELETE FROM _harbor.attached WHERE name = 'app'"
+[[ $(catalog_lines) != *"attached app"* ]] && ok "is forgotten" || bad "after its row: $(catalog_lines)"
+restore_sqlite
+[[ $(catalog_lines) != *"attached app"* ]] && ok "and not attached again once it reads" || bad "after it is back: $(catalog_lines)"
+check "a SQLite file attaches in the workspace again" 0 "app: the SQLite database" \
+  "$harbor" "$work/files/app.sqlite" --mode csv -c "SELECT count(*) FROM app.people"
+replace_sqlite
+catalog_timed >/dev/null
 workspace_stop
+restore_sqlite
+check "a file set aside as the server stops keeps its row" 0 "1" \
+  "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'app'"
+wait_gone
 lock_sqlite "$work/files/app.sqlite"
 started=$(python3 -c 'import time; print(time.time())')
 workspace_start
@@ -988,19 +1065,24 @@ if (( spatial )); then
   # An install is a download, and never stands between the database and the
   # socket: a repository that does not answer holds the start for as long as
   # a connection takes to time out. The SQLite file the workspace records
-  # would attach through an extension the engine installs on demand, from
-  # the same repository, so installing on demand is off: what is measured
-  # is the view's extension, which harbor installs.
+  # attaches through an extension the engine would install on demand, from
+  # the same repository, and is attached in the background too.
   mkdir -p "$work/noext"
   started=$(python3 -c 'import time; print(time.time())')
-  workspace_start --init "SET extension_directory='$work/noext'; SET custom_extension_repository='http://10.255.255.1'; SET autoinstall_known_extensions=false"
+  workspace_start --init "SET extension_directory='$work/noext'; SET custom_extension_repository='http://10.255.255.1'"
   took=$(python3 -c "import time, sys; print(round(time.time() - float(sys.argv[1]), 2))" "$started")
   python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 5 else 1)" "$took" \
     && ok "a start whose extension repository does not answer serves at once (${took}s)" \
     || bad "the start took ${took}s"
-  [[ $(catalog_lines) == *"view parks "*"spatial"* ]] && ok "and the view that needs it says why it does not read" \
-    || bad "the spatial view without spatial: $(catalog_lines)"
+  lines=$(catalog_lines)
+  [[ $lines == *"view parks "*"spatial"* ]] && ok "and the view that needs it says why it does not read" \
+    || bad "the spatial view without spatial: $lines"
+  [[ $lines == *"attached notsq [] attached once sqlite"*"in the background"* ]] \
+    && ok "and the SQLite file the workspace records says it waits on sqlite" || bad "the SQLite file without sqlite: $lines"
   workspace_stop
+  check "and its row stays in the record" 0 "1" \
+    "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'notsq'"
+  wait_gone
 fi
 
 echo

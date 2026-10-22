@@ -2,7 +2,8 @@
 //!
 //! The server writes these types and a client reads them, so the two cannot
 //! disagree on a name. Field order is the document's order, and every field
-//! the full style writes is always there, `null` or `[]` when empty. The lite
+//! the full style writes is always there, `null` or `[]` when empty, but
+//! `stale`, which is there only on a document answered as last read. The lite
 //! style ([`Inventory`]) is the same document at lower fidelity: a field it
 //! omits is absent, never differently shaped. Reading is lenient: a field
 //! missing, as everything the lite style omits is, reads as its default, and
@@ -32,6 +33,12 @@ pub struct Catalog {
     /// The other databases attached to the served one, by name; never
     /// `system` or `temp`.
     pub attached: Vec<Attached>,
+    /// Why this is the catalog the server last read, and may be stale,
+    /// every database in it: an attached SQLite file whose catalog does
+    /// not read for the moment, whose entry says why. Absent from a
+    /// document read anew.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
 }
 
 /// A view: what it reads as, without a row count, since counting a view
@@ -67,9 +74,13 @@ pub struct Attached {
     pub storage: String,
     pub read_only: bool,
     /// Why it is not attached, when it is a file the workspace records and
-    /// its server could not attach at its start: the file gone, or the
-    /// engine's refusal. It then holds nothing. None for a database that is
-    /// attached.
+    /// its server could not attach at its start, the file gone or the
+    /// engine's refusal, or a SQLite file the server detached because its
+    /// catalog stopped reading for good, replaced or gone. It then holds
+    /// nothing. Or why it is listed as last read: a SQLite file still
+    /// attached whose catalog does not read for the moment, locked, so that the
+    /// whole document is the one the server last read, and may be stale
+    /// (`Catalog::stale`). None for a database that is attached and read.
     pub error: Option<String>,
     /// By (schema, name), in the served database's shape. `rowCount` is
     /// exact for a DuckDB catalog, and None for another engine's, where a
@@ -163,6 +174,9 @@ pub struct Inventory {
     pub tables: Vec<Named>,
     pub views: Vec<Named>,
     pub attached: Vec<AttachedInventory>,
+    /// As the full style's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +318,7 @@ mod tests {
                 tables: vec![named("people")],
                 views: vec![],
             }],
+            stale: None,
         };
         let text = serde_json::to_string(&lite).unwrap();
         assert_eq!(
@@ -314,6 +329,11 @@ mod tests {
         assert_eq!((read.tables[0].row_count, read.tables[0].columns.len()), (None, 0));
         assert_eq!((read.views[0].name.as_str(), read.views[0].error.as_deref()), ("v", None));
         assert_eq!(read.attached[0].tables_in("main")[0].name, "people");
+        // A document answered as last read says so, last.
+        let stale = Inventory { stale: Some("last read".into()), ..lite };
+        let text = serde_json::to_string(&stale).unwrap();
+        assert!(text.ends_with(r#""views":[]}],"stale":"last read"}"#), "{text}");
+        assert_eq!(serde_json::from_str::<Catalog>(&text).unwrap().stale.as_deref(), Some("last read"));
     }
 
     /// A view and an attached database, as the full style writes them: a

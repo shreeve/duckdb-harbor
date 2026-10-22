@@ -207,7 +207,7 @@ mod conn {
             // As the server does: a document aimed at a VARIANT is marked.
             let mut params = params.to_vec();
             let bound = c.bind(stmt, &mut params)?;
-            let mut stream = c.execute(stmt, bound, || true)?.expect("wanted");
+            let mut stream = c.execute(stmt, bound, |_| true)?.expect("wanted");
             // Encode through the shared cell encoder so this test exercises
             // the same path the server will.
             let columns = std::mem::take(&mut stream.columns);
@@ -320,7 +320,7 @@ mod conn {
         assert!(c.execute_batch("SELECT no_such_column FROM t").is_err());
         let stmts = c.statements(insert).unwrap();
         let bound = c.bind(&stmts[0], &mut [doc(r#"{"a":1}"#)]).unwrap();
-        let err = c.execute(&stmts[0], bound, || true).err().expect("aborted").to_string();
+        let err = c.execute(&stmts[0], bound, |_| true).err().expect("aborted").to_string();
         assert!(err.contains("aborted"), "{err}");
         c.execute_batch("ROLLBACK").unwrap();
 
@@ -522,14 +522,14 @@ mod conn {
         c.execute_batch("CREATE TABLE t(i INTEGER)").unwrap();
         let stmts = c.statements("INSERT INTO t VALUES (1)").unwrap();
         let bound = c.bind(&stmts[0], &mut []).unwrap();
-        assert!(c.execute(&stmts[0], bound, || false).unwrap().is_none());
+        assert!(c.execute(&stmts[0], bound, |_| false).unwrap().is_none());
         assert_eq!(rows(&mut c, "SELECT count(*) FROM t", &[]).unwrap(), ["0"]);
 
         let handle = c.interrupt_handle();
         let stmts = c.statements("SELECT count(*) FROM range(10000000000)").unwrap();
         let bound = c.bind(&stmts[0], &mut []).unwrap();
         let mut stream = c
-            .execute(&stmts[0], bound, || {
+            .execute(&stmts[0], bound, |_| {
                 handle.interrupt();
                 true
             })
@@ -537,6 +537,41 @@ mod conn {
             .expect("wanted");
         let err = std::iter::from_fn(|| stream.next_chunk().transpose()).find_map(Result::err);
         assert_eq!(err.map(|e| e.code), Some(ffi::ERROR_RUNTIME_INTERRUPT));
+    }
+
+    /// Every statement but a SELECT is retained: run to its end, and in
+    /// autocommit committed, before its first chunk comes back. An
+    /// interrupt fired after that stops nothing, and the rest of its rows,
+    /// RETURNING rows included, arrive.
+    #[test]
+    fn a_write_is_done_by_its_first_chunk() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        c.execute_batch("CREATE TABLE t(i BIGINT)").unwrap();
+        let open = |c: &mut conn::Conn, sql: &str| {
+            let stmts = c.statements(sql).unwrap();
+            let bound = c.bind(&stmts[0], &mut []).unwrap();
+            let mut retained = None;
+            let stream = c.execute(&stmts[0], bound, |r| { retained = Some(r); true }).unwrap().expect("wanted");
+            (retained.expect("told"), stream)
+        };
+        assert!(!open(&mut c, "SELECT 42").0, "a SELECT streams");
+        let handle = c.interrupt_handle();
+        for (sql, rows_back) in [
+            ("INSERT INTO t SELECT * FROM range(10000)", 1),
+            ("INSERT INTO t SELECT * FROM range(10000) RETURNING i", 10000),
+        ] {
+            let (retained, mut stream) = open(&mut c, sql);
+            assert!(retained, "{sql}");
+            let first = stream.next_chunk().unwrap().expect("a first chunk");
+            handle.interrupt();
+            let mut back = first.rows;
+            while let Some(chunk) = stream.next_chunk().unwrap() {
+                back += chunk.rows;
+            }
+            assert_eq!(back, rows_back, "{sql}");
+        }
+        assert_eq!(rows(&mut c, "SELECT count(*) FROM t", &[]).unwrap(), ["20000"]);
     }
 
     #[test]
@@ -932,6 +967,34 @@ mod wire {
             eng,
             "SELECT [union_value(a := 2)::UNION(a INTEGER, b VARCHAR)] AS lu",
             r#"{"name":"lu","duckdbType":"UNION(a INTEGER, b VARCHAR)[]","lossless":true,"child":{"duckdbType":"UNION(a INTEGER, b VARCHAR)","lossless":true,"members":[{"name":"a","duckdbType":"INTEGER","lossless":true},{"name":"b","duckdbType":"VARCHAR","lossless":true}]}}"#,
+        );
+        // A container is lossless only when every member is: the flag on a
+        // column answers for the whole of it, and the nested entry that loses
+        // says so too.
+        schema(
+            eng,
+            "SELECT ['POINT(1 2)'::GEOMETRY] AS lg",
+            r#"{"name":"lg","duckdbType":"GEOMETRY[]","lossless":false,"child":{"duckdbType":"GEOMETRY","lossless":false,"encoding":"varchar-cast"}}"#,
+        );
+        schema(
+            eng,
+            "SELECT ['POINT(1 2)'::GEOMETRY]::GEOMETRY[1] AS ag",
+            r#"{"name":"ag","duckdbType":"GEOMETRY[1]","lossless":false,"arrayLength":1,"child":{"duckdbType":"GEOMETRY","lossless":false,"encoding":"varchar-cast"}}"#,
+        );
+        schema(
+            eng,
+            "SELECT {'n': 1, 'v': 1::VARIANT} AS sv",
+            r#"{"name":"sv","duckdbType":"STRUCT(n INTEGER, v VARIANT)","lossless":false,"fields":[{"name":"n","duckdbType":"INTEGER","lossless":true},{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"json"}]}"#,
+        );
+        schema(
+            eng,
+            "SELECT MAP(['k'], [1::VARIANT]) AS mv",
+            r#"{"name":"mv","duckdbType":"MAP(VARCHAR, VARIANT)","lossless":false,"keyType":{"duckdbType":"VARCHAR","lossless":true},"valueType":{"duckdbType":"VARIANT","lossless":false,"encoding":"json"},"encoding":"pairs"}"#,
+        );
+        schema(
+            eng,
+            "SELECT [[get_type(1)]] AS lt",
+            r#"{"name":"lt","duckdbType":"TYPE[][]","lossless":false,"child":{"duckdbType":"TYPE[]","lossless":false,"child":{"duckdbType":"TYPE","lossless":false,"encoding":"varchar-cast"}}}"#,
         );
         schema(eng, "SELECT NULL AS x", r#"{"name":"x","duckdbType":"\"NULL\"","lossless":true}"#);
         schema(eng, "SELECT TIME_NS '14:30:00' AS t", r#"{"name":"t","duckdbType":"TIME_NS","lossless":true}"#);
