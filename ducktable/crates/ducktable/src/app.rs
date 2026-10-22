@@ -2020,19 +2020,19 @@ impl DuckTable {
         );
     }
 
-    /// Detach an attached catalog, leaving its file as it is, and in the
-    /// workspace let go of its record, so the workspace does not attach it
-    /// again; one the workspace could not attach (`attached` false) has
-    /// only its record. What was staged on its tables is parked with the
-    /// rest of the database's.
-    pub(crate) fn detach_catalog(&mut self, name: String, attached: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Detach a catalog, leaving its file as it is, and in the workspace
+    /// let go of its record, so the workspace does not attach it again.
+    /// The `DETACH` goes whether or not the catalog lists it with an error
+    /// (`workspace::detach_statements`). What was staged on its tables is
+    /// parked with the rest of the database's.
+    pub(crate) fn detach_catalog(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.asking_to_quit {
             return;
         }
         let detached = clone_str(&name);
         let workspace = self.on_workspace();
         self.on_connection(
-            move |conn| harbor_client::workspace::detach(conn, &detached, attached, workspace),
+            move |conn| harbor_client::workspace::detach(conn, &detached, workspace),
             move |state, outcome, _, cx| match outcome {
                 Ok(()) => state.let_go_of(|selected| selected.catalog.as_deref() == Some(name.as_str()), cx),
                 Err(why) => crate::open::alert(format!("{name} was not detached"), why, cx),
@@ -2633,15 +2633,15 @@ mod tests {
         // Remove and Detach leave the files as they were; Detach lets go of
         // the record, so no server attaches the file again.
         workspace::remove_view(&conn, "main", "book").expect("remove");
-        workspace::detach(&conn, "app", true, true).expect("detach");
+        workspace::detach(&conn, "app", true).expect("detach");
         let catalog = super::read_catalog(&conn).expect("catalog");
         assert!(catalog.views.iter().all(|v| v.name != "book") && catalog.attached.is_empty());
         assert!(dir.join("book.xlsx").exists() && dir.join("app.sqlite").exists());
         assert!(record(&conn).is_empty());
 
         // A recorded file that is gone when the server starts is listed,
-        // holding nothing, with why; the sidebar greys it, and its Detach
-        // deletes the record's row alone.
+        // holding nothing, with why; the sidebar greys it, and its Detach,
+        // whose DETACH IF EXISTS finds nothing, deletes the record's row.
         let reopened = super::open_files(&conn, &[(dir.join("app.sqlite"), wire::open::Kind::Sqlite)]);
         assert!(reopened[0].as_ref().is_ok_and(|o| o.name == "app" && o.made), "{reopened:?}");
         drop(conn);
@@ -2655,7 +2655,7 @@ mod tests {
         let lines = tree_lines(&catalog, false, &None);
         assert!(lines.contains(&Line::Catalog { name: "app".into(), storage: "sqlite".into(), error: Some(error) }));
         assert!(!lines.iter().any(|l| l.rel().is_some_and(|r| r.catalog.as_deref() == Some("app"))));
-        workspace::detach(&conn, "app", false, true).expect("detach the missing file");
+        workspace::detach(&conn, "app", true).expect("detach the missing file");
         assert!(record(&conn).is_empty());
         assert!(super::read_catalog(&conn).expect("catalog").attached.is_empty());
 

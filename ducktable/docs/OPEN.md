@@ -100,12 +100,14 @@ turn it into data DuckTable keeps or sends on:
   same rules as File → Export Table.
 
 **Remove from Workspace** on a workspace view drops it; the file is left as
-it is. **Detach** on an attached catalog's heading detaches it with a plain
-`DETACH` and deletes its row from the record (`Record::delete_sql`), so no
-later server attaches it again; what was staged on its tables is parked with
-the rest of the workspace's. On a greyed heading it deletes the row alone,
-since nothing is attached. In a database other than the workspace, Detach
-is the `DETACH` alone.
+it is. **Detach** on an attached catalog's heading detaches it with
+`DETACH IF EXISTS` and deletes its row from the record (`Record::delete_sql`),
+so no later server attaches it again; what was staged on its tables is
+parked with the rest of the workspace's. A greyed heading gets the same
+`DETACH`: a busy file is still attached, and a file the server set aside is
+forgotten once a client detaches its name, while one never attached
+detaches nothing. In a database other than the workspace, Detach is the
+`DETACH` alone.
 
 ## Every way in
 

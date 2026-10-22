@@ -138,15 +138,15 @@ fn record_attachment(conn: &Conn, name: &str, path: &str, read_only: bool) -> Re
     rows(conn, &record.insert_sql()).map(drop)
 }
 
-/// The statements Detach runs for the catalog `name`: `DETACH` when it is
-/// `attached`, and, in the `workspace`, its row deleted from the record, so
-/// no later server attaches it again. A catalog the workspace records and
-/// could not attach (its file gone) has nothing to detach, only its row.
-pub fn detach_statements(name: &str, attached: bool, workspace: bool) -> Vec<String> {
-    let mut sql = Vec::new();
-    if attached {
-        sql.push(format!("DETACH {}", open::quote_ident(name)));
-    }
+/// The statements Detach runs for the catalog `name`: `DETACH IF EXISTS`,
+/// and, in the `workspace`, its row deleted from the record, so no later
+/// server attaches it again. The `DETACH` goes whatever the catalog lists
+/// of the name: one listed with an error may still be attached (a SQLite
+/// file busy with a write), or set aside by the server, which forgets it
+/// once a client detaches the name, and one never attached detaches
+/// nothing.
+pub fn detach_statements(name: &str, workspace: bool) -> Vec<String> {
+    let mut sql = vec![format!("DETACH IF EXISTS {}", open::quote_ident(name))];
     if workspace {
         sql.extend(open::RECORD_DDL.iter().map(|s| s.to_string()));
         sql.push(Record::delete_sql(name));
@@ -156,8 +156,8 @@ pub fn detach_statements(name: &str, attached: bool, workspace: bool) -> Vec<Str
 
 /// Detach the catalog `name` ([`detach_statements`]). The file is
 /// untouched.
-pub fn detach(conn: &Conn, name: &str, attached: bool, workspace: bool) -> Result<(), String> {
-    for sql in detach_statements(name, attached, workspace) {
+pub fn detach(conn: &Conn, name: &str, workspace: bool) -> Result<(), String> {
+    for sql in detach_statements(name, workspace) {
         rows(conn, &sql)?;
     }
     Ok(())
@@ -355,13 +355,10 @@ mod tests {
     fn detach_lets_go_of_the_catalog_and_its_record() {
         let ddl = open::RECORD_DDL.map(String::from);
         let forget = "DELETE FROM _harbor.attached WHERE name = 'o''x'".to_string();
-        let attached = detach_statements("o'x", true, true);
-        assert_eq!(attached[0], "DETACH \"o'x\"");
-        assert_eq!(attached[1..], [ddl[0].clone(), ddl[1].clone(), forget.clone()]);
-        // Recorded and not attached: only its row.
-        assert_eq!(detach_statements("o'x", false, true), [ddl[0].clone(), ddl[1].clone(), forget]);
+        let detach = "DETACH IF EXISTS \"o'x\"".to_string();
+        assert_eq!(detach_statements("o'x", true), [detach.clone(), ddl[0].clone(), ddl[1].clone(), forget]);
         // Another database keeps no record.
-        assert_eq!(detach_statements("o'x", true, false), ["DETACH \"o'x\""]);
+        assert_eq!(detach_statements("o'x", false), [detach]);
     }
 
     #[test]

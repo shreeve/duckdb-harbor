@@ -519,10 +519,9 @@ impl crate::app::DuckTable {
                 .into_any_element(),
             Line::Catalog { name, storage, error } => {
                 let detach = clone_str(&name);
-                let attached = error.is_none();
-                // One the workspace records and could not attach is
-                // greyed, holds nothing, and says why on hover.
-                let color = if attached { t.muted } else { t.muted.opacity(0.5) };
+                // One listed with an error (busy, set aside, or recorded
+                // and not attached) is greyed and says why on hover.
+                let color = if error.is_none() { t.muted } else { t.muted.opacity(0.5) };
                 div()
                     .id(SharedString::from(format!("catalog-{name}")))
                     .pl_2()
@@ -539,7 +538,7 @@ impl crate::app::DuckTable {
                         row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(error.clone()).build(window, cx))
                     })
                     .context_menu(move |menu, _, _| {
-                        menu.menu("Detach", Box::new(crate::DetachCatalog { name: clone_str(&detach), attached }))
+                        menu.menu("Detach", Box::new(crate::DetachCatalog { name: clone_str(&detach) }))
                     })
                     .into_any_element()
             }
