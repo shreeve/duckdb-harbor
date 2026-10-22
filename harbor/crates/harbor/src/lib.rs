@@ -4635,10 +4635,11 @@ enum Gate {
 /// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
 /// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
 /// `information_schema`, `sql_auto_complete` or `sqlite_query`, which reads
-/// an attached SQLite database by its name; `query` or `query_table`,
-/// which run a statement or read a table named in a string; or a view,
-/// macro or prepared statement whose body reads it (`CatalogNames`). A name in a string or a comment does not
-/// count.
+/// an attached SQLite database by its name; `query` or `query_table`
+/// called, which run a statement or read a table named in a string; or a
+/// view, macro or prepared statement whose body reads it (`CatalogNames`).
+/// A name in a string or a comment does not count, and neither does a
+/// column named `query`.
 fn catalog_gate(sql: &str) -> Gate {
     gate_of(sql, &CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner))
 }
@@ -4656,38 +4657,83 @@ fn gate_of(sql: &str, names: &CatalogNames) -> Gate {
 }
 
 /// Whether a name, lowercased, is one of the engine's catalog functions or
-/// schemas.
+/// schemas, as `names_in` passes it: `query` and `query_table` count
+/// called, as `query(` and `query_table(`, and a column of either name does
+/// not.
 fn catalog_word(word: &[u8]) -> bool {
     ["duckdb_", "pragma_", "pg_"].iter().any(|p| word.starts_with(p.as_bytes()))
         || word == b"information_schema"
         || word == b"sql_auto_complete"
         || word == b"sqlite_query"
-        || word == b"query"
-        || word == b"query_table"
+        || word == b"query("
+        || word == b"query_table("
 }
+
+/// The functions that read the catalog only when called, and whose names a
+/// column or a table may have.
+const CALLED: [&[u8]; 2] = [b"query", b"query_table"];
 
 /// Each name a statement uses, lowercased, as the engine matches names: a
 /// word of its code, or a name quoted in `"` or `` ` ``, until `found` says
-/// it is the one looked for. Whether one was.
+/// it is the one looked for. Whether one was. Its spaces are the engine's
+/// (`wire::scan::plain_spaces`), and one of the `CALLED` names followed by
+/// `(`, past spaces and comments, is passed with it: `query(`.
 fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
-    let bytes = sql.as_bytes();
-    for span in wire::scan::scan(sql) {
+    let plain = wire::scan::plain_spaces(sql.as_bytes());
+    let bytes = &*plain;
+    let spans = wire::scan::spans(bytes);
+    let mut used = |name: &[u8], next: &[wire::scan::Span], from: usize| {
+        let mut name = name.to_ascii_lowercase();
+        if CALLED.contains(&name.as_slice()) && called(bytes, next, from) {
+            name.push(b'(');
+        }
+        found(&name)
+    };
+    for (at, span) in spans.iter().enumerate() {
         let text = &bytes[span.start..span.end];
         match span.kind {
             wire::scan::Kind::Code => {
-                if text.split(|&c| !is_word(c)).any(|word| !word.is_empty() && found(&word.to_ascii_lowercase())) {
-                    return true;
+                let mut i = span.start;
+                while i < span.end {
+                    if !is_word(bytes[i]) {
+                        i += 1;
+                        continue;
+                    }
+                    let start = i;
+                    while i < span.end && is_word(bytes[i]) {
+                        i += 1;
+                    }
+                    if used(&bytes[start..i], &spans[at..], i) {
+                        return true;
+                    }
                 }
             }
             wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) => {
                 let quote = text[0];
                 let name = text[1..].strip_suffix(&[quote]).unwrap_or(&text[1..]);
-                if found(&name.to_ascii_lowercase()) {
+                if used(name, &spans[at + 1..], span.end) {
                     return true;
                 }
             }
             _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the code that comes next in `spans` from `from`, past spaces and
+/// comments, is `(`.
+fn called(bytes: &[u8], spans: &[wire::scan::Span], from: usize) -> bool {
+    for span in spans {
+        match span.kind {
+            wire::scan::Kind::Code => {
+                if let Some(&c) = bytes[from.max(span.start)..span.end].iter().find(|&&c| !wire::scan::is_space(c)) {
+                    return c == b'(';
+                }
+            }
+            wire::scan::Kind::LineComment | wire::scan::Kind::BlockComment => {}
+            _ => return false,
         }
     }
     false
@@ -4898,9 +4944,10 @@ fn brings_views(sql: &str) -> bool {
 fn attaches_sqlite(sql: &str) -> bool {
     let sqlite = |name: &[u8]| name == b"sqlite" || name == b"sqlite3";
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
-    let bytes = sql.as_bytes();
+    let plain = wire::scan::plain_spaces(sql.as_bytes());
+    let bytes = &*plain;
     let (mut path, mut after_type) = (true, false);
-    for span in wire::scan::scan(sql) {
+    for span in wire::scan::spans(bytes) {
         let text = &bytes[span.start..span.end];
         match span.kind {
             wire::scan::Kind::Code => {
@@ -5064,8 +5111,9 @@ enum Token {
 /// `made_name` reads comes after.
 fn names_in_order(sql: &str, tokens: &mut Vec<Token>) {
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
-    let bytes = sql.as_bytes();
-    for span in wire::scan::scan(sql) {
+    let plain = wire::scan::plain_spaces(sql.as_bytes());
+    let bytes = &*plain;
+    for span in wire::scan::spans(bytes) {
         let text = &bytes[span.start..span.end];
         match span.kind {
             wire::scan::Kind::Code => {
@@ -6071,9 +6119,27 @@ mod tests {
             "SELECT count(*) FROM query_table('v')",
             "FROM q",
             "EXECUTE p",
+            "SELECT * FROM query /* c */ ('SELECT 1')",
+            "SELECT * FROM \"Query\"\n-- c\n('SELECT 1')",
+            "SELECT * FROM main.query_table ( 'v' )",
+            "SELECT\u{a0}*\u{a0}FROM\u{a0}duckdb_tables()",
         ] {
             assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
         }
+        // A column, alias or table named query is a name like any other.
+        names.learn(b"cols", "CREATE VIEW cols AS SELECT query, query_table FROM log");
+        for sql in [
+            "SELECT sum(hash(i)) AS query FROM range(10) t(i)",
+            "SELECT query, \"query_table\" FROM log WHERE query = '('",
+            "SELECT * FROM query",
+            "SELECT query -- (\nFROM log",
+            "FROM cols",
+        ] {
+            assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
+        }
+        // A view named query reads the catalog as any view does.
+        names.learn(b"query", "CREATE VIEW query AS SELECT * FROM duckdb_tables()");
+        assert_eq!(gate_of("SELECT * FROM query", &names), Gate::Reads);
 
         let body = |name: &str| Some(Made::Body(name.as_bytes().to_vec()));
         assert_eq!(made_name("CREATE VIEW v AS SELECT 1"), body("v"));
