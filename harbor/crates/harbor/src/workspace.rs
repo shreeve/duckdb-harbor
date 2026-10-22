@@ -164,9 +164,8 @@ static SET_ASIDE: Mutex<Vec<SetAside>> = Mutex::new(Vec::new());
 static OURS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Held by a catalog read while it attaches a file set aside again, and
-/// for a moment by a client's `ATTACH` or `DETACH` of its name, as it is
-/// marked pending before it runs ([`pending`]) and as it is claimed once it
-/// ran ([`claimed`]), so one does not undo the other.
+/// for a moment by a client's `ATTACH` or `DETACH` of its name as it is
+/// claimed once it ran ([`claimed`]), so one does not undo the other.
 static TAKING: Mutex<()> = Mutex::new(());
 
 /// The names a client's `ATTACH` or `DETACH` names, from before it runs
@@ -188,10 +187,10 @@ pub fn taking() -> std::sync::MutexGuard<'static, ()> {
 
 /// A client's `ATTACH` or `DETACH` of `name` is about to run: until it is
 /// [`settled`], a file set aside under `name` is not attached again
-/// ([`is_pending`]). Waits only for a file set aside being attached again
-/// at this moment, so the statement runs after it.
+/// ([`is_pending`]). A file being attached again at this moment and the
+/// statement run one after the other, at the catalog gate, and whichever
+/// runs second finds what the first did.
 pub fn pending(name: &str) {
-    let _taking = taking();
     PENDING.lock().unwrap().push(name.to_string());
 }
 
@@ -204,9 +203,8 @@ pub fn is_pending(name: &str, _taking: &std::sync::MutexGuard<'static, ()>) -> b
 /// A client's `ATTACH` or `DETACH` of `name`, [`pending`], is over, and
 /// changed what `name` is when `ran`: then it is [`claimed`].
 pub fn settled(name: &str, ran: bool) {
-    let taking = taking();
     if ran {
-        claimed(name, &taking);
+        claimed(name, &taking());
     }
     let mut pending = PENDING.lock().unwrap();
     if let Some(at) = pending.iter().position(|n| n == name) {
