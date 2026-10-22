@@ -202,6 +202,7 @@ Facts that shape everything:
 cd harbor
 make harbor            # cargo build -p harbor --release → target/release/harbor
 make unit              # cargo test --release --workspace --all-features
+make lint              # cargo clippy over the workspace, every warning an error
 make test              # test/scripts/check.sh: unit plus the fourteen integration suites
 make test SUITES="regressions spec"      # a subset
 make fetch-duckdb      # DuckDB v2.0.0 and its CLI into ~/.duckdb/cli/2.0.0
@@ -219,13 +220,13 @@ oracle, curl in and NDJSON out), `sessions`, `cancel`, `catalog`, `lifecycle`,
 is missing, and runs the suites on the `duckdb` CLI that sits beside the
 engine (`HARBOR_LIBDUCKDB`'s directory, else `~/.duckdb/cli/2.0.0`), so the
 oracle and the engine are one build. CI's quick gate runs `lifecycle types
-spec catalog sessions cancel regressions`, with the unit tests as a job of
-their own beside it; `FullSuite.yml` runs all of them on every push to main
-and nightly at 23:41 UTC, and saves the build cache the pull requests
-restore. A pull request gets four checks: the quick gate, `unit tests`,
-`windows` (build, the listing's note, and a query over the URL form on
-`windows-2025`), and `ducktable check`, which compiles DuckTable against
-harbor's crates. A full local run is ten to twelve minutes; `justhttp`'s
+spec catalog sessions cancel regressions`, with `make lint` and the unit
+tests as a job of their own beside it; `FullSuite.yml` runs all of them on
+every push to main and nightly at 23:41 UTC, and saves the build cache the
+pull requests restore. A pull request gets four checks: the quick gate,
+`unit tests` (clippy, then the unit tests), `windows` (build, the
+listing's note, and a query over the URL form on `windows-2025`), and
+`ducktable check`, which compiles DuckTable against harbor's crates. A full local run is ten to twelve minutes; `justhttp`'s
 tests wait out real timeouts and take about 75 s of it.
 
 What bites locally:
@@ -570,11 +571,7 @@ and DuckTable 0.23.0 record.
   need glibc 2.39; the README and the release notes say so. Building on an
   older baseline would run on older distributions without changing harbor,
   and is deliberately not scheduled (#56).
-- **Left on purpose:** workflow actions pinned by tag, not commit; the
-  engine layer's types that can outlive what they point to (`Stream`,
-  `Chunk`, `Reader`, `Stmt`, `Json` hold raw handles with no borrow of
-  their owner), which is why `cargo clippy` fails on harbor. Giving them
-  lifetimes is a change of its own.
+- **Left on purpose:** workflow actions pinned by tag, not commit.
 - **Optional polish:** a distinct color for braces in the highlighter; the
   brace expander could take aliases inside a group if a syntax that does
   not collide with the struct-literal colon is chosen.
