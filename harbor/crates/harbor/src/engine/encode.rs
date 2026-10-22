@@ -170,27 +170,28 @@ pub fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Type) {
     }
     out.push_str(r#""duckdbType":"#);
     push_json_string(out, &ty.name);
+    out.push_str(if lossless(ty) { r#","lossless":true"# } else { r#","lossless":false"# });
 
     match ty.id {
         LOGICAL_TYPE_ID_DECIMAL => {
-            out.push_str(r#","lossless":true,"decimal":{"width":"#);
+            out.push_str(r#","decimal":{"width":"#);
             out.push_str(&ty.decimal.0.to_string());
             out.push_str(r#","scale":"#);
             out.push_str(&ty.decimal.1.to_string());
             out.push('}');
         }
         LOGICAL_TYPE_ID_LIST => {
-            out.push_str(r#","lossless":true,"child":"#);
+            out.push_str(r#","child":"#);
             emit_column_schema(out, None, &ty.children[0].1);
         }
         LOGICAL_TYPE_ID_ARRAY => {
-            out.push_str(r#","lossless":true,"arrayLength":"#);
+            out.push_str(r#","arrayLength":"#);
             out.push_str(&ty.array_len.to_string());
             out.push_str(r#","child":"#);
             emit_column_schema(out, None, &ty.children[0].1);
         }
         LOGICAL_TYPE_ID_STRUCT | LOGICAL_TYPE_ID_TUPLE => {
-            out.push_str(r#","lossless":true,"fields":["#);
+            out.push_str(r#","fields":["#);
             for (i, (n, child)) in ty.children.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
@@ -200,16 +201,14 @@ pub fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Type) {
             out.push(']');
         }
         LOGICAL_TYPE_ID_MAP => {
-            out.push_str(r#","lossless":true,"keyType":"#);
+            out.push_str(r#","keyType":"#);
             emit_column_schema(out, None, &ty.children[0].1);
             out.push_str(r#","valueType":"#);
             emit_column_schema(out, None, &ty.children[1].1);
             out.push_str(r#","encoding":"pairs""#);
         }
         LOGICAL_TYPE_ID_UNION => {
-            // The vector interface keeps the tag reachable inside
-            // containers too, so a union is lossless at any depth.
-            out.push_str(r#","lossless":true,"members":["#);
+            out.push_str(r#","members":["#);
             for (i, (n, child)) in ty.children.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
@@ -219,7 +218,7 @@ pub fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Type) {
             out.push(']');
         }
         LOGICAL_TYPE_ID_ENUM => {
-            out.push_str(r#","lossless":true,"values":["#);
+            out.push_str(r#","values":["#);
             for (i, value) in ty.enum_values.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
@@ -228,9 +227,9 @@ pub fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Type) {
             }
             out.push(']');
         }
-        id if is_lossless(id) => out.push_str(r#","lossless":true"#),
-        LOGICAL_TYPE_ID_VARIANT => out.push_str(r#","lossless":false,"encoding":"json""#),
-        _ => out.push_str(r#","lossless":false,"encoding":"varchar-cast""#),
+        id if is_lossless(id) => {}
+        LOGICAL_TYPE_ID_VARIANT => out.push_str(r#","encoding":"json""#),
+        _ => out.push_str(r#","encoding":"varchar-cast""#),
     }
     out.push('}');
 }
@@ -239,6 +238,25 @@ pub fn emit_column_schema(out: &mut String, name: Option<&str>, ty: &Type) {
 /// member of a list, struct, map or union at any depth.
 pub fn holds_variant(ty: &Type) -> bool {
     ty.id == ffi::LOGICAL_TYPE_ID_VARIANT || ty.children.iter().any(|(_, c)| holds_variant(c))
+}
+
+/// Whether every value of this type crosses exactly: a type harbor encodes
+/// itself, or a container whose members all do. A `GEOMETRY[]` loses what
+/// its child loses, so the list says so as well as the child. The vector
+/// interface keeps a union's tag reachable inside containers too, so a union
+/// is as lossless as its members, at any depth.
+fn lossless(ty: &Type) -> bool {
+    use ffi::*;
+    match ty.id {
+        LOGICAL_TYPE_ID_DECIMAL => true,
+        LOGICAL_TYPE_ID_LIST
+        | LOGICAL_TYPE_ID_ARRAY
+        | LOGICAL_TYPE_ID_STRUCT
+        | LOGICAL_TYPE_ID_TUPLE
+        | LOGICAL_TYPE_ID_MAP
+        | LOGICAL_TYPE_ID_UNION => ty.children.iter().all(|(_, c)| lossless(c)),
+        id => is_lossless(id),
+    }
 }
 
 fn is_lossless(id: ffi::LOGICAL_TYPE_ID) -> bool {

@@ -933,6 +933,34 @@ mod wire {
             "SELECT [union_value(a := 2)::UNION(a INTEGER, b VARCHAR)] AS lu",
             r#"{"name":"lu","duckdbType":"UNION(a INTEGER, b VARCHAR)[]","lossless":true,"child":{"duckdbType":"UNION(a INTEGER, b VARCHAR)","lossless":true,"members":[{"name":"a","duckdbType":"INTEGER","lossless":true},{"name":"b","duckdbType":"VARCHAR","lossless":true}]}}"#,
         );
+        // A container is lossless only when every member is: the flag on a
+        // column answers for the whole of it, and the nested entry that loses
+        // says so too.
+        schema(
+            eng,
+            "SELECT ['POINT(1 2)'::GEOMETRY] AS lg",
+            r#"{"name":"lg","duckdbType":"GEOMETRY[]","lossless":false,"child":{"duckdbType":"GEOMETRY","lossless":false,"encoding":"varchar-cast"}}"#,
+        );
+        schema(
+            eng,
+            "SELECT ['POINT(1 2)'::GEOMETRY]::GEOMETRY[1] AS ag",
+            r#"{"name":"ag","duckdbType":"GEOMETRY[1]","lossless":false,"arrayLength":1,"child":{"duckdbType":"GEOMETRY","lossless":false,"encoding":"varchar-cast"}}"#,
+        );
+        schema(
+            eng,
+            "SELECT {'n': 1, 'v': 1::VARIANT} AS sv",
+            r#"{"name":"sv","duckdbType":"STRUCT(n INTEGER, v VARIANT)","lossless":false,"fields":[{"name":"n","duckdbType":"INTEGER","lossless":true},{"name":"v","duckdbType":"VARIANT","lossless":false,"encoding":"json"}]}"#,
+        );
+        schema(
+            eng,
+            "SELECT MAP(['k'], [1::VARIANT]) AS mv",
+            r#"{"name":"mv","duckdbType":"MAP(VARCHAR, VARIANT)","lossless":false,"keyType":{"duckdbType":"VARCHAR","lossless":true},"valueType":{"duckdbType":"VARIANT","lossless":false,"encoding":"json"},"encoding":"pairs"}"#,
+        );
+        schema(
+            eng,
+            "SELECT [[get_type(1)]] AS lt",
+            r#"{"name":"lt","duckdbType":"TYPE[][]","lossless":false,"child":{"duckdbType":"TYPE[]","lossless":false,"child":{"duckdbType":"TYPE","lossless":false,"encoding":"varchar-cast"}}}"#,
+        );
         schema(eng, "SELECT NULL AS x", r#"{"name":"x","duckdbType":"\"NULL\"","lossless":true}"#);
         schema(eng, "SELECT TIME_NS '14:30:00' AS t", r#"{"name":"t","duckdbType":"TIME_NS","lossless":true}"#);
     }

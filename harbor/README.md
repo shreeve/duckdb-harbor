@@ -1199,11 +1199,12 @@ which a JavaScript `Date` reads and DuckDB reads back; a `Date` reads
 `-0043-03-15` as the year 2043. A year past 9999 is its bare digits
 (`10000-01-01`), as DuckDB writes it, since DuckDB refuses the `+010000` form.
 Where something genuinely cannot survive, the schema says so
-with `"lossless": false` instead of returning a plausible wrong answer. The
-flag sits on the type that loses: for a `VARIANT[]`, a `STRUCT(v VARIANT)` or a
-`MAP(VARCHAR, VARIANT)` that is the `child`, the field or the `valueType`, and
-the column's own entry still reads `"lossless": true`, so a client that wants
-the answer for a nested column reads the nested entries too.
+with `"lossless": false` instead of returning a plausible wrong answer. A
+list, array, struct, map or union is lossless only when every member is, so
+the column's own entry answers for the whole of it: a `GEOMETRY[]`, a
+`STRUCT(v VARIANT)` or a `MAP(VARCHAR, VARIANT)` reads `"lossless": false`,
+and so does the `child`, the field or the `valueType` that loses, which says
+why in its `encoding`.
 
 ## Where it fits
 
