@@ -842,10 +842,15 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
              opened, so a SET cannot reach it; use the `block-size` key instead"
         );
     }
+    #[cfg(unix)]
     let typed = rest.clone();
     let mut o = parse_opts(o, rest)?;
     o.ephemeral = ephemeral;
+    #[cfg(unix)]
     let background = background && !o.foreground;
+    // Windows has no detached start: a start serves in place.
+    #[cfg(windows)]
+    let _ = background;
     let home = ensure_runtime_dir()?;
 
     // Where this database answers, derived, never chosen: one file, one
@@ -855,10 +860,7 @@ fn start(db: PathBuf, rest: Vec<String>, ephemeral: bool, background: bool) -> R
     #[cfg(unix)]
     let sock_path = harbor_common::socket_for(&home, &canon)?;
     #[cfg(windows)]
-    let sock_path = {
-        let _ = &home; // created for its 0700 healing; TCP needs no socket
-        PathBuf::new()
-    };
+    let _ = &home; // created for its 0700 healing; TCP needs no socket
 
     // A friendlier answer than the lock error, when the answer is knowable:
     // something already serves this file. Advisory only — the database's own

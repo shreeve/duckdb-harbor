@@ -403,8 +403,8 @@ impl Drop for Server {
             self.close_doors();
         }
         // Then sweep every unix socket path off disk.
+        #[cfg(unix)]
         for addr in &self.listening_addrs {
-            #[cfg(unix)]
             if let ListenAddr::Unix(addr) = addr {
                 if let Some(path) = addr.as_pathname() {
                     let _ = std::fs::remove_file(path);

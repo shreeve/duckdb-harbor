@@ -200,7 +200,8 @@ pub fn note() -> Option<String> {
     })
 }
 
-#[cfg(test)]
+// Every case lays out a Homebrew tree of symlinks.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;
@@ -232,7 +233,6 @@ mod tests {
         (root, home, script.join(NAME), brew_bin.join(NAME))
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_homebrew_launcher_and_its_binary_are_one_copy() {
         let (root, home, script, brew) = machine("one");
@@ -249,7 +249,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_note_names_the_other_copy_how_to_remove_it_and_which_one_runs() {
         let (root, home, script, brew) = machine("note");

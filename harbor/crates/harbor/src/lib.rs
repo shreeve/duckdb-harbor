@@ -7624,6 +7624,8 @@ mod tests {
     fn the_tcp_door_is_one_ipv4_listener() {
         let doors = super::ipv4_loopback(0).unwrap();
         assert_eq!(doors.len(), 1);
+        // Without unix sockets a listener can only be a TCP one.
+        #[cfg_attr(not(unix), allow(irrefutable_let_patterns))]
         let justhttp::Listener::Tcp(listener) = &doors[0] else {
             panic!("the TCP door returned a unix listener");
         };

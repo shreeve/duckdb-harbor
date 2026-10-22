@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 // allocation-quiet apart from the code under test)
 fn new_one_server_one_client() -> (justhttp::Server, std::net::TcpStream) {
     let server = justhttp::Server::http("127.0.0.1:0").unwrap();
+    // Without unix sockets an address can only be an IP one.
+    #[cfg_attr(not(unix), allow(irrefutable_let_patterns))]
     let justhttp::ListenAddr::Ip(addr) = server.server_addr() else { unreachable!() };
     let client = std::net::TcpStream::connect(addr).unwrap();
     (server, client)
