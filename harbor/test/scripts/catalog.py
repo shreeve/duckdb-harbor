@@ -114,10 +114,10 @@ def free_port():
     return port
 
 
-def start_server(db, port):
+def start_server(db, port, workers=2):
     log = open(db + ".log", "w")
     proc = subprocess.Popen(
-        [*LAUNCHER, db, "start", "--port", str(port), "--workers", "2"],
+        [*LAUNCHER, db, "start", "--port", str(port), "--workers", str(workers)],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL,
     )
     base = f"http://127.0.0.1:{port}"
@@ -261,7 +261,8 @@ def main():
         stop_server(proc)
         log.close()
     busy = os.path.join(work, "busy.duckdb")
-    proc, base, log = start_server(busy, free_port())
+    # Four workers: a long statement, an ATTACH that waits on it, and one more.
+    proc, base, log = start_server(busy, free_port(), workers=4)
     try:
         if sqlite_ok:
             run_busy(base, work)
@@ -766,7 +767,8 @@ def run_unlisted(base, work, seconds=5):
     # listing of them, which a locked SQLite file fails after its wait.
     # Until a listing reads, every statement is kept apart from an ATTACH
     # or DETACH, the ATTACH does not hold the others for the lock's wait,
-    # and the listing is read again at a later ATTACH or DETACH: a view
+    # and the listing is read again at a later ATTACH or DETACH, beside the
+    # statements an ATTACH or DETACH waits for: a view
     # attached meanwhile that reads the catalog, raced against a SQLite
     # ATTACH/DETACH loop, does not bring the server down.
     import sqlite3
@@ -792,6 +794,32 @@ def run_unlisted(base, work, seconds=5):
         bad("and a catalog read after it does not wait out the lock", f"{took:.2f}s")
     locker.execute("ROLLBACK")
     locker.close()
+    # Not yet read again, every statement shares the gate, and a long one
+    # holds an ATTACH. The statements after the ATTACH do not wait for it:
+    # it asks for the views beside the long one, and they pass the gate by.
+    answers = {}
+
+    def timed(key, statement):
+        began = time.time()
+        answers[key] = (sql(base, statement), time.time() - began)
+
+    long = threading.Thread(target=timed, args=("long", "SELECT sum(hash(i)) FROM range(1000000000) t(i)"))
+    long.start()
+    time.sleep(0.5)
+    attach = threading.Thread(target=timed, args=("attach", "ATTACH ':memory:' AS busy_mem"))
+    attach.start()
+    time.sleep(0.3)
+    timed("after", "SELECT 42")
+    long.join(timeout=60)
+    attach.join(timeout=60)
+    refused, took = answers["after"]
+    if refused is None and took < 1:
+        ok("a statement after an ATTACH that waits on a long one does not wait", f"{took:.2f}s")
+    else:
+        bad("a statement after an ATTACH that waits on a long one does not wait", f"{took:.2f}s {refused}")
+    eq("and the ATTACH runs once the long one is over", (None, None),
+       (answers.get("attach", ("not answered",))[0], answers.get("long", ("not answered",))[0]))
+    sql(base, "DETACH IF EXISTS busy_mem")
     stop = threading.Event()
     counts, failures = [0, 0], []
 

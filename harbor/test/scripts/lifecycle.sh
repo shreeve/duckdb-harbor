@@ -977,6 +977,27 @@ lines=$(catalog_lines)
   || bad "the catalog of a replaced file: $lines"
 [[ $lines == *"view it_s_q1 reads"* ]] && ok "and the rest of the catalog reads" || bad "the catalog beside it: $lines"
 restore_sqlite
+# A catalog read that attaches it again, and a client's ATTACH pipelined
+# behind it on one connection: each is answered, neither waiting on the
+# other.
+out=$(python3 -c '
+import json, socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.settimeout(15)
+body = json.dumps({"sql": "ATTACH '"'"':memory:'"'"' AS piped"}).encode()
+s.sendall(b"GET /catalog HTTP/1.1\r\nHost: harbor\r\n\r\n"
+          + b"POST /sql HTTP/1.1\r\nHost: harbor\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+got = b""
+try:
+    while not (got.count(b"HTTP/1.1 200") == 2 and b"\"type\":\"end\"" in got and got.endswith(b"0\r\n\r\n")):
+        more = s.recv(65536)
+        if not more: break
+        got += more
+except socket.timeout:
+    pass
+print("answered", got.count(b"HTTP/1.1 200"))' "$(live_sock)" 2>&1)
+[[ $out == "answered 2" ]] && ok "a catalog read that attaches it again, and an ATTACH pipelined behind it, are both answered" \
+  || bad "a pipelined catalog read and ATTACH: $out"
+check "and the ATTACH ran" 0 "" "$harbor" "$work/workspace.duckdb" -c "DETACH piped"
 [[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is attached again once it reads" \
   || bad "after it is back: $(catalog_lines)"
 replace_sqlite
