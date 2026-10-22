@@ -978,8 +978,7 @@ lines=$(catalog_lines)
 [[ $lines == *"view it_s_q1 reads"* ]] && ok "and the rest of the catalog reads" || bad "the catalog beside it: $lines"
 restore_sqlite
 # A catalog read that attaches it again, and a client's ATTACH pipelined
-# behind it on one connection: each is answered, neither waiting on the
-# other.
+# behind it on one connection: each is answered, the ATTACH in its turn.
 out=$(python3 -c '
 import json, socket, sys, time
 s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.settimeout(15)

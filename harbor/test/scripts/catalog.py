@@ -792,6 +792,33 @@ def run_unlisted(base, work, seconds=5):
         ok("and a catalog read after it does not wait out the lock", f"{took:.2f}s")
     else:
         bad("and a catalog read after it does not wait out the lock", f"{took:.2f}s")
+    # An ATTACH and a long answer pipelined on one connection, while another
+    # statement holds the gate: the answer runs in its turn, after the
+    # ATTACH's is written, never beside it holding the gate the ATTACH waits
+    # for while its own answer waits behind the ATTACH's.
+    held = threading.Thread(target=sql, args=(base, "SELECT sum(hash(i)) FROM range(300000000) t(i)"))
+    held.start()
+    time.sleep(0.3)
+    piped = socket.create_connection(("127.0.0.1", int(base.rsplit(":", 1)[1])), timeout=30)
+
+    def post(statement, last=False):
+        body = json.dumps({"sql": statement}).encode()
+        close = b"Connection: close\r\n" if last else b""
+        return b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\n%sContent-Length: %d\r\n\r\n%s" % (close, len(body), body)
+
+    piped.sendall(post("ATTACH ':memory:' AS piped_mem")
+                  + post("SELECT i FROM range(200000) r(i)", last=True))
+    got = b""
+    try:
+        while chunk := piped.recv(65536):
+            got += chunk
+    except OSError:
+        pass
+    piped.close()
+    held.join(timeout=60)
+    eq("an ATTACH and a long answer pipelined behind it are both answered, whole",
+       (2, True), (got.count(b"HTTP/1.1 200"), b'"rowCount":200000' in got))
+    eq("and an ATTACH after them is answered", None, sql(base, "DETACH piped_mem"))
     locker.execute("ROLLBACK")
     locker.close()
     # Not yet read again, every statement shares the gate, and a long one
