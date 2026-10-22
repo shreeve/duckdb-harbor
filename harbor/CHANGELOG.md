@@ -79,6 +79,11 @@ Harbor releases, and are not included here.
   on, up to 120 s, while the server's process is alive. `harbor <db>
   autostart restart` rewrites an existing item and restarts it under the
   new priority.
+- **A client that stops reading a streamed answer frees its worker one
+  write timeout sooner.** After the 10 s write timeout ended a chunked
+  answer, its last chunk and terminator waited out another 10 s. They are
+  refused at once: measured, a 64 MiB answer to a reader that never reads
+  frees its thread in 25 s, where it took 35 s.
 - **Two changes DuckDB 2.0.0 made, for anyone coming from 0.46.0.** A
   VARIANT object reads back with its keys sorted, so `{"p":1,"a":2}` comes
   back `{"a":2,"p":1}`, the values unchanged. A bare table name is not a
