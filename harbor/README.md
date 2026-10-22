@@ -450,8 +450,11 @@ catalog is being read is left out; it never fails the read. An `ATTACH` or
 itself, the `duckdb_…` and `pragma_…` functions, `information_schema`, `SHOW`,
 `DESCRIBE` and the engine's completer — waiting for those running and holding
 back those that come after, since the engine brings itself down when a SQLite
-database is detached while a catalog read walks it. A view whose body reads the
-catalog is not seen as reading it.
+database is detached while a catalog read walks it. A view or macro whose body
+reads the catalog, itself or through another, reads it too: the server learns
+each one's body from the engine's catalog when it starts and after each
+`ATTACH`, and from each `CREATE VIEW`, `CREATE MACRO` and `ALTER VIEW … RENAME`
+before it runs.
 
 The document is stable — same database, same bytes — so clients can diff it.
 A client that only wants an inventory asks `GET /catalog?style=lite` and gets
