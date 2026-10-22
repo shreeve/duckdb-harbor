@@ -418,25 +418,39 @@ fn at_terminal() -> bool {
 
 /// The session manager starts a server asynchronously: block until it
 /// answers on its socket, or say why not with the log to read. The same
-/// budget a summon gives its child. A start that never comes up is taken
-/// back out of the manager, so a database that cannot open is not retried
-/// every ten seconds until logout; the item stays registered for the next
-/// login and the next `start`.
+/// budget a summon gives its child, extended while the manager's process
+/// is still alive, since a large database or a busy machine can take
+/// longer to open and a server still opening is not failing. A start that
+/// never comes up — its process gone, or still silent at the outer limit —
+/// is taken back out of the manager, so a database that cannot open is not
+/// retried every ten seconds until logout; the item stays registered for
+/// the next login and the next `start`.
 fn wait_serving(db: &Path, name: &str) -> Result<PathBuf, String> {
     #[cfg(unix)]
     {
         let (runtime, canon, sock) = harbor_common::paths::socket_of(db)?;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
+        let began = Instant::now();
+        let (budget, limit) = (Duration::from_secs(15), Duration::from_secs(120));
+        let mut told = false;
+        loop {
             if sock.exists() && harbor::repl::sock_ready(&sock) {
                 return Ok(sock);
+            }
+            let waited = began.elapsed();
+            if waited >= limit || (waited >= budget && !autostart::running(name)) {
+                break;
+            }
+            if waited >= budget && !told {
+                eprintln!("harbor: {name} is still opening…");
+                told = true;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         autostart::unload(name);
         Err(format!(
-            "{} did not come up in 15s — see {}; its login item is unloaded until the next login or `start`",
+            "{} did not come up in {}s — see {}; its login item is unloaded until the next login or `start`",
             canon.display(),
+            began.elapsed().as_secs(),
             harbor_common::paths::log_file(&runtime, name).display()
         ))
     }
