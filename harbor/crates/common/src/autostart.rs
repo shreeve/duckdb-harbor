@@ -303,6 +303,13 @@ fn loaded(name: &str) -> bool {
     launchctl(&["print", &format!("{}/{}", domain(), label(name))])
 }
 
+/// Whether the manager has a process running for the job: one that is
+/// opening its database, or serving it.
+#[cfg(target_os = "macos")]
+pub fn running(name: &str) -> bool {
+    loaded_pid(name).is_some()
+}
+
 /// The pid of the job's process, while launchd has one running.
 #[cfg(target_os = "macos")]
 fn loaded_pid(name: &str) -> Option<u32> {
@@ -355,7 +362,7 @@ fn item_body(name: &str, exe: &str, db: &str, log: &str, env: &[(String, String)
          \t<key>ThrottleInterval</key>\n\t<integer>10</integer>\n\
          \t<key>StandardOutPath</key>\n\t<string>{log}</string>\n\
          \t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n\
-         \t<key>ProcessType</key>\n\t<string>Background</string>\n\
+         \t<key>ProcessType</key>\n\t<string>Standard</string>\n\
          </dict>\n\
          </plist>\n",
         label = xml(&label(name)),
@@ -439,6 +446,13 @@ pub fn install(db: &Path, name: &str, serving: bool) -> Result<Installed, String
     }
     systemctl(&["start", &unit(name)])?;
     Ok(Installed::Started)
+}
+
+/// Whether systemd has a process running for the unit: one that is opening
+/// its database, or serving it.
+#[cfg(target_os = "linux")]
+pub fn running(name: &str) -> bool {
+    systemctl(&["is-active", "--quiet", &unit(name)]).is_ok()
 }
 
 /// Stop the unit's server, if systemd is running one. Registration stays.
@@ -597,6 +611,11 @@ pub fn install(_db: &Path, _name: &str, _serving: bool) -> Result<Installed, Str
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn running(_name: &str) -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn unload(_name: &str) {}
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -638,6 +657,17 @@ mod tests {
         assert!(body.contains("<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>"));
         assert!(body.contains("<key>ThrottleInterval</key>\n\t<integer>10</integer>"));
         assert!(!body.contains("<key>KeepAlive</key>\n\t<true/>"), "a clean stop must stay stopped");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plist_runs_at_standard_priority() {
+        // A Background job is throttled for CPU and disk: on a busy Mac its
+        // server took seconds longer to open than the same start from a
+        // shell, past the wait for it to come up.
+        let body = item_body("my-db", "/opt/harbor", "/data/my-db.duckdb", "/tmp/log/my-db.log", &[]);
+        assert!(body.contains("<key>ProcessType</key>\n\t<string>Standard</string>"));
+        assert!(!body.contains("Background"));
     }
 
     #[cfg(target_os = "macos")]

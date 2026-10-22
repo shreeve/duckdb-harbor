@@ -359,18 +359,36 @@ select id, raw_request.requisitionNumber, raw_request.visitDate,
   from orders where raw_request.patient.lastName ilike 'morel';
 ```
 
-Items are separated by commas. Whitespace alone separates them too, so the
-comma is never required, only clearer. A group nests. It can sit
+Items are separated by commas. Whitespace or a comment alone separates them
+too, so the comma is never required, only clearer; a comment between items
+goes with the separator and is not in the expansion. A group nests. It can sit
 anywhere in a term — `orders_{2025,2026}`, `{first,last}Name`,
-`r.{a,b}::VARCHAR` — and two groups in one term multiply, as in a shell:
+`r.{a,b}::VARCHAR` — where a term ends at whitespace, a comment, a comma, a
+parenthesis or a semicolon, whitespace being whatever the engine takes for it,
+the vertical tab and the Unicode spaces it strips among it. A cast's type
+parameters written right after its type name stay in the term, so
+`r.{a,b}::DECIMAL(10,2)` casts both. A type the engine reads on past a space
+or comment, parameters or array bounds after one (`::DECIMAL (10,2)`,
+`::INT []`) or a type of several words (`::TIMESTAMP WITH TIME ZONE`,
+`::DOUBLE PRECISION`), would reach only the last alternative, so the
+statement is refused with a `400` that gives the one-word spelling where there
+is one, or says to cast each alternative on its own. `CAST(r.{a,b} AS …)` puts
+both inside the one `CAST`, which the engine refuses. Two groups in one term
+multiply, as in a shell:
 `r.{a,b}.{x,y}` is four paths. The alternatives are joined with `, `, which is
 what a select list, a `FROM` list and an argument list all take.
 
 A struct literal is DuckDB's own use of braces, and it always carries a lone
 `:` at its top level — never the `::` of a cast — so `{'a': 1}` is left as it
 came, and so is an empty `{}`. Strings, quoted identifiers, dollar quotes and
-comments are never touched. A brace that never closes leaves the statement as
-it came, and the engine reports the syntax error at it.
+comments are never touched: the statement is read once, as the engine reads
+it, and only a group in code expands. An expansion the engine would read
+another way than the statement it came from, as when a quote its parser
+misreads is repeated or an `E` comes to begin the word before a string and
+make it take backslash escapes, is refused with a `400` that says what to
+write instead: most often a space between the group and the quote, or a plain
+space for a Unicode one. A brace that never closes leaves the statement as it
+came; the engine then reports the syntax error at it.
 
 The expansion happens in the server, once, for every client: the REPL,
 `curl`, a Rip app. `EXPLAIN` and the engine's error messages show the
@@ -436,22 +454,41 @@ another engine's carry `rowCount: null`, since a count there reads every row.
 On the workspace, a file it records as attached and could not attach at its
 start, or whose catalog did not read once attached, is listed too, holding
 nothing, with why in `error` (`"/data/app.sqlite: no such file"`); `error` is
-`null` for a database that is attached. An attached SQLite file whose catalog
-does not read — not SQLite after all, or held locked by another program —
-fails the whole read with a `400` that names it and says why, since the
-engine reads every attached database's catalog together and lists none while
-one does not; it reads again once that file does, or once it is detached. A
-SQLite file harbor attaches waits a second on a lock (`BUSY_TIMEOUT 1000`;
-the engine's own default is five), so a locked one fails a read in about a
-second rather than holding it.
+`null` for a database that is attached. The engine reads every attached
+database's catalog together and lists none while one does not, so an attached
+SQLite file whose catalog does not read fails every listing, on any server.
+One that does not read for good — not SQLite after all, replaced by a file
+that is not, or a read-only one deleted — is detached by the read that finds
+it and listed the same way, holding nothing, with the engine's reason in
+`error`, while the rest of the catalog lists. The first read after it reads
+attaches it again under its name when the workspace attached it from its
+record; one a client attached is left for the client to attach again, and a
+client's `DETACH` of its name forgets it. The workspace records either as
+attached. One that is only busy — held locked by a long write, harbor's own or
+another program's — stays attached, since detaching it would take it from
+every connection using it: the read answers with the catalog the server last
+read, the busy file's entry saying why in `error`, and a `stale` field at the
+document's end saying that every database in it may be stale (a document read
+anew has no `stale`), or, when the server has read none yet, a `400` that names
+the file.
+The read that meets a lock waits out the file's own wait on it, and a read
+while it stays busy asks the file alone, waiting a tenth of a second. A SQLite
+file harbor attaches waits a second on a lock (`BUSY_TIMEOUT 1000`; the
+engine's own default is five).
 A table or view another client drops, or a database it detaches, while the
 catalog is being read is left out; it never fails the read. An `ATTACH` or
 `DETACH` runs alone against every statement that reads the catalog — `/catalog`
 itself, the `duckdb_…` and `pragma_…` functions, `information_schema`, `SHOW`,
-`DESCRIBE` and the engine's completer — waiting for those running and holding
-back those that come after, since the engine brings itself down when a SQLite
-database is detached while a catalog read walks it. A view whose body reads the
-catalog is not seen as reading it.
+`DESCRIBE`, the engine's completer, and `query` and `query_table`, which run a
+statement or read a table named in a string — waiting for those running and
+holding back those that come after, since the engine brings itself down when a
+SQLite database is detached while a catalog read walks it. A view, macro or
+prepared statement whose body reads the catalog, itself or through another,
+reads it too: the server learns each one's body from the engine's catalog when
+it starts and after each `ATTACH`, `IMPORT DATABASE` and `COPY FROM DATABASE`,
+from each `CREATE VIEW`, `CREATE MACRO`, `PREPARE` and `ALTER VIEW … RENAME`
+before it runs, and from the `schema.sql` an `IMPORT DATABASE` runs, before it
+runs.
 
 The document is stable — same database, same bytes — so clients can diff it.
 A client that only wants an inventory asks `GET /catalog?style=lite` and gets
@@ -618,7 +655,11 @@ whichever client summoned it: it loads `spatial` when a view calls an `ST_`
 function, since `spatial` does not load on demand (`excel`, `json`, `parquet`
 and `sqlite` do), and installs it in the background when it is not installed,
 never between the database and the socket, since an install is a download (the
-views that need it say why they do not read until it loads); and it attaches
+views that need it say why they do not read until it loads). The SQLite files
+it records attach through `sqlite`, which the engine installs on demand, so
+when `sqlite` is not installed it is installed in the background too, and those
+files are attached there once it loads, each listed in `/catalog` with why
+until then; and it attaches
 again each database file the workspace records. The record is the table
 `_harbor.attached` (`name`, `path`, `type`, `read_only`) in the workspace
 itself: `harbor <SQLite file>` writes its row, and the server rewrites it from
@@ -1199,11 +1240,12 @@ which a JavaScript `Date` reads and DuckDB reads back; a `Date` reads
 `-0043-03-15` as the year 2043. A year past 9999 is its bare digits
 (`10000-01-01`), as DuckDB writes it, since DuckDB refuses the `+010000` form.
 Where something genuinely cannot survive, the schema says so
-with `"lossless": false` instead of returning a plausible wrong answer. The
-flag sits on the type that loses: for a `VARIANT[]`, a `STRUCT(v VARIANT)` or a
-`MAP(VARCHAR, VARIANT)` that is the `child`, the field or the `valueType`, and
-the column's own entry still reads `"lossless": true`, so a client that wants
-the answer for a nested column reads the nested entries too.
+with `"lossless": false` instead of returning a plausible wrong answer. A
+list, array, struct, map or union is lossless only when every member is, so
+the column's own entry answers for the whole of it: a `GEOMETRY[]`, a
+`STRUCT(v VARIANT)` or a `MAP(VARCHAR, VARIANT)` reads `"lossless": false`,
+and so does the `child`, the field or the `valueType` that loses, which says
+why in its `encoding`.
 
 ## Where it fits
 

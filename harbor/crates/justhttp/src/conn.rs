@@ -345,6 +345,22 @@ impl ClientConnection {
             (method, path, version, headers, content_length)
         };
 
+        // A request is handed out only once the response before it on this
+        // connection is written. Pipelined requests are still read off the
+        // wire, but each runs in its turn: one running beside the request
+        // ahead of it would hold what it took, a lock or a worker, while its
+        // response waited behind that request's, and the request ahead could
+        // be waiting on what it took.
+        self.sink.wait_answered();
+        // A response that failed to write ended the connection, and nothing
+        // after it is answered, so nothing after it runs.
+        if self.socket.ended() {
+            return Err(ReadError::ReadIoError(IoError::new(
+                ErrorKind::ConnectionAborted,
+                "the response before this request was cut",
+            )));
+        }
+
         // building the writer for the request
         let writer = self.sink.next().unwrap();
 
@@ -703,6 +719,14 @@ mod sequential {
                     self.next_trigger = None;
                     true
                 }
+            }
+        }
+
+        /// Waits until every writer handed out has finished.
+        pub fn wait_answered(&mut self) {
+            if let Some(last) = self.next_trigger.take() {
+                // Its writer says when it is dropped, and is gone after.
+                let _ = last.recv();
             }
         }
 

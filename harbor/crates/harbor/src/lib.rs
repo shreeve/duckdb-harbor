@@ -264,6 +264,21 @@ struct SlotRun {
     /// is a message, not an interface, and a client should not learn why its
     /// query stopped from prose that may be reworded upstream.
     cancelled: bool,
+    /// The statement is in the engine, which runs it to its end before it
+    /// hands back a chunk (`Conn::execute`'s retained statement), and its
+    /// first fetch has not come back. An interrupt that reaches it in this
+    /// stretch may stop it or may come too late, with the statement done
+    /// and, in autocommit, committed, and only that fetch says which. A
+    /// canceller who fires in it waits for the fetch, so a cancel is
+    /// answered true only when the statement was stopped and nothing of it
+    /// was kept.
+    retained: bool,
+    /// A retained statement's first fetch came back: what it did is done,
+    /// and a cancel from here stops nothing.
+    kept: bool,
+    /// Where a canceller waiting on a retained statement is told whether it
+    /// stopped: true when it ended cancelled, false when it was kept.
+    told: Option<Arc<OnceLock<bool>>>,
     /// When this statement must stop, if anything asked for a limit.
     deadline: Option<Instant>,
     /// While this worker handles an HTTP request with no statement of its
@@ -295,7 +310,18 @@ enum Cancel {
 
 impl SlotRun {
     fn idle() -> Self {
-        SlotRun { job: 0, last: 0, started: Instant::now(), pending: None, cancelled: false, deadline: None, wedged_at: None }
+        SlotRun {
+            job: 0,
+            last: 0,
+            started: Instant::now(),
+            pending: None,
+            cancelled: false,
+            retained: false,
+            kept: false,
+            told: None,
+            deadline: None,
+            wedged_at: None,
+        }
     }
 
     /// Claim this slot for `job`. Returns true when the statement was already
@@ -305,6 +331,8 @@ impl SlotRun {
         self.last = job;
         self.started = Instant::now();
         self.deadline = deadline;
+        self.retained = false;
+        self.kept = false;
         // Any held cancel is consumed here whether or not it matches: it named
         // a statement that is now either this one or one that will never start,
         // and either way it has had its say.
@@ -315,7 +343,42 @@ impl SlotRun {
     fn end(&mut self) -> bool {
         self.job = 0;
         self.deadline = None;
-        std::mem::replace(&mut self.cancelled, false)
+        self.retained = false;
+        self.kept = false;
+        let cancelled = std::mem::replace(&mut self.cancelled, false);
+        // A retained statement that ends before its first fetch came back
+        // ends cancelled, as a 499, only when a canceller reached it.
+        self.tell(cancelled);
+        cancelled
+    }
+
+    /// The statement is submitted and about to run. False when a canceller
+    /// has reached it already, and it must not run.
+    fn submitted(&mut self, retained: bool) -> bool {
+        if self.cancelled {
+            return false;
+        }
+        self.retained = retained && self.job != 0;
+        true
+    }
+
+    /// A retained statement's first fetch came back: it ran to its end. A
+    /// cancel that fired at it came too late and stopped nothing, so it is
+    /// cleared, and the statement is answered as what it did.
+    fn keep(&mut self) {
+        if !self.retained {
+            return;
+        }
+        self.retained = false;
+        self.kept = true;
+        self.cancelled = false;
+        self.tell(false);
+    }
+
+    fn tell(&mut self, stopped: bool) {
+        if let Some(told) = self.told.take() {
+            let _ = told.set(stopped);
+        }
     }
 
     fn arm(&mut self, job: Option<u64>) -> Cancel {
@@ -329,7 +392,7 @@ impl SlotRun {
                 self.pending = Some(want);
                 Cancel::Held
             }
-            _ if self.job == 0 => Cancel::Nothing,
+            _ if self.job == 0 || self.kept => Cancel::Nothing,
             _ => {
                 self.cancelled = true;
                 Cancel::Fire
@@ -356,7 +419,31 @@ impl SlotState {
     /// window described above: once this returns, no interrupt aimed at this
     /// job can still be in flight.
     fn end(&self) -> bool {
-        self.run.lock().unwrap().end()
+        let mut run = self.run.lock().unwrap();
+        let asked = run.told.is_some();
+        let cancelled = run.end();
+        drop(run);
+        if asked {
+            Asked::said();
+        }
+        cancelled
+    }
+
+    /// Mark the statement submitted, unless a canceller has reached it; see
+    /// `SlotRun::submitted`.
+    fn submitted(&self, retained: bool) -> bool {
+        self.run.lock().unwrap().submitted(retained)
+    }
+
+    /// A retained statement's first fetch came back; see `SlotRun::keep`.
+    fn keep(&self) {
+        let mut run = self.run.lock().unwrap();
+        let asked = run.told.is_some();
+        run.keep();
+        drop(run);
+        if asked {
+            Asked::said();
+        }
     }
 
     /// Whether a canceller has reached the statement now running.
@@ -365,10 +452,45 @@ impl SlotState {
     }
 
     /// Interrupt the running statement if it is still `job` — or whatever is
-    /// running, when `job` is None. Returns whether it stopped, or will stop,
-    /// a statement.
+    /// running, when `job` is None. Returns whether it fired, or held the
+    /// cancel for a statement yet to begin: what the reapers, deadlines and
+    /// departures that call it need, none of which waits on the answer.
     fn cancel(&self, job: Option<u64>) -> bool {
         let mut run = self.run.lock().unwrap();
+        self.fire(&mut run, job)
+    }
+
+    /// Cancel `job` and say whether that stopped it, which is what a client
+    /// that asked is told. Fired at a statement harbor stops itself, the
+    /// answer is known at once: one that has not begun never runs, and one
+    /// that has is answered 499 at its next step or at its end. Fired at a
+    /// retained statement in the engine, it is the engine's, and is told at
+    /// the statement's first fetch: an INSERT the interrupt did not reach in
+    /// time has run, in autocommit committed, and the cancel stopped
+    /// nothing. That is as long as the engine takes to notice the interrupt
+    /// or to finish, and the statement's executor waits on nothing but the
+    /// engine meanwhile.
+    fn cancel_and_tell(&self, job: u64) -> Said {
+        let mut run = self.run.lock().unwrap();
+        if !self.fire(&mut run, Some(job)) {
+            return Said::Now(false);
+        }
+        if !(run.job == job && run.retained) {
+            return Said::Now(true);
+        }
+        Said::Later(Arc::clone(run.told.get_or_insert_with(Default::default)))
+    }
+
+    /// `cancel_and_tell`, waited for on this thread.
+    #[cfg(test)]
+    fn cancel_and_say(&self, job: u64) -> bool {
+        match self.cancel_and_tell(job) {
+            Said::Now(stopped) => stopped,
+            Said::Later(told) => Asked::wait(&told),
+        }
+    }
+
+    fn fire(&self, run: &mut SlotRun, job: Option<u64>) -> bool {
         match run.arm(job) {
             Cancel::Nothing => false,
             Cancel::Held => true,
@@ -406,11 +528,105 @@ impl SlotState {
         run.expired(now).then_some(run.job)
     }
 
+    /// The running job's id if a canceller has reached it, else None.
+    fn unheeded_job(&self) -> Option<u64> {
+        let run = self.run.lock().unwrap();
+        (run.job != 0 && run.cancelled).then_some(run.job)
+    }
+
     /// The job running right now (0 = idle). A snapshot for reapers that must
     /// name their target instead of firing at "whatever is running".
     fn current_job(&self) -> u64 {
         self.run.lock().unwrap().job
     }
+}
+
+/// Whether a cancel stopped its statement: known when it fired, or told at
+/// a retained statement's first fetch (`SlotRun::told`).
+enum Said {
+    Now(bool),
+    Later(Arc<OnceLock<bool>>),
+}
+
+/// A `DELETE /sql/queries/<id>` waiting to be told whether its cancel
+/// stopped a retained statement. One thread answers them all
+/// (`answer_cancels`), so a wait holds neither a worker nor the probe lane,
+/// which answers `/ready`, renewals, releases and other cancels: the wait is
+/// the engine's longest stretch without an interrupt check, a commit that
+/// checkpoints or a `CHECKPOINT`, and the lane must not stand behind it.
+struct Asked {
+    told: Arc<OnceLock<bool>>,
+    req: Request,
+    line: Option<LogLine>,
+}
+
+/// The cancels waiting to be told, and the signal a statement gives when it
+/// tells one: at its first fetch (`SlotState::keep`) or its end.
+static ASKED: (Mutex<Vec<Asked>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+
+impl Asked {
+    /// A statement told its canceller. Signalled under the lock the waiters
+    /// check under, so none checks before the telling and sleeps after it.
+    fn said() {
+        let _asked = ASKED.0.lock().unwrap();
+        ASKED.1.notify_all();
+    }
+
+    /// Wait on this thread until `told` is.
+    fn wait(told: &OnceLock<bool>) -> bool {
+        let (asked, said) = &ASKED;
+        let _asked = said.wait_while(asked.lock().unwrap(), |_| told.get().is_none()).unwrap();
+        *told.get().unwrap()
+    }
+}
+
+/// Answer the cancels in ASKED as their statements tell them, for the life
+/// of the process. A statement harbor abandoned at a stop never tells, and
+/// its cancel is left unanswered, as its statement is. A cancel is handed
+/// out only once the response before it on its connection is written, so
+/// its answer waits on no statement.
+fn answer_cancels() {
+    let (asked, said) = &ASKED;
+    loop {
+        let mut waiting = said
+            .wait_while(asked.lock().unwrap(), |w| !w.iter().any(|a| a.told.get().is_some()))
+            .unwrap();
+        let (told, rest): (Vec<Asked>, Vec<Asked>) =
+            std::mem::take(&mut *waiting).into_iter().partition(|a| a.told.get().is_some());
+        *waiting = rest;
+        drop(waiting);
+        for Asked { told, req, line } in told {
+            let status = answer_cancel(req, *told.get().unwrap()).1;
+            if let Some(line) = line {
+                line.write(status);
+            }
+        }
+    }
+}
+
+/// Answer `req`, a cancel that must wait for its statement's first fetch,
+/// from `answer_cancels`, or on this thread when that cannot start.
+fn await_cancel(req: Request, told: Arc<OnceLock<bool>>, line: Option<LogLine>) -> bool {
+    static ANSWERING: OnceLock<bool> = OnceLock::new();
+    let answering = *ANSWERING.get_or_init(|| {
+        thread::Builder::new().name("harbor-cancel".to_string()).spawn(answer_cancels).is_ok()
+    });
+    if answering {
+        ASKED.0.lock().unwrap().push(Asked { told, req, line });
+        ASKED.1.notify_all();
+        return true;
+    }
+    let status = answer_cancel(req, Asked::wait(&told)).1;
+    if let Some(line) = line {
+        line.write(status);
+    }
+    true
+}
+
+fn answer_cancel(req: Request, cancelled: bool) -> (bool, u16) {
+    let body = serde_json::to_string(&wire::CancelledResponse { cancelled }).unwrap();
+    let _ = req.respond(json_response(200, &body));
+    (true, 200)
 }
 
 /// Every executor's slot, worker and lease alike, for the life of the server.
@@ -495,21 +711,30 @@ impl Drop for Cancellable {
 
 /// Cancel by the id the client chose. The slot and job are looked up together,
 /// so a `queryId` reused after its statement finished cancels nothing.
-fn cancel_query(id: &str) -> bool {
+fn cancel_query(id: &str) -> Said {
     let target = {
         let guard = QUERIES.lock().unwrap();
         guard.as_ref().and_then(|q| q.get(id).map(|(s, j)| (Arc::clone(s), *j)))
     };
     match target {
-        Some((slot, job)) => slot.cancel(Some(job)),
-        None => false,
+        Some((slot, job)) => slot.cancel_and_tell(job),
+        None => Said::Now(false),
     }
 }
 
-/// Stop any statement that has outlived its deadline. Runs on the reaper's
+/// Stop any statement that has outlived its deadline, and interrupt again
+/// any a canceller has reached that is still running. Runs on the reaper's
 /// tick, so the granularity of a timeout is the reap interval — which is the
 /// right trade for a limit measured in seconds and enforced by a thread that
 /// would otherwise be asleep.
+///
+/// The engine can lose an interrupt: one that lands a moment after a
+/// statement is submitted was measured to leave it running as if nobody had
+/// asked, a scan over a document param to its deadline, with its cancel
+/// answered true. A retained statement's canceller would wait on it all
+/// that time. So a cancel is fired again each tick for as long as its
+/// statement runs, which is harmless: it is aimed by id, and the engine
+/// clears a stray one as the next statement starts.
 fn cancel_expired() {
     let slots: Vec<Arc<SlotState>> = SLOTS.lock().unwrap().clone();
     let now = Instant::now();
@@ -518,7 +743,7 @@ fn cancel_expired() {
         // firing, the expired statement can finish and a fresh one begin, and
         // a cancel(None) would kill that innocent — the exact race the job-id
         // machinery exists to close (see SlotRun). A stale id finds nothing.
-        if let Some(job) = slot.expired_job(now) {
+        if let Some(job) = slot.expired_job(now).or_else(|| slot.unheeded_job()) {
             slot.cancel(Some(job));
         }
     }
@@ -1055,6 +1280,11 @@ pub fn open_pool(mut con: Connection) -> Result<(), String> {
     }
 
     lock_operator_settings(&mut con)?;
+    // What --init and the workspace attached are in place, and attaching in
+    // the background may still be under way. A SQLite file locked at the
+    // start leaves the names to a later chance, not the start to its wait.
+    *LEARNER.lock().unwrap_or_else(PoisonError::into_inner) = Some((con.try_clone().map_err(|e| format!("harbor: {e}"))?, None));
+    learn_again(changing_catalog());
 
     for _ in 0..configured_pool_size() {
         pool.push(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
@@ -1318,6 +1548,43 @@ pub fn stop() -> Result<String, String> {
     stop_with(RUNNING.lock().unwrap())
 }
 
+/// Wait up to `patience` for `executors` to finish, putting the connections
+/// they hand back in `pool`, and return those still running. The reaper
+/// is gone by now, so its work is done here: a cancel the engine lost is
+/// fired again each tick at a statement still running, as `cancel_expired`
+/// does, or the stop would wait that statement out.
+fn drain(
+    executors: Vec<thread::JoinHandle<Option<Connection>>>,
+    slots: &[Arc<SlotState>],
+    pool: &mut Vec<Connection>,
+    patience: Duration,
+) -> Vec<thread::JoinHandle<Option<Connection>>> {
+    let started = Instant::now();
+    let mut fired = started;
+    let mut pending = executors;
+    loop {
+        let (done, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|h| h.is_finished());
+        for h in done {
+            if let Ok(Some(conn)) = h.join() {
+                pool.push(conn);
+            }
+        }
+        pending = rest;
+        if pending.is_empty() || started.elapsed() >= patience {
+            return pending;
+        }
+        if fired.elapsed() >= REAP_INTERVAL {
+            fired = Instant::now();
+            for slot in slots {
+                if let Some(job) = slot.unheeded_job() {
+                    slot.cancel(Some(job));
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Stop the server only if no client has connected since `accepted` had been
 /// accepted and none is connected now: a refcounted server's departure. The
 /// last look and the start of the stop are one step under the server's lock,
@@ -1389,7 +1656,6 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     for slot in &slots {
         slot.cancel(None);
     }
-    drop(slots);
     // Nothing can be cancelled by name once the registry is gone, and an id
     // left behind would outlive the server that could act on it.
     *QUERIES.lock().unwrap() = None;
@@ -1407,23 +1673,10 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     // the CHECKPOINT this drain exists to reach. After the deadline the
     // straggler is abandoned exactly as a panicked worker would be: its
     // connection is forfeited, and the checkpoint below runs regardless.
-    let deadline = Instant::now() + Duration::from_secs(10);
     let mut pool = POOL.lock().unwrap();
-    let mut pending: Vec<thread::JoinHandle<Option<Connection>>> =
-        r.workers.into_iter().chain(r.leases).collect();
-    loop {
-        let (done, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|h| h.is_finished());
-        for h in done {
-            if let Ok(Some(conn)) = h.join() {
-                pool.push(conn);
-            }
-        }
-        pending = rest;
-        if pending.is_empty() || Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    let pending = drain(r.workers.into_iter().chain(r.leases).collect(), &slots, &mut pool,
+        Duration::from_secs(10));
+    drop(slots);
     if !pending.is_empty() {
         eprintln!(
             "harbor: {} executor(s) still writing to stalled clients; abandoning them to checkpoint",
@@ -1859,12 +2112,14 @@ fn handle(req: Request, exec: Option<Executor>, log: bool) -> bool {
             // deliberately unexciting: cancelling something that already
             // finished is `false`, not an error, because by the time a Stop
             // button is pressed the query it refers to may well be over —
-            // its rows may still be on their way, and they all arrive.
+            // its rows may still be on their way, and they all arrive. One
+            // that must wait for the engine's word is answered off this
+            // thread (`Asked`).
             (Method::Delete, p) if p.starts_with("/sql/queries/") => {
-                let cancelled = cancel_query(&percent_decoded(&p["/sql/queries/".len()..]));
-                let body = serde_json::to_string(&wire::CancelledResponse { cancelled }).unwrap();
-                let _ = req.respond(json_response(200, &body));
-                (true, 200)
+                match cancel_query(&percent_decoded(&p["/sql/queries/".len()..])) {
+                    Said::Now(cancelled) => answer_cancel(req, cancelled),
+                    Said::Later(told) => return await_cancel(req, told, line),
+                }
             }
             // What is holding a connection, and for how long. The question an
             // operator asks when everything is suddenly waiting, and the reason
@@ -2411,6 +2666,9 @@ struct Job {
     /// Body bytes, in envelope-line batches. Bounded, so a slow client
     /// applies backpressure to the query instead of buffering the result.
     body: mpsc::SyncSender<Vec<u8>>,
+    /// A client's `ATTACH` or `DETACH` of a name: told, once the statement
+    /// is over, whether it changed what that name is (`Claiming`).
+    claims: Option<mpsc::SyncSender<bool>>,
 }
 
 impl Job {
@@ -2424,7 +2682,7 @@ impl Job {
         let (ready, ready_rx) = mpsc::sync_channel(1);
         let (body, body_rx) = mpsc::sync_channel(BODY_QUEUE);
         let deadline = timeout.map(|t| Instant::now() + t);
-        let job = Job { sql, params, shape, id: next_job_id(), deadline, reset: false, ready, body };
+        let job = Job { sql, params, shape, id: next_job_id(), deadline, reset: false, ready, body, claims: None };
         (job, ready_rx, body_rx)
     }
 }
@@ -2578,6 +2836,9 @@ fn sessions_report() -> String {
 enum CatalogFailure {
     Refused(Refusal),
     Gone,
+    /// A listing met attached SQLite databases whose catalogs do not read
+    /// for the moment (`catalog_listing`).
+    Busy(Vec<Busy>),
 }
 
 /// Run one catalog query on this worker's own executor — the same connection
@@ -2638,7 +2899,22 @@ fn catalog_refuse(req: Request, failure: CatalogFailure) -> (bool, u16) {
             let _ = req.respond(error_response(503, code::UNAVAILABLE, "harbor is shutting down"));
             (false, 503)
         }
+        CatalogFailure::Busy(busy) => {
+            let named: Vec<String> = busy.iter().map(|b| format!("{} ({}): {}", b.name, b.path, b.why)).collect();
+            catalog_refuse(req, CatalogFailure::Refused(not_reading(&named)))
+        }
     }
+}
+
+/// The refusal of a listing that does not read while the attached
+/// databases `named`, each with why, do not.
+fn not_reading(named: &[String]) -> Refusal {
+    Refusal::sql(format!(
+        "the catalog does not read while an attached database's does not, since the engine reads \
+         every attached database's catalog together: {}. It reads again once that one does, or \
+         once it is detached",
+        named.join("; ")
+    ))
 }
 
 // One cell out of a catalog row, by position. The queries below name their
@@ -2913,78 +3189,491 @@ struct CatalogDatabase {
     storage: String,
     read_only: bool,
     served: bool,
+    /// Detached by this read, its catalog not reading (`catalog_listing`).
+    aside: bool,
 }
 
-/// What the workspace recorded and could not attach when it started, each
-/// still in its record and not attached since: listed among the attached
-/// databases with its reason. Nothing, and no query, on any other server.
+/// The names the workspace's record holds, read on the served database;
+/// None on any other server, and none when the record was dropped.
+fn recorded_names(
+    exec: Executor,
+    peer: &justhttp::Peer,
+    databases: &[CatalogDatabase],
+) -> Result<Option<Vec<String>>, CatalogFailure> {
+    if !workspace::serving() {
+        return Ok(None);
+    }
+    let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
+    let sql = format!("SELECT name FROM {}", wire::open::record_in(served));
+    match catalog_rows(exec, peer, &sql) {
+        Ok(rows) => Ok(Some(rows.iter().map(|row| cell_str(row, 0)).collect())),
+        Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => Ok(Some(Vec::new())),
+        Err(failure) => Err(failure),
+    }
+}
+
+/// What is attached by none of `databases` and listed among them, holding
+/// nothing, with why: what the workspace recorded and could not attach when
+/// it started, each still in its record, and the SQLite files set aside
+/// (`catalog_listing`), each still in the record when it was in it when set
+/// aside. A file set aside whose name is attached again is forgotten.
 fn unattached_now(
     exec: Executor,
     peer: &justhttp::Peer,
     databases: &[CatalogDatabase],
 ) -> Result<Vec<workspace::Unattached>, CatalogFailure> {
     let unattached = workspace::unattached();
-    if unattached.is_empty() {
+    let aside = workspace::set_aside_now();
+    if unattached.is_empty() && aside.is_empty() {
         return Ok(unattached);
     }
-    let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
-    let sql = format!("SELECT name FROM {}", wire::open::record_in(served));
-    let recorded: Vec<String> = match catalog_rows(exec, peer, &sql) {
-        Ok(rows) => rows.iter().map(|row| cell_str(row, 0)).collect(),
-        // The record dropped: nothing is recorded.
-        Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => Vec::new(),
-        Err(failure) => return Err(failure),
-    };
-    Ok(unattached
+    let recorded = recorded_names(exec, peer, databases)?.unwrap_or_default();
+    let attached = |name: &str| databases.iter().any(|d| !d.aside && d.name.eq_ignore_ascii_case(name));
+    let mut listed: Vec<workspace::Unattached> = unattached
         .into_iter()
         .filter(|u| recorded.contains(&u.record.name))
-        .filter(|u| !databases.iter().any(|d| d.name.eq_ignore_ascii_case(&u.record.name)))
-        .collect())
+        .filter(|u| !attached(&u.record.name))
+        .collect();
+    for a in aside {
+        let name = &a.unattached.record.name;
+        if attached(name) || (a.recorded && !recorded.contains(name)) {
+            workspace::taken_back(name);
+        } else if !listed.iter().any(|u| u.record.name.eq_ignore_ascii_case(name)) {
+            listed.push(a.unattached);
+        }
+    }
+    Ok(listed)
+}
+
+/// Why a SQLite file set aside is not attached, after the engine's reason,
+/// when the server attached it from the workspace's record
+/// ([`workspace::ours`]).
+const SET_ASIDE_OURS: &str = "detached by the server, since an attached database whose catalog does not read \
+                              fails every catalog read, and attached again by the first catalog read after it reads";
+/// The same, for any other: a client's to attach again.
+const SET_ASIDE: &str = "detached by the server, since an attached database whose catalog does not read \
+                         fails every catalog read; attach it again once it reads";
+
+/// Why an attached SQLite database is listed as the server last read it,
+/// after the engine's reason (`catalog_stale`).
+const STALE: &str = "its catalog does not read for the moment, and the engine reads every attached database's catalog \
+                     together, so the whole document, every database in it, is the catalog the server last read, \
+                     and may be stale; it is read anew once this one reads";
+
+/// An attached SQLite database whose catalog does not read for the moment, and
+/// the engine's reason: a lock another connection or program holds on its
+/// file, or a failure not known to last (`for_good`).
+#[derive(Debug, Clone)]
+struct Busy {
+    name: String,
+    path: String,
+    why: String,
+}
+
+/// The attached SQLite databases the last catalog read found busy, asked
+/// first by the next one (`still_busy`).
+static BUSY: Mutex<Vec<Busy>> = Mutex::new(Vec::new());
+
+/// The last catalog each style answered in full, for a read that meets a
+/// busy database (`catalog_stale`).
+static LAST_CATALOG: Mutex<(Option<Catalog>, Option<Inventory>)> = Mutex::new((None, None));
+
+/// Whether a SQLite file's catalog does not read for good, as far as the
+/// server can tell from `why`, the engine's reason: its file is gone, or
+/// the engine finds it is not a SQLite database or cannot open it. A lock
+/// passes, and so may anything else.
+fn for_good(path: &str, why: &str) -> bool {
+    let in_memory = path.is_empty() || path == ":memory:";
+    (!in_memory && !std::path::Path::new(path).is_file())
+        || ["file is not a database", "malformed", "unable to open database file"].iter().any(|m| why.contains(m))
 }
 
 /// One of the catalog functions' listings, which read every attached
 /// database's catalog at once: one database whose catalog does not read
 /// fails the listing of all of them, and the engine names the statement it
 /// sent the database and not the database. A SQLite file that is not
-/// SQLite, or that another program holds locked, does that, and attaching
-/// one reads nothing of it. So a listing that fails asks each attached
-/// SQLite database alone, and names in its refusal each one that does not
-/// read, with its reason; one that does not wait on a lock is not slowed.
+/// SQLite, or that a connection or another program holds locked, does
+/// that, and attaching one reads nothing of it; and the engine lists no
+/// database's catalog alone. So a listing that fails asks each attached
+/// SQLite database alone. One that does not read for good (`for_good`) is
+/// detached and set aside, with its reason, as `aside` among `databases`,
+/// and the listing runs again; a later read attaches it again once it
+/// reads when the server attached it from the workspace's record
+/// (`take_back`). One that is busy is left as it is, attached, and the
+/// listing fails as `Busy`, answered from the catalog last read
+/// (`catalog_stale`). One that does not wait on a lock is not slowed. One
+/// that cannot be detached fails the listing, named.
 fn catalog_listing(
     exec: Executor,
     peer: &justhttp::Peer,
     sql: &str,
-    databases: &[CatalogDatabase],
+    databases: &mut [CatalogDatabase],
 ) -> Result<Vec<Vec<serde_json::Value>>, CatalogFailure> {
     let refusal = match catalog_rows(exec, peer, sql) {
         Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => refusal,
         other => return other,
     };
+    let mut recorded: Option<Option<Vec<String>>> = None;
     let mut unreadable = Vec::new();
-    for database in databases.iter().filter(|d| !d.served && d.storage == "sqlite") {
-        let probe = format!(
-            "SELECT count(*) FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
-            wire::open::quote_literal(&database.name)
-        );
-        match catalog_rows(exec, peer, &probe) {
+    let mut busy = Vec::new();
+    let mut set_aside = false;
+    for i in 0..databases.len() {
+        let database = &databases[i];
+        if database.served || database.aside || database.storage != "sqlite" {
+            continue;
+        }
+        let path = database.path.clone().unwrap_or_default();
+        let why = match reads_alone(exec, peer, &database.name, &path)? {
+            Ok(()) => continue,
+            Err(why) => why,
+        };
+        if !for_good(&path, &why) {
+            busy.push(Busy { name: database.name.clone(), path, why });
+            continue;
+        }
+        let detach = format!("DETACH {}", wire::open::quote_ident(&database.name));
+        match catalog_rows(exec, peer, &detach) {
             Ok(_) => {}
-            Err(CatalogFailure::Refused(why)) if why.code == code::SQL_ERROR => {
-                let why = why.message.split("\nLINE ").next().unwrap_or_default().trim().to_string();
-                let path = database.path.as_deref().unwrap_or_default();
-                unreadable.push(format!("{} ({path}): {why}", database.name));
+            // Another catalog read set it aside first.
+            Err(CatalogFailure::Refused(_))
+                if workspace::set_aside_now().iter().any(|a| a.unattached.record.name == database.name) =>
+            {
+                databases[i].aside = true;
+                set_aside = true;
+                continue;
+            }
+            Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR => {
+                unreadable.push(format!("{} ({path}): {why}, and it was not detached: {}", database.name, refusal.message));
+                continue;
             }
             Err(failure) => return Err(failure),
         }
+        if recorded.is_none() {
+            recorded = Some(recorded_names(exec, peer, databases)?);
+        }
+        let database = &mut databases[i];
+        database.aside = true;
+        set_aside = true;
+        eprintln!("harbor: {} ({path}) is detached, since its catalog does not read: {why}", database.name);
+        let record = wire::open::Record {
+            name: database.name.clone(),
+            path,
+            storage: database.storage.clone(),
+            read_only: database.read_only,
+        };
+        let in_record = recorded.as_ref().and_then(|r| r.as_ref()).is_some_and(|r| r.contains(&record.name));
+        let ours = in_record && workspace::ours(&record.name);
+        let reason = format!("{why}: {}", if ours { SET_ASIDE_OURS } else { SET_ASIDE });
+        workspace::set_aside(workspace::SetAside {
+            unattached: workspace::Unattached { record, reason },
+            recorded: in_record,
+            ours,
+        });
     }
-    if unreadable.is_empty() {
+    if !unreadable.is_empty() {
+        return Err(CatalogFailure::Refused(not_reading(&unreadable)));
+    }
+    if set_aside {
+        match catalog_rows(exec, peer, sql) {
+            Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR && !busy.is_empty() => {}
+            other => return other,
+        }
+    }
+    if busy.is_empty() {
         return Err(CatalogFailure::Refused(refusal));
     }
-    Err(CatalogFailure::Refused(Refusal::sql(format!(
-        "the catalog does not read while an attached database's does not, since the engine reads \
-         every attached database's catalog together: {}. It reads again once that one does, or \
-         once it is detached",
-        unreadable.join("; ")
-    ))))
+    for b in &busy {
+        eprintln!("harbor: {} ({}) does not read for the moment, and stays attached: {}", b.name, b.path, b.why);
+    }
+    *BUSY.lock().unwrap() = busy.clone();
+    Err(CatalogFailure::Busy(busy))
+}
+
+/// The databases the last catalog read found busy that still are, asked
+/// alone (`reads_alone`) before the listings, so a read while one stays
+/// busy does not wait out its lock again: none when each reads, or is gone.
+fn still_busy(exec: Executor, peer: &justhttp::Peer, databases: &[CatalogDatabase]) -> Result<Vec<Busy>, CatalogFailure> {
+    let known = BUSY.lock().unwrap().clone();
+    let mut busy = Vec::new();
+    for b in known {
+        let attached = databases.iter().any(|d| !d.served && d.name == b.name && d.path.as_deref().unwrap_or_default() == b.path);
+        if !attached {
+            continue;
+        }
+        if let Err(why) = reads_alone(exec, peer, &b.name, &b.path)?
+            && !for_good(&b.path, &why)
+        {
+            busy.push(Busy { why, ..b });
+        }
+    }
+    if busy.is_empty() {
+        BUSY.lock().unwrap().clear();
+    }
+    Ok(busy)
+}
+
+/// An attached database's entry in either style, as a document answered
+/// from the one last read (`catalog_stale`) rewrites it.
+trait AttachedEntry: Clone {
+    fn key(&self) -> (&str, Option<&str>, bool);
+    fn error_mut(&mut self) -> &mut Option<String>;
+    fn holding_nothing(name: String, path: Option<String>, storage: String, read_only: bool, error: Option<String>) -> Self;
+}
+
+impl AttachedEntry for Attached {
+    fn key(&self) -> (&str, Option<&str>, bool) {
+        (&self.name, self.path.as_deref(), self.error.is_none())
+    }
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+    fn holding_nothing(name: String, path: Option<String>, storage: String, read_only: bool, error: Option<String>) -> Self {
+        Attached { name, path, storage, read_only, error, ..Attached::default() }
+    }
+}
+
+impl AttachedEntry for AttachedInventory {
+    fn key(&self) -> (&str, Option<&str>, bool) {
+        (&self.name, self.path.as_deref(), self.error.is_none())
+    }
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+    fn holding_nothing(name: String, path: Option<String>, storage: String, read_only: bool, error: Option<String>) -> Self {
+        AttachedInventory { name, path, storage, read_only, error, tables: Vec::new(), views: Vec::new() }
+    }
+}
+
+/// The attached databases of a document answered from `last`, the one last
+/// read: each database attached at this read, as `last` lists it when it lists it
+/// attached from the same path, holding nothing when it does not; each busy
+/// one with why (`STALE`); then what is unattached at this read, with why.
+fn stale_attached<E: AttachedEntry>(
+    last: &[E],
+    databases: &[CatalogDatabase],
+    busy: &[Busy],
+    unattached: Vec<workspace::Unattached>,
+) -> Vec<E> {
+    let mut attached: Vec<E> = Vec::new();
+    for d in databases.iter().filter(|d| !d.served && !d.aside) {
+        let mut entry = last
+            .iter()
+            .find(|e| e.key() == (d.name.as_str(), d.path.as_deref(), true))
+            .cloned()
+            .unwrap_or_else(|| E::holding_nothing(d.name.clone(), d.path.clone(), d.storage.clone(), d.read_only, None));
+        if let Some(b) = busy.iter().find(|b| b.name == d.name) {
+            *entry.error_mut() = Some(format!("{}: {STALE}", b.why));
+        }
+        attached.push(entry);
+    }
+    attached.extend(unattached.into_iter().map(|u| {
+        E::holding_nothing(u.record.name, Some(u.record.path), u.record.storage, u.record.read_only, Some(u.reason))
+    }));
+    attached.sort_by(|a, b| a.key().0.cmp(b.key().0));
+    attached
+}
+
+/// Answer a catalog read that met `busy`, attached SQLite databases whose
+/// catalogs do not read for the moment: the engine reads every attached
+/// database's catalog together, so nothing of the catalog lists until they
+/// read, and detaching one would take it from every connection using it,
+/// the server's own among them, as a long write to it holds its lock. So
+/// the read is answered with the catalog the server last read in the same
+/// style (the lite one from the full one when it has read only that), its
+/// `stale` saying so (`stale_note`), each busy database's entry saying why
+/// (`STALE`), the databases attached and
+/// unattached as this read finds them, and the sizes as it stats them. With no
+/// catalog read yet, the read is refused, naming each busy database.
+fn catalog_stale(
+    req: Request,
+    exec: Executor,
+    peer: &justhttp::Peer,
+    style: CatalogStyle,
+    databases: &[CatalogDatabase],
+    busy: Vec<Busy>,
+) -> (bool, u16) {
+    let (full, lite) = LAST_CATALOG.lock().unwrap().clone();
+    let lite = match (&style, lite, &full) {
+        (CatalogStyle::Lite, None, Some(full)) => Some(inventory_of(full)),
+        (_, lite, _) => lite,
+    };
+    let refused = matches!((&style, &full, &lite), (CatalogStyle::Full, None, _) | (CatalogStyle::Lite, _, None));
+    if refused {
+        return catalog_refuse(req, CatalogFailure::Busy(busy));
+    }
+    let unattached = match unattached_now(exec, peer, databases) {
+        Ok(unattached) => unattached,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
+    let stale = Some(stale_note(&busy));
+    let body = match style {
+        CatalogStyle::Full => {
+            let mut catalog = full.unwrap_or_default();
+            catalog.attached = stale_attached(&catalog.attached, databases, &busy, unattached);
+            (catalog.database_size_bytes, catalog.wal_size_bytes) = (database_size_bytes, wal_size_bytes);
+            catalog.stale = stale;
+            serde_json::to_string(&catalog).unwrap()
+        }
+        CatalogStyle::Lite => {
+            let Some(mut inventory) = lite else { return catalog_refuse(req, CatalogFailure::Busy(busy)) };
+            inventory.attached = stale_attached(&inventory.attached, databases, &busy, unattached);
+            (inventory.database_size_bytes, inventory.wal_size_bytes) = (database_size_bytes, wal_size_bytes);
+            inventory.stale = stale;
+            serde_json::to_string(&inventory).unwrap()
+        }
+    };
+    let _ = req.respond(json_response(200, &body));
+    (true, 200)
+}
+
+/// What a document answered as last read says of itself (`stale`): which
+/// attached databases do not read.
+fn stale_note(busy: &[Busy]) -> String {
+    let named: Vec<String> = busy.iter().map(|b| format!("{} ({})", b.name, b.path)).collect();
+    format!(
+        "this is the catalog the server last read, since the catalog of {} does not read for the moment, and the \
+         engine reads every attached database's together: every database in it may be stale, and it is read anew \
+         once that one reads",
+        named.join(", ")
+    )
+}
+
+/// The lite style of a full catalog: what it names.
+fn inventory_of(catalog: &Catalog) -> Inventory {
+    let named = |schema: &str, name: &str| Named { name: name.to_string(), schema: schema.to_string() };
+    let tables = |tables: &[Table]| tables.iter().map(|t| named(&t.schema, &t.name)).collect::<Vec<_>>();
+    let views = |views: &[View]| views.iter().map(|v| named(&v.schema, &v.name)).collect::<Vec<_>>();
+    Inventory {
+        harbor_version: catalog.harbor_version.clone(),
+        duckdb_version: catalog.duckdb_version.clone(),
+        database_size_bytes: catalog.database_size_bytes,
+        wal_size_bytes: catalog.wal_size_bytes,
+        tables: tables(&catalog.tables),
+        views: views(&catalog.views),
+        attached: catalog
+            .attached
+            .iter()
+            .map(|a| AttachedInventory {
+                name: a.name.clone(),
+                path: a.path.clone(),
+                storage: a.storage.clone(),
+                read_only: a.read_only,
+                error: a.error.clone(),
+                tables: tables(&a.tables),
+                views: views(&a.views),
+            })
+            .collect(),
+        stale: catalog.stale.clone(),
+    }
+}
+
+/// Whether the SQLite file at `path`, attached as `name`, reads its own
+/// catalog, and the engine's reason when it does not. Asked on an
+/// attachment of its own, hidden from the catalog functions and waiting
+/// [`PROBE_BUSY_MS`] on a lock, so the catalog read that asks does not wait
+/// out the file's own wait a second time; an in-memory one, on its own
+/// attachment.
+fn reads_alone(
+    exec: Executor,
+    peer: &justhttp::Peer,
+    name: &str,
+    path: &str,
+) -> Result<Result<(), String>, CatalogFailure> {
+    let quote = wire::open::quote_literal;
+    let read = |name: &str| format!("SELECT count(*) FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')", quote(name));
+    let why = |refusal: Refusal| refusal.message.split("\nLINE ").next().unwrap_or_default().trim().to_string();
+    if path.is_empty() || path == ":memory:" {
+        return match catalog_rows(exec, peer, &read(name)) {
+            Ok(_) => Ok(Ok(())),
+            Err(CatalogFailure::Refused(refusal)) => Ok(Err(why(refusal))),
+            Err(failure) => Err(failure),
+        };
+    }
+    let probe = format!("{PROBE}{}", next_job_id());
+    let attach = format!(
+        "ATTACH {} AS {} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)",
+        quote(path),
+        wire::open::quote_ident(&probe)
+    );
+    match catalog_rows(exec, peer, &attach) {
+        Ok(_) => {}
+        Err(CatalogFailure::Refused(refusal)) => return Ok(Err(why(refusal))),
+        Err(failure) => return Err(failure),
+    }
+    let read = catalog_rows(exec, peer, &read(&probe));
+    let _ = catalog_rows(exec, peer, &format!("DETACH {}", wire::open::quote_ident(&probe)));
+    match read {
+        Ok(_) => Ok(Ok(())),
+        Err(CatalogFailure::Refused(refusal)) => Ok(Err(why(refusal))),
+        Err(failure) => Err(failure),
+    }
+}
+
+/// How long the question whether a SQLite file reads waits on a lock, in
+/// milliseconds: long enough to ride over a writer's commit.
+const PROBE_BUSY_MS: u32 = 100;
+
+/// Attach again each SQLite file set aside that the server attached from
+/// the workspace's record ([`workspace::ours`]) and whose file reads
+/// (`reads_alone`), under its name, as its record attaches it, so one still
+/// not reading costs a catalog read a few milliseconds. One whose row the
+/// record no longer holds is forgotten, not attached. Any other is a
+/// client's, attached with the client's options, and is left for a client
+/// to attach again.
+fn take_back(exec: Executor, peer: &justhttp::Peer) -> Result<(), CatalogFailure> {
+    let aside = workspace::set_aside_now();
+    if aside.is_empty() {
+        return Ok(());
+    }
+    let recorded = match workspace::serving() {
+        true => {
+            let served = catalog_rows(exec, peer, "SELECT current_database()")?;
+            let served = served.first().map(|row| cell_str(row, 0)).unwrap_or_default();
+            let databases = [CatalogDatabase {
+                name: served,
+                path: None,
+                storage: String::new(),
+                read_only: false,
+                served: true,
+                aside: false,
+            }];
+            recorded_names(exec, peer, &databases)?
+        }
+        false => None,
+    };
+    for a in aside {
+        let record = &a.unattached.record;
+        if a.recorded && recorded.as_ref().is_some_and(|r| !r.contains(&record.name)) {
+            workspace::taken_back(&record.name);
+            continue;
+        }
+        if !a.ours {
+            continue;
+        }
+        // A file gone is not attached, since attaching a missing path makes
+        // an empty database there.
+        if !std::path::Path::new(&record.path).is_file() || reads_alone(exec, peer, &record.name, &record.path)?.is_err() {
+            continue;
+        }
+        // A client's DETACH of its name since forgot it, and one of its
+        // name that has not yet been claimed may.
+        let taking = workspace::taking();
+        if !workspace::set_aside_now().iter().any(|s| s.unattached.record.name == record.name)
+            || workspace::is_pending(&record.name, &taking)
+        {
+            continue;
+        }
+        match catalog_rows(exec, peer, &record.attach_sql()) {
+            Ok(_) => {
+                eprintln!("harbor: {} ({}) reads again, and is attached again", record.name, record.path);
+                workspace::taken_back(&record.name);
+            }
+            Err(CatalogFailure::Refused(_)) => {}
+            Err(failure) => return Err(failure),
+        }
+    }
+    Ok(())
 }
 
 /// Bind the view a `duckdb_views()` row names (database, schema, name,
@@ -3075,9 +3764,13 @@ fn view_error(refusal: &Refusal) -> Option<String> {
 /// since a count there reads every row of the file. On the workspace, a
 /// file it records and could not attach at its start is listed there too,
 /// holding nothing, with why in `error`, and the record itself, in the
-/// `_harbor` schema, is not listed (`workspace`). An attached database whose
-/// own catalog does not read fails every listing, and the refusal names it
-/// (`catalog_listing`).
+/// `_harbor` schema, is not listed (`workspace`). An attached SQLite file
+/// whose own catalog does not read fails every listing: one that does not
+/// read for good is detached and listed there the same way, and attached
+/// again by a later read once it reads when the workspace attached it
+/// (`catalog_listing`, `take_back`); one that is busy stays attached, and
+/// the read is answered with the catalog last read, the busy one saying
+/// why and the document's `stale` saying so (`catalog_stale`).
 ///
 /// Ordering is part of the contract: tables and views by (schema, name),
 /// attached databases by name, columns in ordinal position, indexes and
@@ -3097,6 +3790,9 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
+    if let Err(failure) = take_back(exec, &peer) {
+        return catalog_refuse(req, failure);
+    }
     // `system` and `temp` are the internal databases; every other one is the
     // served database, which current_database() names, or one attached
     // beside it. Relations of any database not in this list are passed over
@@ -3109,7 +3805,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         Ok(rows) => rows,
         Err(failure) => return catalog_refuse(req, failure),
     };
-    let databases: Vec<CatalogDatabase> = database_rows
+    let mut databases: Vec<CatalogDatabase> = database_rows
         .iter()
         .map(|row| CatalogDatabase {
             name: cell_str(row, 0),
@@ -3117,10 +3813,18 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
             storage: cell_str(row, 2),
             read_only: cell_bool(row, 3),
             served: cell_bool(row, 4),
+            aside: false,
         })
         .collect();
     let database_of: HashMap<String, usize> =
         databases.iter().enumerate().map(|(i, d)| (d.name.clone(), i)).collect();
+    // A database the last read found busy that still is answers this one
+    // from the catalog last read, without waiting out its lock again.
+    match still_busy(exec, &peer, &databases) {
+        Ok(busy) if !busy.is_empty() => return catalog_stale(req, exec, &peer, style, &databases, busy),
+        Ok(_) => {}
+        Err(failure) => return catalog_refuse(req, failure),
+    }
     let table_sql = match style {
         CatalogStyle::Full => {
             "SELECT database_name, schema_name, table_name, sql FROM duckdb_tables() \
@@ -3133,8 +3837,9 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
              ORDER BY database_name, schema_name, table_name"
         }
     };
-    let table_rows = match catalog_listing(exec, &peer, table_sql, &databases) {
+    let table_rows = match catalog_listing(exec, &peer, table_sql, &mut databases) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     let view_rows = match catalog_listing(
@@ -3142,9 +3847,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         "SELECT database_name, schema_name, view_name, sql FROM duckdb_views() \
          WHERE NOT internal AND NOT temporary \
          ORDER BY database_name, schema_name, view_name",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     // The workspace's record of what is attached in it is Harbor's, and is
@@ -3156,10 +3862,6 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     };
     let table_rows: Vec<_> = table_rows.into_iter().filter(listed).collect();
     let view_rows: Vec<_> = view_rows.into_iter().filter(listed).collect();
-    let unattached = match unattached_now(exec, &peer, &databases) {
-        Ok(unattached) => unattached,
-        Err(failure) => return catalog_refuse(req, failure),
-    };
     let duckdb_version = version_rows.first().map(|r| cell_str(r, 0)).unwrap_or_default();
     let harbor_version = env!("CARGO_PKG_VERSION").to_string();
     let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
@@ -3168,6 +3870,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     // and the count, the views' binding and the four shape queries below
     // never run.
     if let CatalogStyle::Lite = style {
+        let unattached = match unattached_now(exec, &peer, &databases) {
+            Ok(unattached) => unattached,
+            Err(failure) => return catalog_refuse(req, failure),
+        };
         let named_in = |rows: &[Vec<serde_json::Value>], database: &str| -> Vec<Named> {
             rows.iter()
                 .filter(|row| cell_str(row, 0) == database)
@@ -3177,7 +3883,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         let served = databases.iter().find(|d| d.served).map(|d| d.name.as_str()).unwrap_or_default();
         let mut attached: Vec<AttachedInventory> = databases
             .iter()
-            .filter(|d| !d.served)
+            .filter(|d| !d.served && !d.aside)
             .map(|d| AttachedInventory {
                 name: d.name.clone(),
                 path: d.path.clone(),
@@ -3206,8 +3912,12 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
             tables: named_in(&table_rows, served),
             views: named_in(&view_rows, served),
             attached,
+            stale: None,
         };
+        LAST_CATALOG.lock().unwrap().1 = Some(inventory.clone());
+        BUSY.lock().unwrap().clear();
         let _ = req.respond(json_response(200, &serde_json::to_string(&inventory).unwrap()));
+        learn_after_reading();
         return (true, 200);
     }
 
@@ -3278,9 +3988,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
          FROM duckdb_columns() \
          WHERE NOT internal \
          ORDER BY database_name, schema_name, table_name, column_index",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     let constraint_rows = match catalog_listing(
@@ -3290,9 +4001,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
          FROM duckdb_constraints() \
          WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY') \
          ORDER BY database_name, schema_name, table_name, constraint_index",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     // duckdb_indexes() lists only the indexes CREATE INDEX made; the internal
@@ -3304,9 +4016,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         "SELECT database_name, schema_name, table_name, index_name, is_unique, expressions \
          FROM duckdb_indexes() \
          ORDER BY database_name, schema_name, table_name, index_name",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     let sequence_rows = match catalog_rows(
@@ -3433,9 +4146,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
          UNION ALL SELECT database_name, schema_name, view_name FROM duckdb_views() \
          WHERE NOT internal AND NOT temporary \
          UNION ALL SELECT database_name, NULL, NULL FROM duckdb_databases() WHERE NOT internal",
-        &databases,
+        &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     let mut present: std::collections::HashSet<RelationKey> = present_rows.iter().map(key_of).collect();
@@ -3493,12 +4207,16 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         }
     }
     let still_attached = |name: &str| present.contains(&(name.to_string(), String::new(), String::new()));
+    let unattached = match unattached_now(exec, &peer, &databases) {
+        Ok(unattached) => unattached,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
 
     // Each relation to its database, in the order delivered: by database
     // name, then (schema, name), so each database's lists stay in order.
     let mut attached: Vec<Attached> = Vec::new();
     let mut slot: Vec<Option<usize>> = vec![None; databases.len()];
-    for (i, database) in databases.iter().enumerate().filter(|(_, d)| !d.served && still_attached(&d.name)) {
+    for (i, database) in databases.iter().enumerate().filter(|(_, d)| !d.served && !d.aside && still_attached(&d.name)) {
         slot[i] = Some(attached.len());
         attached.push(Attached {
             name: database.name.clone(),
@@ -3542,8 +4260,13 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         sequences,
         views: served_views,
         attached,
+        stale: None,
     };
-    let _ = req.respond(json_response(200, &serde_json::to_string(&catalog).unwrap()));
+    let body = serde_json::to_string(&catalog).unwrap();
+    LAST_CATALOG.lock().unwrap().0 = Some(catalog);
+    BUSY.lock().unwrap().clear();
+    let _ = req.respond(json_response(200, &body));
+    learn_after_reading();
     (true, 200)
 }
 
@@ -3618,6 +4341,33 @@ fn respond_ready(req: Request, ok: bool, message: &str) -> u16 {
 /// A worker's executor: its jobs channel and its cancellation slot.
 type Executor<'a> = (&'a mpsc::SyncSender<Job>, &'a Arc<SlotState>);
 
+/// A client's `ATTACH` or `DETACH` of `name`, pending
+/// ([`workspace::pending`]) from before it is sent until it is over, when
+/// its executor tells whether it ran (`Job::claims`) and the name is
+/// claimed when it did ([`workspace::settled`]). No lock is held between:
+/// a catalog read passes a file set aside under a pending name by, and
+/// waits for nothing. Dropped as its request ends, after the answer is
+/// written: the executor tells as the statement ends, and the answer may be
+/// all its executor holds.
+struct Claiming {
+    name: String,
+    ran: mpsc::Receiver<bool>,
+}
+
+impl Claiming {
+    fn new(name: &[u8], ran: mpsc::Receiver<bool>) -> Self {
+        let name = String::from_utf8_lossy(name).into_owned();
+        workspace::pending(&name);
+        Claiming { name, ran }
+    }
+}
+
+impl Drop for Claiming {
+    fn drop(&mut self) {
+        workspace::settled(&self.name, self.ran.recv() == Ok(true));
+    }
+}
+
 /// `POST /sql` on a worker: the body read and parsed, then the statement run.
 fn run_sql_request(mut req: Request, exec: Executor) -> (bool, u16) {
     let parsed = read_request_body(&mut req)
@@ -3641,7 +4391,6 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         Ok(std::borrow::Cow::Borrowed(_)) => {}
         Err(e) => return refuse(req, Refusal::bad_request(e)),
     }
-
     // `USE` sets the CURRENT DATABASE on the connection it runs on, and
     // outside a session that connection is a pooled one that goes back to the
     // pool when this request ends. Since a request carries exactly one
@@ -3690,8 +4439,19 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         (None, None) => return shed(req),
     };
 
-    let (job, ready, body) = Job::new(parsed.sql, parsed.params, shape, parsed.timeout);
+    // A client's DETACH or ATTACH of a name that ran is the client's: a
+    // file the server set aside under it, or one the server attached under
+    // it from the workspace's record, is not the server's to attach again.
+    // Claimed once the statement is over, when it ran, and pending until
+    // then, so the server does not attach one again in between.
+    let named = detached_name(&parsed.sql).or_else(|| attached_name(&parsed.sql));
+    let (mut job, ready, body) = Job::new(parsed.sql, parsed.params, shape, parsed.timeout);
     let id = job.id;
+    let _claiming = named.map(|name| {
+        let (claims, ran) = mpsc::sync_channel(1);
+        job.claims = Some(claims);
+        Claiming::new(&name, ran)
+    });
 
     // Registered before the job is sent, so a Stop pressed the instant the
     // query goes out has something to find. `Cancellable` deregisters on drop,
@@ -3700,7 +4460,12 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         None => None,
         Some(name) => match Cancellable::register(name, slot, id) {
             Ok(guard) => Some(guard),
-            Err(refusal) => return refuse(req, refusal),
+            // The job goes first, and with it what tells `Claiming` that
+            // it did not run.
+            Err(refusal) => {
+                drop(job);
+                return refuse(req, refusal);
+            }
         },
     };
 
@@ -3934,46 +4699,776 @@ enum Gate {
 /// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
 /// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
 /// `information_schema`, `sql_auto_complete` or `sqlite_query`, which reads
-/// an attached SQLite database by its name. A name in a string or a
-/// comment does not count. A view whose body calls one is not seen; it is
-/// read as the plain query it looks like.
+/// an attached SQLite database by its name; `query` or `query_table`
+/// called, which run a statement or read a table named in a string; or a
+/// view, macro or prepared statement whose body reads it (`CatalogNames`).
+/// A name in a string or a comment does not count, and neither does a
+/// column named `query`. While the views and macros are not all learned
+/// (`CatalogNames::complete`), every statement reads the catalog, since
+/// any name may be one that does.
 fn catalog_gate(sql: &str) -> Gate {
+    gate_of(sql, &CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner))
+}
+
+fn gate_of(sql: &str, names: &CatalogNames) -> Gate {
     match acting_keyword(sql).as_str() {
         "ATTACH" | "DETACH" => return Gate::Changes,
         "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PRAGMA" => return Gate::Reads,
         _ => {}
     }
-    let catalog = |word: &[u8]| {
-        let word = word.to_ascii_lowercase();
-        ["duckdb_", "pragma_", "pg_"].iter().any(|p| word.starts_with(p.as_bytes()))
-            || word == b"information_schema"
-            || word == b"sql_auto_complete"
-            || word == b"sqlite_query"
-    };
+    match names_in(sql, |name| catalog_word(name) || names.reads.contains(name)) {
+        true => Gate::Reads,
+        false if !names.complete => Gate::Reads,
+        false => Gate::Open,
+    }
+}
+
+/// Whether a name, lowercased, is one of the engine's catalog functions or
+/// schemas, as `names_in` passes it: `query` and `query_table` count
+/// called, as `query(` and `query_table(`, and a column of either name does
+/// not.
+fn catalog_word(word: &[u8]) -> bool {
+    ["duckdb_", "pragma_", "pg_"].iter().any(|p| word.starts_with(p.as_bytes()))
+        || word == b"information_schema"
+        || word == b"sql_auto_complete"
+        || word == b"sqlite_query"
+        || word == b"query("
+        || word == b"query_table("
+}
+
+/// The functions that read the catalog only when called, and whose names a
+/// column or a table may have.
+const CALLED: [&[u8]; 2] = [b"query", b"query_table"];
+
+/// Each name a statement uses, lowercased, as the engine matches names: a
+/// word of its code, or a name quoted in `"` or `` ` ``, until `found` says
+/// it is the one looked for. Whether one was. Its spaces are the engine's
+/// (`wire::scan::plain_spaces`), and one of the `CALLED` names followed by
+/// `(`, past spaces and comments, is passed with it: `query(`.
+fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
-    let bytes = sql.as_bytes();
-    for span in wire::scan::scan(sql) {
+    let plain = wire::scan::plain_spaces(sql.as_bytes());
+    let bytes = &*plain;
+    let spans = wire::scan::spans(bytes);
+    let mut used = |name: &[u8], next: &[wire::scan::Span], from: usize| {
+        let mut name = name.to_ascii_lowercase();
+        if CALLED.contains(&name.as_slice()) && called(bytes, next, from) {
+            name.push(b'(');
+        }
+        found(&name)
+    };
+    for (at, span) in spans.iter().enumerate() {
         let text = &bytes[span.start..span.end];
         match span.kind {
             wire::scan::Kind::Code => {
-                if text.split(|&c| !is_word(c)).any(catalog) {
-                    return Gate::Reads;
+                let mut i = span.start;
+                while i < span.end {
+                    if !is_word(bytes[i]) {
+                        i += 1;
+                        continue;
+                    }
+                    let start = i;
+                    while i < span.end && is_word(bytes[i]) {
+                        i += 1;
+                    }
+                    if used(&bytes[start..i], &spans[at..], i) {
+                        return true;
+                    }
                 }
             }
-            wire::scan::Kind::Str if text.first() == Some(&b'"') => {
-                let name = text[1..].strip_suffix(b"\"").unwrap_or(&text[1..]);
-                if catalog(name) {
-                    return Gate::Reads;
+            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) => {
+                let quote = text[0];
+                let name = text[1..].strip_suffix(&[quote]).unwrap_or(&text[1..]);
+                if used(name, &spans[at + 1..], span.end) {
+                    return true;
                 }
             }
             _ => {}
         }
     }
-    Gate::Open
+    false
+}
+
+/// Whether the code that comes next in `spans` from `from`, past spaces and
+/// comments, is `(`.
+fn called(bytes: &[u8], spans: &[wire::scan::Span], from: usize) -> bool {
+    for span in spans {
+        match span.kind {
+            wire::scan::Kind::Code => {
+                if let Some(&c) = bytes[from.max(span.start)..span.end].iter().find(|&&c| !wire::scan::is_space(c)) {
+                    return c == b'(';
+                }
+            }
+            wire::scan::Kind::LineComment | wire::scan::Kind::BlockComment => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The views and macros whose bodies read the catalog. A view over
+/// `duckdb_tables()` reads it when it is read, and `SELECT * FROM v` names
+/// no catalog function, so the gate knows such names. Each view's and
+/// macro's name is kept with the names its body uses, learned from the
+/// engine's catalog when the pool opens and after each `ATTACH`, `IMPORT
+/// DATABASE` and `COPY FROM DATABASE`, since each brings views of its own,
+/// and from each `CREATE VIEW`, `CREATE MACRO`, `PREPARE` and `ALTER VIEW …
+/// RENAME` as it passes, before it runs, and the views and macros of the
+/// `schema.sql` an `IMPORT DATABASE` runs, before it runs. A name is never
+/// forgotten: one dropped, or kept by another schema's view of its name,
+/// costs a statement that names it the shared gate and nothing else.
+///
+/// The engine's listing reads every attached database's catalog, and one
+/// SQLite file locked fails it after the file's wait. Until a listing
+/// succeeds, and from before a statement that brings views runs until
+/// they are read, the names are not all known (`complete`), and every
+/// statement shares the gate: an ATTACH or DETACH waits for the statements
+/// running, and nothing reads the catalog unseen. Learning is tried again
+/// after each ATTACH and DETACH (`learn_again`) and each `/catalog` read
+/// that succeeds (`learn_after_reading`).
+#[derive(Default)]
+struct CatalogNames {
+    /// Each name, lowercased, with the names its bodies use.
+    uses: HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>>,
+    /// Each name used, with the names whose bodies use it.
+    used_by: HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>>,
+    /// The names whose bodies read the catalog, themselves or through
+    /// another such name.
+    reads: std::collections::HashSet<Vec<u8>>,
+    /// Every view and macro the engine lists was learned by the last
+    /// listing, and nothing since brought one unread.
+    complete: bool,
+    /// How many times the names were found incomplete (`unsettle`), so a
+    /// listing read before the last time cannot call them complete.
+    unsettled: u64,
+}
+
+static CATALOG_NAMES: std::sync::LazyLock<RwLock<CatalogNames>> = std::sync::LazyLock::new(Default::default);
+
+/// The names `body` uses, lowercased.
+fn used_names(body: &str) -> std::collections::HashSet<Vec<u8>> {
+    let mut used = std::collections::HashSet::new();
+    names_in(body, |word| {
+        used.insert(word.to_vec());
+        false
+    });
+    used
+}
+
+impl CatalogNames {
+    /// Names whose listing succeeded, holding none yet.
+    #[cfg(test)]
+    fn listed() -> Self {
+        CatalogNames { complete: true, ..Default::default() }
+    }
+
+    /// `name`, whose body is `body`.
+    #[cfg(test)]
+    fn learn(&mut self, name: &[u8], body: &str) {
+        self.learn_all(vec![(name.to_vec(), used_names(body))]);
+    }
+
+    /// Not all learned: a listing failed, or a statement brings views.
+    fn unsettle(&mut self) {
+        self.complete = false;
+        self.unsettled += 1;
+    }
+
+    /// Each name with the names its body uses ([`used_names`]), then what
+    /// reads the catalog among them and the names that use them, settled
+    /// once: as cheap for the whole catalog as for one name.
+    fn learn_all(&mut self, learned: Vec<(Vec<u8>, std::collections::HashSet<Vec<u8>>)>) {
+        let mut names = Vec::with_capacity(learned.len());
+        for (name, used) in learned {
+            let name = name.to_ascii_lowercase();
+            self.add(&name, used);
+            names.push(name);
+        }
+        self.settle(names);
+    }
+
+    /// `to` takes what `from` uses, as a view renamed does.
+    fn rename(&mut self, from: &[u8], to: &[u8]) {
+        let used = self.uses.get(from).cloned().unwrap_or_default();
+        self.add(to, used);
+        self.settle(vec![to.to_vec()]);
+    }
+
+    fn add(&mut self, name: &[u8], used: std::collections::HashSet<Vec<u8>>) {
+        for u in &used {
+            self.used_by.entry(u.clone()).or_default().insert(name.to_vec());
+        }
+        self.uses.entry(name.to_vec()).or_default().extend(used);
+    }
+
+    /// Mark each of `names` that reads the catalog, and every name that
+    /// uses one marked, through the names that use it: each name is marked
+    /// once, so the work is the names and their uses, once.
+    fn settle(&mut self, names: Vec<Vec<u8>>) {
+        let reads = |this: &Self, name: &Vec<u8>| {
+            this.uses.get(name).is_some_and(|used| used.iter().any(|u| catalog_word(u) || this.reads.contains(u)))
+        };
+        let mut work: Vec<Vec<u8>> = names.into_iter().filter(|n| !self.reads.contains(n) && reads(self, n)).collect();
+        while let Some(name) = work.pop() {
+            if !self.reads.insert(name.clone()) {
+                continue;
+            }
+            if let Some(users) = self.used_by.get(&name) {
+                work.extend(users.iter().filter(|u| !self.reads.contains(*u)).cloned());
+            }
+        }
+    }
+}
+
+/// Learn the views and macros a statement makes or renames, before it runs
+/// (`CatalogNames`), and those of the `schema.sql` an `IMPORT DATABASE`
+/// runs.
+fn learn_from_statement(sql: &str) {
+    match acting_keyword(sql).as_str() {
+        "CREATE" | "ALTER" | "PREPARE" => learn_made(sql),
+        "IMPORT" => {
+            for statement in imported_statements(sql) {
+                if matches!(acting_keyword(&statement).as_str(), "CREATE" | "ALTER") {
+                    learn_made(&statement);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn learn_made(sql: &str) {
+    let Some(made) = made_name(sql) else { return };
+    let used = match &made {
+        Made::Body(_) => used_names(sql),
+        Made::Renamed { .. } => Default::default(),
+    };
+    let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
+    match made {
+        Made::Body(name) => names.learn_all(vec![(name, used)]),
+        Made::Renamed { from, to } => names.rename(&from, &to),
+    }
+}
+
+/// The statements of the `schema.sql` an `IMPORT DATABASE 'directory'`
+/// runs, where the engine finds it: none when there is no such file.
+fn imported_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let Some(path) = wire::scan::scan(sql)
+        .into_iter()
+        .find(|s| matches!(s.kind, wire::scan::Kind::Str) && bytes[s.start] == b'\'')
+    else {
+        return Vec::new();
+    };
+    let quoted = &sql[path.start + 1..path.end.saturating_sub(1).max(path.start + 1)];
+    let directory = quoted.replace("''", "'");
+    let Ok(schema) = std::fs::read_to_string(std::path::Path::new(&directory).join("schema.sql")) else {
+        return Vec::new();
+    };
+    statements_of(&schema)
+}
+
+/// `script`'s statements, split at each `;` of its code.
+fn statements_of(script: &str) -> Vec<String> {
+    let bytes = script.as_bytes();
+    let mut statements = Vec::new();
+    let mut start = 0;
+    for span in wire::scan::scan(script).into_iter().filter(|s| matches!(s.kind, wire::scan::Kind::Code)) {
+        for at in (span.start..span.end).filter(|&i| bytes[i] == b';') {
+            statements.push(script[start..at].to_string());
+            start = at + 1;
+        }
+    }
+    statements.push(script[start..].to_string());
+    statements.retain(|s| !s.trim().is_empty());
+    statements
+}
+
+/// What lists every view and macro with its body, one JSON pair a row.
+const LISTING: &str = "SELECT json_array(view_name, sql)::VARCHAR FROM duckdb_views() WHERE sql IS NOT NULL \
+                       UNION ALL SELECT json_array(function_name, macro_definition)::VARCHAR FROM duckdb_functions() \
+                       WHERE function_type IN ('macro', 'table_macro') AND macro_definition IS NOT NULL";
+
+/// Learn every view and macro the engine lists on `conn` (`CatalogNames`).
+/// Its catalog is read, so the caller holds the gate. Said in the log when
+/// the catalog does not read; what was learned stays, and the names are
+/// not complete until a listing succeeds.
+fn learn_catalog_names(conn: &mut Connection) {
+    let began = CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).unsettled;
+    let listed = conn.query_strings(LISTING).map_err(|e| e.into_text());
+    learn_listed(began, listed);
+}
+
+/// Whether the last listing failed, so the next that succeeds says so.
+static UNLISTED: AtomicBool = AtomicBool::new(false);
+
+/// Learn the rows of a listing begun when the names had been unsettled
+/// `began` times: complete when it succeeded and nothing unsettled them
+/// since.
+fn learn_listed(began: u64, listed: Result<Vec<String>, String>) {
+    let rows = match listed {
+        Ok(rows) => rows,
+        Err(e) => {
+            if !UNLISTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "harbor: the views and macros that read the catalog were not read from it, and until they \
+                     are, an ATTACH or DETACH waits for every statement running: {e}"
+                );
+            }
+            CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).unsettle();
+            return;
+        }
+    };
+    // Read outside the lock, which the gate of every statement takes.
+    let learned: Vec<_> = rows
+        .iter()
+        .filter_map(|row| serde_json::from_str::<(String, String)>(row).ok())
+        .map(|(name, body)| (name.into_bytes(), used_names(&body)))
+        .collect();
+    let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
+    names.learn_all(learned);
+    if names.unsettled == began {
+        names.complete = true;
+        UNREAD_BESIDE.store(false, Ordering::SeqCst);
+        if UNLISTED.swap(false, Ordering::Relaxed) {
+            eprintln!("harbor: the views and macros that read the catalog are read from it");
+        }
+    }
+}
+
+/// The connection the views and macros are learned on after the pool
+/// opens: one of its own, outside every session's transaction; and when
+/// `learn_again` last found a SQLite file busy.
+static LEARNER: Mutex<Option<(Connection, Option<Instant>)>> = Mutex::new(None);
+
+/// How long `learn_again` waits after it found a SQLite file busy before it
+/// asks again.
+const ASK_AGAIN: Duration = Duration::from_secs(1);
+
+/// What a probe of a SQLite file is attached as, before a number: hidden
+/// from the catalog functions, and no client's.
+const PROBE: &str = "harbor_probe_";
+
+/// Learn again, when the names are not complete, after an ATTACH or a
+/// DETACH, holding the gate alone as `alone`. The listing waits out a
+/// SQLite file's lock, five seconds by default, so each attached SQLite
+/// file is asked first, waiting [`PROBE_BUSY_MS`] on a lock (`busy_sqlite`),
+/// and while one does not read, learning waits for a later chance, and asks
+/// again no sooner than [`ASK_AGAIN`], so a client attaching and detaching
+/// over and over does not hold the gate for the asking. Then the gate is
+/// shared for the listing: statements run beside it, and only an ATTACH or
+/// DETACH waits.
+pub(crate) fn learn_again(alone: RwLockWriteGuard<'static, ()>) {
+    if CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete {
+        return;
+    }
+    {
+        let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((conn, busy_at)) = learner.as_mut() else { return };
+        if busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+            return;
+        }
+        *busy_at = None;
+        let busy = busy_sqlite(conn);
+        if busy.is_none() {
+            UNREAD_BESIDE.store(false, Ordering::SeqCst);
+        }
+        if let Some(why) = busy {
+            *busy_at = Some(Instant::now());
+            if !UNLISTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "harbor: the views and macros that read the catalog are not read while {why}, and until they \
+                     are, an ATTACH or DETACH waits for every statement running"
+                );
+            }
+            return;
+        }
+    }
+    // The learner is let go first: a statement holding the gate shared may
+    // wait for it, and a share asked for while an ATTACH waits is not given.
+    // A statement that would share the gate only because the names are not
+    // all known waits for the listing (`LEARNING`), and then for what it
+    // learned, rather than hold the gate for as long as it runs.
+    let _learning = Learning::begin();
+    drop(alone);
+    let _reading = reading_catalog();
+    learn_on_learner();
+}
+
+/// How long an ATTACH or DETACH that waits while the names are not all
+/// known lets readers in beside it and asks for the names, before it waits
+/// for the readers running and keeps out the ones that come after, unless
+/// asking may yet learn them.
+const ASK_BESIDE: Duration = Duration::from_secs(1);
+
+/// How many listings `learn_again` has begun and not ended.
+static LEARNING: AtomicUsize = AtomicUsize::new(0);
+
+/// A listing begun by `learn_again`, counted in [`LEARNING`] until it is
+/// learned, or failed.
+struct Learning;
+
+impl Learning {
+    fn begin() -> Self {
+        LEARNING.fetch_add(1, Ordering::SeqCst);
+        Learning
+    }
+}
+
+impl Drop for Learning {
+    fn drop(&mut self) {
+        LEARNING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether every view and macro is known (`CatalogNames::complete`).
+fn names_complete() -> bool {
+    CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete
+}
+
+/// Learn again, when the names are not complete, for an ATTACH or DETACH
+/// that waits for the statements running, sharing the gate beside them: a
+/// listing that succeeds makes the names complete, and the statements that
+/// come after it, the catalog not read, pass the gate by rather than wait
+/// for the ATTACH. Asked no more often than [`ASK_AGAIN`] after a listing or
+/// a probe found a SQLite file busy, never while an ATTACH or DETACH waits
+/// or another listing runs, and not again after a listing here failed until
+/// a probe finds every SQLite file reads (`UNREAD_BESIDE`): a listing waits
+/// out a locked file, and the ATTACH with it. Whether asking again may yet
+/// learn them.
+fn learn_beside() -> bool {
+    if UNREAD_BESIDE.load(Ordering::SeqCst) {
+        return false;
+    }
+    let _reading = match CATALOG_GATE.try_read() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(TryLockError::WouldBlock) => return true,
+    };
+    let Ok(mut learner) = LEARNER.try_lock() else { return true };
+    let Some((conn, busy_at)) = learner.as_mut() else { return false };
+    if names_complete() {
+        return true;
+    }
+    if busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN) {
+        return false;
+    }
+    learn_catalog_names(conn);
+    if !names_complete() {
+        *busy_at = Some(Instant::now());
+        UNREAD_BESIDE.store(true, Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+/// Whether a listing beside the statements running failed, and neither a
+/// probe has found every SQLite file reads since nor a listing read.
+static UNREAD_BESIDE: AtomicBool = AtomicBool::new(false);
+
+/// Learn again, when the names are not complete, after a `/catalog` read
+/// that succeeded, which read every attached database's catalog.
+fn learn_after_reading() {
+    if CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete {
+        return;
+    }
+    let _reading = reading_catalog();
+    learn_on_learner();
+}
+
+/// Learn on [`LEARNER`], under the gate the caller holds.
+fn learn_on_learner() {
+    let mut learner = LEARNER.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((conn, _)) = learner.as_mut() {
+        learn_catalog_names(conn);
+    }
+}
+
+/// An attached SQLite file that does not read for the moment, and why: each
+/// asked as `reads_alone` asks it, on an attachment of its own that waits
+/// [`PROBE_BUSY_MS`] on a lock, under the gate held alone.
+fn busy_sqlite(conn: &mut Connection) -> Option<String> {
+    let paths = match conn.query_strings(
+        "SELECT path FROM duckdb_databases() WHERE type = 'sqlite' AND path IS NOT NULL AND path NOT IN ('', ':memory:')",
+    ) {
+        Ok(paths) => paths,
+        Err(e) => return Some(format!("the attached databases do not list: {}", e.into_text())),
+    };
+    let quote = wire::open::quote_literal;
+    paths.iter().find_map(|path| {
+        let probe = format!("{PROBE}{}", next_job_id());
+        let name = wire::open::quote_ident(&probe);
+        let attach = format!("ATTACH {} AS {name} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)", quote(path));
+        let read = conn.execute_batch(&attach).and_then(|()| {
+            let read = conn.query_strings(&format!(
+                "SELECT count(*)::VARCHAR FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
+                quote(&probe)
+            ));
+            let _ = conn.execute_batch(&format!("DETACH {name}"));
+            read
+        });
+        let why = |e: crate::engine::Error| e.into_text().split("\nLINE ").next().unwrap_or_default().trim().to_string();
+        read.err().map(|e| format!("{path} does not read ({})", why(e)))
+    })
+}
+
+/// Whether a statement brings views and macros the engine makes, read from
+/// the engine once it has run: an `ATTACH` but of a SQLite file
+/// (`attaches_sqlite`), whose views are SQLite's, so that reading its
+/// catalog, which waits on its file, is spared, and so is harbor's own
+/// question whether one reads; an `IMPORT DATABASE`; and a `COPY FROM
+/// DATABASE`.
+fn brings_views(sql: &str) -> bool {
+    match acting_keyword(sql).as_str() {
+        "ATTACH" => !attaches_sqlite(sql),
+        "IMPORT" => true,
+        "COPY" => {
+            let mut tokens = Vec::new();
+            names_in_order(sql, &mut tokens);
+            let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(t)) if t == w.as_bytes());
+            tokens
+                .iter()
+                .position(|t| word(Some(t), "copy"))
+                .is_some_and(|at| word(tokens.get(at + 1), "from") && word(tokens.get(at + 2), "database"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an `ATTACH` attaches a SQLite file, as the engine reads the
+/// statement: a path led by `sqlite:`, or a `TYPE sqlite` option. A
+/// database named `sqlite` is not one.
+fn attaches_sqlite(sql: &str) -> bool {
+    let sqlite = |name: &[u8]| name == b"sqlite" || name == b"sqlite3";
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let plain = wire::scan::plain_spaces(sql.as_bytes());
+    let bytes = &*plain;
+    let (mut path, mut after_type) = (true, false);
+    for span in wire::scan::spans(bytes) {
+        let text = &bytes[span.start..span.end];
+        match span.kind {
+            wire::scan::Kind::Code => {
+                for word in text.split(|&c| !is_word(c)).filter(|w| !w.is_empty()) {
+                    let word = word.to_ascii_lowercase();
+                    if after_type && sqlite(&word) {
+                        return true;
+                    }
+                    after_type = word == b"type";
+                }
+            }
+            wire::scan::Kind::Str => {
+                let inner = text.get(1..text.len().saturating_sub(1)).unwrap_or_default().to_ascii_lowercase();
+                if path && text[0] == b'\'' {
+                    path = false;
+                    if inner.starts_with(b"sqlite:") || inner.starts_with(b"sqlite3:") {
+                        return true;
+                    }
+                } else if after_type && sqlite(&inner) {
+                    return true;
+                }
+                after_type = false;
+            }
+            wire::scan::Kind::LineComment | wire::scan::Kind::BlockComment => {}
+            wire::scan::Kind::Dollar => after_type = false,
+        }
+    }
+    false
+}
+
+/// What a `CREATE` or `ALTER` makes, by its last name part, lowercased.
+#[derive(Debug, PartialEq, Eq)]
+enum Made {
+    /// A view or a macro, whose body is the statement.
+    Body(Vec<u8>),
+    /// A view renamed.
+    Renamed { from: Vec<u8>, to: Vec<u8> },
+}
+
+/// The view or macro a statement makes: `CREATE [OR REPLACE] [TEMP |
+/// TEMPORARY] [RECURSIVE] VIEW | MACRO | FUNCTION [IF NOT EXISTS] name`,
+/// or `ALTER VIEW [IF EXISTS] name RENAME TO name`, a name being one to
+/// three parts, each a word or a quoted name; or the prepared statement a
+/// `PREPARE name AS` makes, which `EXECUTE name` runs.
+fn made_name(sql: &str) -> Option<Made> {
+    let mut tokens = Vec::new();
+    names_in_order(sql, &mut tokens);
+    let mut at = 0;
+    let word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(t)) if t == w.as_bytes());
+    let name = |at: &mut usize| -> Option<Vec<u8>> {
+        let mut last = None;
+        loop {
+            match tokens.get(*at) {
+                Some(Token::Word(n) | Token::Quoted(n)) => last = Some(n.clone()),
+                _ => return last,
+            }
+            *at += 1;
+            if !matches!(tokens.get(*at), Some(Token::Dot)) {
+                return last;
+            }
+            *at += 1;
+        }
+    };
+    if word(at, "create") {
+        at += 1;
+        if word(at, "or") && word(at + 1, "replace") {
+            at += 2;
+        }
+        if word(at, "temp") || word(at, "temporary") {
+            at += 1;
+        }
+        if word(at, "recursive") {
+            at += 1;
+        }
+        if !(word(at, "view") || word(at, "macro") || word(at, "function")) {
+            return None;
+        }
+        at += 1;
+        if word(at, "if") && word(at + 1, "not") && word(at + 2, "exists") {
+            at += 3;
+        }
+        return name(&mut at).map(Made::Body);
+    }
+    if word(at, "prepare") {
+        at += 1;
+        return name(&mut at).map(Made::Body);
+    }
+    if word(at, "alter") && word(at + 1, "view") {
+        at += 2;
+        if word(at, "if") && word(at + 1, "exists") {
+            at += 2;
+        }
+        let from = name(&mut at)?;
+        if !(word(at, "rename") && word(at + 1, "to")) {
+            return None;
+        }
+        at += 2;
+        let to = name(&mut at)?;
+        return Some(Made::Renamed { from, to });
+    }
+    None
+}
+
+/// The database a `DETACH [DATABASE] [IF EXISTS] name` names, lowercased.
+fn detached_name(sql: &str) -> Option<Vec<u8>> {
+    if acting_keyword(sql) != "DETACH" {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    names_in_order(sql, &mut tokens);
+    let word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(t)) if t == w.as_bytes());
+    let mut at = 1;
+    if word(at, "database") {
+        at += 1;
+    }
+    if word(at, "if") && word(at + 1, "exists") {
+        at += 2;
+    }
+    match tokens.get(at) {
+        Some(Token::Word(name) | Token::Quoted(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The database an `ATTACH` names, lowercased: the name after `AS`, else
+/// the file's name without its extension, as the engine names it.
+fn attached_name(sql: &str) -> Option<Vec<u8>> {
+    if acting_keyword(sql) != "ATTACH" {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let spans = wire::scan::scan(sql);
+    let at = spans.iter().position(|s| matches!(s.kind, wire::scan::Kind::Str) && bytes[s.start] == b'\'')?;
+    let path = &spans[at];
+    let after = &sql[path.end..];
+    let mut tokens = Vec::new();
+    names_in_order(after, &mut tokens);
+    match (tokens.first(), tokens.get(1)) {
+        (Some(Token::Word(w)), Some(Token::Word(name) | Token::Quoted(name))) if w == b"as" => Some(name.clone()),
+        _ => {
+            let quoted = sql[path.start + 1..path.end.saturating_sub(1).max(path.start + 1)].replace("''", "'");
+            let file = quoted.rsplit(['/', '\\']).next().unwrap_or_default();
+            let file = file.split_once(':').map_or(file, |(_, rest)| rest);
+            let stem = file.split('.').next().unwrap_or_default();
+            (!stem.is_empty()).then(|| stem.to_ascii_lowercase().into_bytes())
+        }
+    }
+}
+
+/// Whether an `ATTACH` replaces a database of its name: `ATTACH OR
+/// REPLACE`.
+fn replaces(sql: &str) -> bool {
+    let mut tokens = Vec::new();
+    names_in_order(sql, &mut tokens);
+    let word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(t)) if t == w.as_bytes());
+    (0..tokens.len()).find(|&at| word(at, "attach")).is_some_and(|at| word(at + 1, "or") && word(at + 2, "replace"))
+}
+
+/// Whether a database is attached as `name`, lowercased, on `conn`.
+fn attached(conn: &mut Connection, name: &[u8]) -> bool {
+    let name = wire::open::quote_literal(&String::from_utf8_lossy(name));
+    conn.query_strings(&format!("SELECT count(*)::VARCHAR FROM duckdb_databases() WHERE lower(database_name) = {name}"))
+        .is_ok_and(|rows| rows.first().is_some_and(|n| n != "0"))
+}
+
+/// A statement's leading tokens, as `made_name`, `detached_name` and
+/// `attached_name` read them.
+enum Token {
+    Word(Vec<u8>),
+    Quoted(Vec<u8>),
+    Dot,
+    Other,
+}
+
+/// The tokens of `sql`'s code and quoted names, lowercased, in order, with
+/// comments passed over; reading stops at the first string, which no name
+/// `made_name` reads comes after.
+fn names_in_order(sql: &str, tokens: &mut Vec<Token>) {
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let plain = wire::scan::plain_spaces(sql.as_bytes());
+    let bytes = &*plain;
+    for span in wire::scan::spans(bytes) {
+        let text = &bytes[span.start..span.end];
+        match span.kind {
+            wire::scan::Kind::Code => {
+                let mut i = 0;
+                while i < text.len() {
+                    let c = text[i];
+                    if is_word(c) {
+                        let start = i;
+                        while i < text.len() && is_word(text[i]) {
+                            i += 1;
+                        }
+                        tokens.push(Token::Word(text[start..i].to_ascii_lowercase()));
+                        continue;
+                    }
+                    if c == b'.' {
+                        tokens.push(Token::Dot);
+                    } else if !c.is_ascii_whitespace() {
+                        tokens.push(Token::Other);
+                    }
+                    i += 1;
+                }
+            }
+            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) => {
+                let quote = text[0];
+                let inner = text[1..].strip_suffix(&[quote]).unwrap_or(&text[1..]);
+                let doubled = [quote, quote];
+                let mut name = Vec::with_capacity(inner.len());
+                let mut i = 0;
+                while i < inner.len() {
+                    name.push(inner[i]);
+                    i += if inner[i..].starts_with(&doubled) { 2 } else { 1 };
+                }
+                tokens.push(Token::Quoted(name.to_ascii_lowercase()));
+            }
+            wire::scan::Kind::LineComment | wire::scan::Kind::BlockComment => {}
+            _ => return,
+        }
+    }
 }
 
 /// The gate as a statement holds it: one guard or the other, or neither.
-/// Held, never read; dropped when the statement is over.
+/// Held, and asked only which it is; dropped when the statement is over.
 #[allow(dead_code)]
 enum Passed {
     Open,
@@ -3981,17 +5476,57 @@ enum Passed {
     Changing(RwLockWriteGuard<'static, ()>),
 }
 
-/// Pass the gate for the statement running on `slot`. A reader waits on an
-/// attach or detach, and gives up when the statement is cancelled while it
-/// waits: by its client, by leaving or by a deadline. One that attaches or
-/// detaches waits for the readers running, each a catalog read the engine
-/// answers from memory or a database's file, and readers that come after it
-/// wait for it.
-fn pass_gate(gate: Gate, slot: &SlotState) -> Option<Passed> {
+/// Pass the gate for `sql`, the statement running on `slot`. A reader
+/// waits on an attach or detach, and gives up when the statement is
+/// cancelled while it waits: by its client, by leaving or by a deadline.
+/// One that attaches or detaches waits for the readers running, each a
+/// catalog read the engine answers from memory or a database's file, and
+/// readers that come after it wait for it.
+///
+/// While the names are not all known (`CatalogNames::complete`), every
+/// statement is a reader, and a long one would hold an ATTACH, and every
+/// reader after it, for as long as it runs. So a reader waits for a listing
+/// begun (`LEARNING`) and passes as the names it learned say; and an ATTACH
+/// or DETACH does not keep readers out while it waits, but asks for the
+/// names beside them (`learn_beside`), and waits as any once they are
+/// known, or once it has asked for [`ASK_BESIDE`] and asking cannot learn
+/// them for now: readers that overlap would otherwise keep it out for as
+/// long as they came, and the names may not read for longer, while a SQLite
+/// file stays locked.
+fn pass_gate(sql: &str, slot: &SlotState) -> Option<Passed> {
+    let gate = catalog_gate(sql);
+    let mut unknown = gate == Gate::Reads && !names_complete();
+    let asking = Instant::now();
     match gate {
         Gate::Open => Some(Passed::Open),
-        Gate::Changes => Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner))),
+        Gate::Changes => loop {
+            if names_complete() {
+                return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
+            }
+            match CATALOG_GATE.try_write() {
+                Ok(guard) => return Some(Passed::Changing(guard)),
+                Err(TryLockError::Poisoned(p)) => return Some(Passed::Changing(p.into_inner())),
+                Err(TryLockError::WouldBlock) if slot.cancelled() => return None,
+                Err(TryLockError::WouldBlock) if !learn_beside() && asking.elapsed() >= ASK_BESIDE => {
+                    return Some(Passed::Changing(CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)));
+                }
+                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            }
+        },
         Gate::Reads => loop {
+            if unknown && LEARNING.load(Ordering::SeqCst) > 0 {
+                if slot.cancelled() {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if unknown && names_complete() {
+                unknown = false;
+                if catalog_gate(sql) == Gate::Open {
+                    return Some(Passed::Open);
+                }
+            }
             match CATALOG_GATE.try_read() {
                 Ok(guard) => return Some(Passed::Reading(guard)),
                 Err(TryLockError::Poisoned(p)) => return Some(Passed::Reading(p.into_inner())),
@@ -4006,6 +5541,12 @@ fn pass_gate(gate: Gate, slot: &SlotState) -> Option<Passed> {
 /// executors: the workspace's record, written as the server stops.
 pub(crate) fn reading_catalog() -> RwLockReadGuard<'static, ()> {
     CATALOG_GATE.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The gate held alone, for harbor's own attaching off the pool's
+/// executors: the workspace's SQLite files, attached in the background.
+pub(crate) fn changing_catalog() -> RwLockWriteGuard<'static, ()> {
+    CATALOG_GATE.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Final rollback during server shutdown, before returning connections.
@@ -4079,6 +5620,7 @@ fn run_statement(
     ready: mpsc::SyncSender<Result<(), Refusal>>,
     body: mpsc::SyncSender<Vec<u8>>,
     started: Instant,
+    ended: &mut bool,
 ) -> bool {
     // Decided from the statement text before it runs, then widened below by
     // any path that ends the job early.
@@ -4147,7 +5689,14 @@ fn run_statement(
     // any statement whose result holds no VARIANT, and refuses the rest
     // rather than send display text under a schema line that promised JSON.
     let json = conn.json();
-    let wanted = || !on_slot.slot.cancelled();
+    // A retained statement (see `SlotRun::retained`) is awaited until its
+    // first fetch comes back.
+    let mut awaiting = false;
+    let wanted = |retained| {
+        let wanted = on_slot.slot.submitted(retained);
+        awaiting = wanted && retained;
+        wanted
+    };
     let mut stream = match conn.execute(last, bound, wanted) {
         Ok(Some(s)) => s,
         Ok(None) => {
@@ -4155,6 +5704,11 @@ fn run_statement(
             return needs_reset;
         }
         Err(e) => {
+            // A group's first step failed (`Conn::execute`): what it did
+            // is the error's, as at a first fetch below.
+            if awaiting && !e.interrupted() {
+                on_slot.slot.keep();
+            }
             let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
             return true;
         }
@@ -4165,6 +5719,9 @@ fn run_statement(
         Ok(j) => Some(j),
         Err(e) => {
             if columns.iter().any(|(_, ty)| crate::engine::encode::holds_variant(ty)) {
+                if awaiting && stream.stop() {
+                    on_slot.slot.keep();
+                }
                 drop(stream);
                 let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
                 return needs_reset;
@@ -4179,6 +5736,9 @@ fn run_statement(
     // to be a 400 rather than a 200 with an apology inside it. The
     // handshake therefore moves to the bottom of the loop in that shape.
     if shape == Shape::Ndjson && ready.send(Ok(())).is_err() {
+        if awaiting && stream.stop() {
+            on_slot.slot.keep();
+        }
         return true;
     }
 
@@ -4223,13 +5783,44 @@ fn run_statement(
         // A fetch failure is the SQL-failed / cancelled path: v2 reports a
         // cancellation as ERROR_RUNTIME_INTERRUPT on the fetch, and only the
         // slot knows which of the two this was.
-        let fetched = stream.next_chunk().and_then(|next| match next {
+        let next = stream.next_chunk();
+        // A retained statement's first fetch: a chunk or its end says it
+        // ran to its end, and a cancel that fired at it stopped nothing.
+        // So does any error but the interrupt, which is the statement's own
+        // and may follow work that was kept: a commit is durable before the
+        // checkpoint that follows it fails. The client is told that error,
+        // and the canceller that its cancel stopped nothing.
+        if awaiting && next.as_ref().map_or_else(|e| !e.interrupted(), |_| true) {
+            on_slot.slot.keep();
+            awaiting = false;
+        }
+        let fetched = next.and_then(|next| match next {
             None => Ok(None),
             Some(chunk) => chunk.readers(columns.len()).map(|r| Some((chunk, r))),
         });
         let (chunk, readers) = match fetched {
             Ok(Some(pair)) => pair,
-            Ok(None) => break,
+            // The end, where the statement is retired. One a canceller
+            // reached first is answered as cancelled: the engine can finish
+            // a streaming statement before the interrupt lands, and the
+            // canceller was told it stopped it, which holds, since a stream
+            // keeps nothing of what it read. A retained statement was kept
+            // at its first fetch, and no cancel reaches it after that.
+            Ok(None) => {
+                if !on_slot.finish() {
+                    break;
+                }
+                cut_short = true;
+                let refusal = Refusal::cancelled();
+                if shape == Shape::Ndjson {
+                    push_error(&mut buf, refusal.code, &refusal.message);
+                    buf.push('\n');
+                    let _ = body.send(std::mem::take(&mut buf).into_bytes());
+                    gone = true;
+                }
+                failure = Some(refusal);
+                break;
+            }
             Err(e) => {
                 // Retired here rather than after the loop, because what the
                 // client is told depends on the answer: the same DuckDB
@@ -4362,6 +5953,7 @@ fn run_statement(
 
     // An abandoned or failed stream is the case that poisons a connection.
     needs_reset = needs_reset || gone || failure.is_some();
+    *ended = !gone && failure.is_none();
 
     match shape {
         Shape::Ndjson => {
@@ -4421,7 +6013,7 @@ fn execute_jobs(
     // including when a released lease is assigned to another caller.
     let mut must_reset = false;
     for job in jobs {
-        let Job { sql, params, shape, id, deadline, reset, ready, body } = job;
+        let Job { sql, params, shape, id, deadline, reset, ready, body, claims } = job;
         must_reset |= reset || (needs_reset && !pinned);
         if must_reset {
             if let Err(e) = conn.reset() {
@@ -4494,12 +6086,24 @@ fn execute_jobs(
         // An ATTACH or DETACH runs alone against the catalog's readers
         // (CATALOG_GATE). A reader cancelled while it waits did not run, and
         // its transaction is left aborted, as for a cancel before it began.
-        let Some(_passed) = pass_gate(catalog_gate(&sql), &state) else {
+        // A view or macro the statement makes is known to the gate first,
+        // and the views an ATTACH brings are unknown until they are read.
+        learn_from_statement(&sql);
+        let brings = brings_views(&sql);
+        let probe = detached_name(&sql).or_else(|| attached_name(&sql)).is_some_and(|n| n.starts_with(PROBE.as_bytes()));
+        let Some(passed) = pass_gate(&sql, &state) else {
             on_slot.finish();
             conn.abort_transaction();
             let _ = ready.send(Err(Refusal::cancelled()));
             continue;
         };
+        if brings && matches!(passed, Passed::Changing(_)) {
+            CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).unsettle();
+        }
+        // An ATTACH of a name attached already changes it only when it
+        // replaces it: `IF NOT EXISTS` leaves it as it was.
+        let keeps = claims.is_some() && attached_name(&sql).is_some_and(|name| !replaces(&sql) && attached(&mut conn, &name));
+        let mut ended = false;
 
         // A panic below — an encoder invariant tripping, an FFI metadata
         // assert (the v2 paths return Err rather than panic, so this is the
@@ -4515,7 +6119,7 @@ fn execute_jobs(
         // job on a worker resets first.
         let ready_guard = ready.clone();
         needs_reset = match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started)
+            run_statement(&mut conn, &mut on_slot, sql, params, shape, ready, body, started, &mut ended)
         })) {
             Ok(next_reset) => next_reset,
             Err(_) => {
@@ -4531,6 +6135,21 @@ fn execute_jobs(
                 true
             }
         };
+        // After an ATTACH or DETACH, a probe's but, the views and macros
+        // are learned again when they are not all known (`learn_again`); the
+        // ones an import or a copy of a database brings, under the gate
+        // shared.
+        if let Some(claims) = claims {
+            let _ = claims.send(ended && !keeps);
+        }
+        match passed {
+            Passed::Changing(alone) if !probe => learn_again(alone),
+            passed if brings => {
+                let _reading = matches!(passed, Passed::Open).then(reading_catalog);
+                learn_on_learner();
+            }
+            _ => {}
+        }
     }
     // And once more on the way out, so a connection going back to the pool for
     // the next start() is clean too. Unconditional here: this runs once
@@ -4809,7 +6428,9 @@ mod tests {
 
     #[test]
     fn attaching_and_reading_the_catalog_pass_the_gate_apart() {
-        use super::{Gate, catalog_gate};
+        use super::{CatalogNames, Gate, gate_of};
+        let names = CatalogNames::listed();
+        let catalog_gate = |sql| gate_of(sql, &names);
         for sql in [
             "ATTACH '/x/a.sqlite' AS a (TYPE sqlite)",
             "  /* c */ detach a",
@@ -4845,6 +6466,208 @@ mod tests {
             "INSERT INTO attached VALUES (1)",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
+            // Every statement reads it while the names are not all known.
+            assert_eq!(gate_of(sql, &CatalogNames::default()), Gate::Reads, "{sql}");
+        }
+        assert_eq!(gate_of("DETACH a", &CatalogNames::default()), Gate::Changes);
+    }
+
+    #[test]
+    fn a_view_or_macro_whose_body_reads_the_catalog_reads_it() {
+        use super::{CatalogNames, Gate, Made, gate_of, made_name};
+        let mut names = CatalogNames::listed();
+        names.learn(b"v", "CREATE VIEW v AS SELECT * FROM duckdb_tables()");
+        names.learn(b"plain", "CREATE VIEW plain AS SELECT 1");
+        // Through another view, learned before or after the one it reads.
+        names.learn(b"w", "CREATE VIEW w AS SELECT * FROM \"Later\"");
+        names.learn(b"later", "CREATE VIEW later AS SELECT * FROM main.V");
+        names.learn(b"m", "CREATE MACRO m() AS TABLE SELECT * FROM information_schema.tables");
+        names.rename(b"v", b"renamed");
+        for sql in ["SELECT * FROM v", "select * from MAIN.\"V\"", "SELECT * FROM w", "FROM m()", "TABLE renamed"] {
+            assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
+        }
+        for sql in ["SELECT * FROM plain", "SELECT 'v'", "SELECT 1 -- v", "SELECT vv FROM t"] {
+            assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
+        }
+        // A statement in a string, run by query(), and a table named in one.
+        names.learn(b"q", "CREATE VIEW q AS SELECT * FROM query('SELECT * FROM duckdb_tables()')");
+        names.learn(b"p", "PREPARE p AS SELECT * FROM duckdb_columns()");
+        for sql in [
+            "SELECT count(*) FROM query('SELECT * FROM duckdb_tables()')",
+            "SELECT count(*) FROM query_table('v')",
+            "FROM q",
+            "EXECUTE p",
+            "SELECT * FROM query /* c */ ('SELECT 1')",
+            "SELECT * FROM \"Query\"\n-- c\n('SELECT 1')",
+            "SELECT * FROM main.query_table ( 'v' )",
+            "SELECT\u{a0}*\u{a0}FROM\u{a0}duckdb_tables()",
+        ] {
+            assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
+        }
+        // A column, alias or table named query is a name like any other.
+        names.learn(b"cols", "CREATE VIEW cols AS SELECT query, query_table FROM log");
+        for sql in [
+            "SELECT sum(hash(i)) AS query FROM range(10) t(i)",
+            "SELECT query, \"query_table\" FROM log WHERE query = '('",
+            "SELECT * FROM query",
+            "SELECT query -- (\nFROM log",
+            "FROM cols",
+        ] {
+            assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
+        }
+        // A view named query reads the catalog as any view does.
+        names.learn(b"query", "CREATE VIEW query AS SELECT * FROM duckdb_tables()");
+        assert_eq!(gate_of("SELECT * FROM query", &names), Gate::Reads);
+
+        let body = |name: &str| Some(Made::Body(name.as_bytes().to_vec()));
+        assert_eq!(made_name("CREATE VIEW v AS SELECT 1"), body("v"));
+        assert_eq!(made_name("create or replace temp view if not exists db.s.\"My \"\"V\"\"\" AS SELECT 1"), body("my \"v\""));
+        assert_eq!(made_name("CREATE /* c */ RECURSIVE VIEW `R`(n) AS SELECT 1"), body("r"));
+        assert_eq!(made_name("CREATE MACRO s.m(a) AS TABLE SELECT a"), body("m"));
+        assert_eq!(made_name("CREATE FUNCTION f(a) AS a + 1"), body("f"));
+        assert_eq!(made_name("PREPARE \"P\" AS SELECT 1"), body("p"));
+        assert_eq!(
+            made_name("ALTER VIEW IF EXISTS s.v RENAME TO w"),
+            Some(Made::Renamed { from: b"v".to_vec(), to: b"w".to_vec() })
+        );
+        for sql in ["CREATE TABLE v AS SELECT 1", "ALTER VIEW v SET SCHEMA s", "CREATE VIEW 'v' AS SELECT 1", "SELECT 1"] {
+            assert_eq!(made_name(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_names_that_read_the_catalog_settle_once_however_many() {
+        use super::{CatalogNames, used_names};
+        // A chain of twenty thousand views, each over the one before, the
+        // first over the catalog, listed last first, as the engine may
+        // list them: settled in one pass, where a pass per name is
+        // quadratic.
+        let mut learned: Vec<_> = (1..20_000)
+            .rev()
+            .map(|i| (format!("v{i}").into_bytes(), used_names(&format!("CREATE VIEW v{i} AS SELECT * FROM v{}", i - 1))))
+            .collect();
+        learned.push((b"v0".to_vec(), used_names("CREATE VIEW v0 AS SELECT * FROM duckdb_tables()")));
+        learned.push((b"plain".to_vec(), used_names("CREATE VIEW plain AS SELECT * FROM t")));
+        let mut names = CatalogNames::default();
+        names.learn_all(learned);
+        assert_eq!(names.reads.len(), 20_000);
+        assert!(names.reads.contains(b"v19999".as_slice()) && !names.reads.contains(b"plain".as_slice()));
+        // One learned later over the chain reads it too.
+        names.learn(b"top", "CREATE VIEW top AS SELECT * FROM v19999");
+        assert!(names.reads.contains(b"top".as_slice()));
+    }
+
+    #[test]
+    fn an_import_names_the_views_its_schema_makes() {
+        use super::{imported_statements, statements_of};
+        assert_eq!(
+            statements_of("CREATE VIEW a AS SELECT ';';\n-- ; x\nCREATE MACRO m() AS 1 ;\n\n"),
+            ["CREATE VIEW a AS SELECT ';'", "\n-- ; x\nCREATE MACRO m() AS 1 "]
+        );
+        let dir = std::env::temp_dir().join(format!("harbor-import-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("it's")).unwrap();
+        std::fs::write(dir.join("it's").join("schema.sql"), "CREATE TABLE t(a INTEGER);\nCREATE VIEW iv AS SELECT * FROM duckdb_tables();\n").unwrap();
+        let path = dir.join("it's").to_string_lossy().replace('\'', "''");
+        let statements = imported_statements(&format!("IMPORT DATABASE '{path}'"));
+        assert_eq!(statements.len(), 2);
+        assert!(statements[1].contains("CREATE VIEW iv"));
+        assert!(imported_statements("IMPORT DATABASE '/no/such/directory'").is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sqlite_file_that_is_busy_is_listed_as_last_read_and_one_gone_for_good_is_not() {
+        use super::{Busy, CatalogDatabase, STALE, for_good, stale_attached, workspace};
+        let here = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        let locked = "Failed to prepare query \"SELECT count(*) FROM sqlite_master\": database is locked";
+        assert!(!for_good(&here, locked));
+        assert!(!for_good("", locked));
+        assert!(for_good("/no/such/file.sqlite", locked));
+        assert!(for_good(&here, "Failed to prepare query: file is not a database"));
+        assert!(for_good(&here, "Unable to open database: unable to open database file"));
+
+        let entry = |name: &str, path: &str, tables: &[&str], error: Option<&str>| wire::catalog::Attached {
+            name: name.into(),
+            path: Some(path.into()),
+            storage: "sqlite".into(),
+            error: error.map(str::to_string),
+            tables: tables.iter().map(|t| wire::catalog::Table { name: t.to_string(), ..Default::default() }).collect(),
+            ..Default::default()
+        };
+        let last = [
+            entry("app", "/x/app.sqlite", &["people"], None),
+            entry("gone", "/x/gone.sqlite", &[], Some("/x/gone.sqlite: no such file")),
+            entry("moved", "/x/old.sqlite", &["t"], None),
+        ];
+        let database = |name: &str, path: &str, served: bool| CatalogDatabase {
+            name: name.into(),
+            path: Some(path.into()),
+            storage: if served { "duckdb".into() } else { "sqlite".into() },
+            read_only: false,
+            served,
+            aside: false,
+        };
+        let databases = [
+            database("app", "/x/app.sqlite", false),
+            database("main", "/x/main.duckdb", true),
+            database("moved", "/x/new.sqlite", false),
+            database("since", "/x/since.sqlite", false),
+        ];
+        let busy = [Busy { name: "app".into(), path: "/x/app.sqlite".into(), why: "database is locked".into() }];
+        let unattached = vec![workspace::Unattached {
+            record: wire::open::Record { name: "gone".into(), path: "/x/gone.sqlite".into(), storage: "sqlite".into(), read_only: false },
+            reason: "/x/gone.sqlite: no such file".into(),
+        }];
+        let listed: Vec<_> = stale_attached(&last, &databases, &busy, unattached)
+            .into_iter()
+            .map(|a| (a.name, a.tables.into_iter().map(|t| t.name).collect::<Vec<_>>(), a.error))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("app".to_string(), vec!["people".to_string()], Some(format!("database is locked: {STALE}"))),
+                ("gone".to_string(), vec![], Some("/x/gone.sqlite: no such file".to_string())),
+                // Attached from another file since: nothing of the last read is its.
+                ("moved".to_string(), vec![], None),
+                ("since".to_string(), vec![], None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_detach_names_its_database_and_a_sqlite_attach_brings_no_views() {
+        use super::{brings_views, detached_name};
+        assert_eq!(detached_name("DETACH app"), Some(b"app".to_vec()));
+        assert_eq!(detached_name("/* x */ detach database if exists \"My App\""), Some(b"my app".to_vec()));
+        assert_eq!(detached_name("SELECT 1"), None);
+        use super::attached_name;
+        assert_eq!(attached_name("ATTACH '/x/a.sqlite' AS App (TYPE sqlite)"), Some(b"app".to_vec()));
+        assert_eq!(attached_name("attach database if not exists '/x/a.db' as \"My App\""), Some(b"my app".to_vec()));
+        assert_eq!(attached_name("ATTACH '/x/Some.File.duckdb'"), Some(b"some".to_vec()));
+        assert_eq!(attached_name("ATTACH 'sqlite:/x/b.db' (READ_ONLY)"), Some(b"b".to_vec()));
+        assert_eq!(attached_name("DETACH a"), None);
+        for sql in [
+            "ATTACH '/x/a.duckdb' AS a",
+            "ATTACH 'sqlite.duckdb'",
+            "ATTACH '/x/a.duckdb' AS sqlite",
+            "ATTACH '/x/sqlite' AS \"sqlite\" (READ_ONLY) -- TYPE sqlite",
+            "ATTACH '/x/a.duckdb' AS a (TYPE duckdb, READ_ONLY)",
+            "IMPORT DATABASE '/x/export'",
+            "COPY FROM DATABASE a TO b",
+            "explain analyze copy from database a to b (schema)",
+        ] {
+            assert!(brings_views(sql), "{sql}");
+        }
+        for sql in [
+            "ATTACH '/x/a.db' AS a (TYPE sqlite, READ_ONLY)",
+            "ATTACH '/x/a.db' AS a (READ_ONLY, type SQLITE3)",
+            "ATTACH '/x/a.db' AS a (TYPE 'sqlite')",
+            "ATTACH 'sqlite:/x/a.db' AS a",
+            "DETACH a",
+            "COPY t FROM 'x.csv'",
+            "SELECT 1",
+        ] {
+            assert!(!brings_views(sql), "{sql}");
         }
     }
 
@@ -4888,7 +6711,7 @@ mod tests {
         let (body, _output) = std::sync::mpsc::sync_channel(1);
         super::run_statement(&mut conn, &mut slot,
             "CREATE TABLE must_not_exist(x INTEGER); SELECT 1".into(), vec![],
-            super::Shape::Json, ready, body, Instant::now());
+            super::Shape::Json, ready, body, Instant::now(), &mut false);
         assert_eq!(result.recv().unwrap().err().unwrap().status, 400);
         assert!(conn.execute_batch("SELECT * FROM must_not_exist").is_err());
     }
@@ -4914,7 +6737,7 @@ mod tests {
             let (body, output) = sync_channel(super::BODY_QUEUE);
             jobs.send(super::Job {
                 sql: sql.into(), params: vec![], shape: super::Shape::Ndjson, id: super::next_job_id(),
-                deadline: None, reset: false, ready, body,
+                deadline: None, reset: false, ready, body, claims: None,
             }).unwrap();
             match answered.recv().unwrap() {
                 Err(refusal) => Err((refusal.status, refusal.message)),
@@ -5004,7 +6827,7 @@ mod tests {
             let (ready, result) = sync_channel(1);
             let (body, _output) = sync_channel(1);
             super::run_statement(conn, &mut slot, sql.into(), vec![], super::Shape::Json,
-                ready, body, Instant::now());
+                ready, body, Instant::now(), &mut false);
             result.recv().unwrap().err().unwrap().status
         };
         assert_eq!(cancelled(&mut conn, 1, "INSERT INTO m VALUES (2)"), 499);
@@ -5027,7 +6850,7 @@ mod tests {
             let (ready, result) = sync_channel(1);
             let (body, output) = sync_channel(4);
             jobs.send(super::Job { sql: sql.into(), params: vec![], shape: super::Shape::Json, id,
-                deadline: None, reset: false, ready, body }).unwrap();
+                deadline: None, reset: false, ready, body, claims: None }).unwrap();
             answers.push((result, output));
         }
         drop(jobs);
@@ -5042,6 +6865,144 @@ mod tests {
         assert!(answers.next().unwrap().0.is_ok());
         let (answer, body) = answers.next().unwrap();
         assert!(answer.is_ok() && body.contains(r#""data":[[0]]"#), "{body}");
+    }
+
+    /// A cancel is answered true only when it stopped its statement and
+    /// nothing of it was kept. An autocommit INSERT has run and committed by
+    /// the time its first chunk comes back, its RETURNING rows included, so
+    /// a cancel the engine did not reach in time is answered false, and the
+    /// statement as what it did. Cancels are asked until answered, from a
+    /// little later each time, across the statement's life.
+    #[test]
+    fn a_cancel_is_answered_true_only_when_nothing_was_kept() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::sync_channel};
+        if crate::engine::engine().is_err() { return; }
+        let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        conn.execute_batch("CREATE TABLE r(k INTEGER, i BIGINT)").unwrap();
+        let state = super::SlotState::new(conn.interrupt_handle());
+        let (mut stopped, mut kept) = (0, 0);
+        for k in 0..400u64 {
+            let id = super::next_job_id();
+            let returning = if k % 2 == 1 { " RETURNING i" } else { "" };
+            let sql = format!("INSERT INTO r SELECT {k}, i FROM range(5000) t(i){returning}");
+            state.begin(id, None);
+            let over = Arc::new(AtomicBool::new(false));
+            let canceller = {
+                let (state, over) = (Arc::clone(&state), Arc::clone(&over));
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_micros(k * 13 % 1500));
+                    loop {
+                        if state.cancel_and_say(id) {
+                            return true;
+                        }
+                        if over.load(Ordering::SeqCst) {
+                            return false;
+                        }
+                    }
+                })
+            };
+            let mut slot = super::OnSlot { slot: &state, done: false };
+            let (ready, result) = sync_channel(1);
+            let (body, _output) = sync_channel(1);
+            super::run_statement(&mut conn, &mut slot, sql, vec![], super::Shape::Json,
+                ready, body, Instant::now(), &mut false);
+            drop(slot);
+            over.store(true, Ordering::SeqCst);
+            let said = canceller.join().unwrap();
+            let answer = result.recv().unwrap().map_err(|r| r.status);
+            let rows = conn.query_strings(&format!("SELECT count(*)::VARCHAR FROM r WHERE k = {k}")).unwrap();
+            if said {
+                stopped += 1;
+                assert_eq!((answer, rows[0].as_str()), (Err(499), "0"), "run {k}: told it was cancelled");
+            } else {
+                kept += 1;
+                assert_eq!((answer, rows[0].as_str()), (Ok(()), "5000"), "run {k}: told it was not");
+            }
+        }
+        // Both answers were given, or the test proved nothing about one.
+        assert!(stopped > 0 && kept > 0, "{stopped} stopped, {kept} kept");
+    }
+
+    /// A retained statement whose first fetch fails with an error of its own
+    /// is answered that error, and its canceller false: only the interrupt
+    /// says the cancel stopped it. The slot's interrupt is aimed at another
+    /// connection, as one the engine loses is, so the statement runs on to
+    /// its error with a cancel fired at it.
+    #[test]
+    fn a_cancel_is_answered_true_only_for_the_interrupt() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::sync_channel};
+        if crate::engine::engine().is_err() { return; }
+        let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        let elsewhere = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        conn.execute_batch("CREATE TABLE e(i BIGINT)").unwrap();
+        let state = super::SlotState::new(elsewhere.interrupt_handle());
+        let id = super::next_job_id();
+        state.begin(id, None);
+        let over = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let (state, over) = (Arc::clone(&state), Arc::clone(&over));
+            std::thread::spawn(move || {
+                while !state.run.lock().unwrap().retained {
+                    if over.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    std::thread::yield_now();
+                }
+                Some(state.cancel_and_say(id))
+            })
+        };
+        let sql = "INSERT INTO e SELECT CASE WHEN i = 30000000 THEN error('boom') ELSE i END \
+                   FROM range(30000001) t(i)";
+        let mut slot = super::OnSlot { slot: &state, done: false };
+        let (ready, result) = sync_channel(1);
+        let (body, _output) = sync_channel(1);
+        super::run_statement(&mut conn, &mut slot, sql.into(), vec![], super::Shape::Json,
+            ready, body, Instant::now(), &mut false);
+        drop(slot);
+        over.store(true, Ordering::SeqCst);
+        let said = canceller.join().unwrap();
+        let answer = result.recv().unwrap().map_err(|r| (r.status, r.message));
+        let (status, message) = answer.unwrap_err();
+        assert!(status == 400 && message.contains("boom"), "{status} {message}");
+        assert_eq!(said, Some(false), "the cancel was answered true for the statement's own error");
+        assert_eq!(conn.query_strings("SELECT count(*)::VARCHAR FROM e").unwrap(), ["0"]);
+    }
+
+    /// A stop fires the reaper's re-fire itself while it waits for the
+    /// executors: a cancel the engine lost would otherwise make it wait
+    /// the statement out. The lost cancel is a slot marked cancelled with no
+    /// interrupt fired.
+    #[test]
+    fn a_stop_fires_again_a_cancel_the_engine_lost() {
+        use std::sync::{Arc, mpsc::sync_channel};
+        if crate::engine::engine().is_err() { return; }
+        let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        let state = super::SlotState::new(conn.interrupt_handle());
+        let (ready, result) = sync_channel(1);
+        let executor = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                state.begin(super::next_job_id(), None);
+                let mut slot = super::OnSlot { slot: &state, done: false };
+                let (body, _output) = sync_channel(1);
+                super::run_statement(&mut conn, &mut slot,
+                    "SELECT count(*) FROM range(1000000000000) t(i) WHERE i % 7 = 3".into(),
+                    vec![], super::Shape::Json, ready, body, Instant::now(), &mut false);
+                drop(slot);
+                Some(conn)
+            })
+        };
+        while state.current_job() == 0 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        state.run.lock().unwrap().cancelled = true;
+        let started = Instant::now();
+        let mut pool = Vec::new();
+        let left = super::drain(vec![executor], &[Arc::clone(&state)], &mut pool, Duration::from_secs(8));
+        assert!(left.is_empty() && pool.len() == 1, "the stop waited out its patience");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(result.recv().unwrap().err().unwrap().status, 499);
     }
 
     #[test]
@@ -5164,6 +7125,40 @@ mod tests {
         let mut run = SlotRun::idle();
         assert_eq!(run.arm(Some(4)), Cancel::Held);
         assert!(run.begin(4, None), "job 4 ran despite being cancelled before it started");
+    }
+
+    /// A retained statement's cancel is told by its first fetch. One that
+    /// fired and came too late is cleared, stopped nothing and says so, and
+    /// nothing reaches the statement after it; one the statement ended on is
+    /// told it stopped it.
+    #[test]
+    fn a_retained_statement_tells_its_canceller_what_happened() {
+        use std::sync::{Arc, OnceLock};
+        let mut run = SlotRun::idle();
+        run.begin(3, None);
+        assert!(run.submitted(true));
+        assert_eq!(run.arm(Some(3)), Cancel::Fire);
+        let told = Arc::clone(run.told.get_or_insert_with(Arc::<OnceLock<bool>>::default));
+        run.keep();
+        assert_eq!(told.get(), Some(&false));
+        assert_eq!(run.arm(Some(3)), Cancel::Nothing, "a kept statement was cancelled");
+        assert!(!run.end(), "a kept statement reported itself cancelled");
+
+        run.begin(4, None);
+        assert!(run.submitted(true));
+        assert_eq!(run.arm(None), Cancel::Fire);
+        let told = Arc::clone(run.told.get_or_insert_with(Arc::<OnceLock<bool>>::default));
+        assert!(run.end());
+        assert_eq!(told.get(), Some(&true));
+
+        // A cancel that reached the statement before it was submitted keeps
+        // it from running, and a slot with nothing running retains nothing.
+        run.begin(5, None);
+        assert_eq!(run.arm(Some(5)), Cancel::Fire);
+        assert!(!run.submitted(true));
+        assert!(run.end());
+        assert!(run.submitted(true));
+        assert!(!run.retained);
     }
 
     #[test]

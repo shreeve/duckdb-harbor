@@ -236,6 +236,11 @@ impl Error {
 }
 
 impl Error {
+    /// The engine's answer to an interrupt, and nothing else.
+    pub fn interrupted(&self) -> bool {
+        self.code == ffi::ERROR_RUNTIME_INTERRUPT
+    }
+
     /// The client-facing text: the engine's rendered message when there is
     /// one, the structured code when there is not.
     pub fn into_text(self) -> String {

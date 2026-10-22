@@ -515,6 +515,23 @@ mod tests {
         head.lines().next().unwrap_or_default().to_string()
     }
 
+    /// The error of a request to a loopback port just closed, which the
+    /// kernel refuses. Any process may take the port between its close and
+    /// the connect, as another test's server binding a fresh port can, and a
+    /// request that reaches a listener is tried again on another port. A
+    /// port held open without listening is no answer: macOS drops the
+    /// connect's SYN, and the connect times out.
+    fn refused(timeout: Option<Duration>) -> io::Error {
+        for _ in 0..20 {
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap();
+            match request(&Transport::Tcp(port.to_string()), &wire::endpoint::READY, None, timeout) {
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return e,
+                _ => {}
+            }
+        }
+        panic!("twenty closed ports in a row were taken before the connect");
+    }
+
     /// A server on a fresh port that answers one request with `reply`.
     pub(crate) fn one_shot(reply: &'static str) -> (Transport, JoinHandle<String>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -534,11 +551,8 @@ mod tests {
             assert!(was_not_sent(&e), "{e}");
             assert!(matches!(Failure::from(e), Failure::Unsent(_)));
         }
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap();
         for timeout in [None, Some(Duration::from_secs(1))] {
-            let e = request(&Transport::Tcp(port.to_string()), &wire::endpoint::READY, None, timeout)
-                .err()
-                .unwrap();
+            let e = refused(timeout);
             assert!(was_not_sent(&e), "{e}");
         }
 

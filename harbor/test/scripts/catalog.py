@@ -114,10 +114,10 @@ def free_port():
     return port
 
 
-def start_server(db, port):
+def start_server(db, port, workers=2):
     log = open(db + ".log", "w")
     proc = subprocess.Popen(
-        [*LAUNCHER, db, "start", "--port", str(port), "--workers", "2"],
+        [*LAUNCHER, db, "start", "--port", str(port), "--workers", str(workers)],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL,
     )
     base = f"http://127.0.0.1:{port}"
@@ -257,6 +257,16 @@ def main():
     try:
         sqlite_ok = run_views(base, work)
         run_race(base, work, sqlite_ok)
+    finally:
+        stop_server(proc)
+        log.close()
+    busy = os.path.join(work, "busy.duckdb")
+    # Four workers: a long statement, an ATTACH that waits on it, and one more.
+    proc, base, log = start_server(busy, free_port(), workers=4)
+    try:
+        if sqlite_ok:
+            run_busy(base, work)
+            run_unlisted(base, work)
     finally:
         stop_server(proc)
         log.close()
@@ -646,7 +656,246 @@ def run_views(base, work):
     return sqlite_ok
 
 
-def run_race(base, work, sqlite_ok, rounds=200):
+def run_busy(base, work):
+    # -----------------------------------------------------------------------
+    section("An attached SQLite file that is busy, or gone for good")
+    # -----------------------------------------------------------------------
+    # The engine reads every attached database's catalog together, so one
+    # SQLite file locked, or not SQLite any more, fails every listing. A
+    # busy one stays attached, since the lock may be any connection's, the
+    # server's own long write among them, and the catalog is answered as
+    # the server last read it, the busy one saying why; with nothing read
+    # yet, the read is refused, naming it. One gone for good is detached
+    # and listed with why, and a client's is left for the client to attach.
+    import sqlite3
+    app = os.path.join(work, "busy.sqlite")
+    con = sqlite3.connect(app)
+    con.executescript("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO people (name) VALUES ('ann');")
+    con.commit()
+    con.close()
+    eq("a table of its own", None, sql(base, "CREATE TABLE own (i INTEGER)"))
+    eq("a SQLite file attaches, waiting two seconds on a lock", None,
+       sql(base, f"ATTACH '{app}' AS app (TYPE sqlite, BUSY_TIMEOUT 2000)"))
+    locker = sqlite3.connect(app, isolation_level=None)
+
+    def lock():
+        locker.execute("BEGIN EXCLUSIVE")
+
+    def release():
+        locker.execute("ROLLBACK")
+
+    def attached_now():
+        """None when app is attached, else why not."""
+        return sql(base, "SELECT CASE WHEN count(*) = 0 THEN error('app is not attached') END "
+                         "FROM duckdb_databases() WHERE database_name = 'app'")
+
+    lock()
+    st, body, _ = fetch(base, "/catalog")
+    message = json.loads(body or b"{}").get("message", "")
+    eq("locked before any catalog is read: a 400 that names it",
+       (400, True, True), (st, "app (" in message, "database is locked" in message))
+    release()
+    st, body, _ = fetch(base, "/catalog")
+    doc = json.loads(body)
+    eq("read once the lock is gone",
+       (200, [("app", ["people"], None)]), (st, [(a["name"], [t["name"] for t in a["tables"]], a["error"]) for a in doc["attached"]]))
+    last = doc
+
+    lock()
+    for style in ("", "?style=lite"):
+        started = time.time()
+        st, body, _ = fetch(base, "/catalog" + style)
+        took = time.time() - started
+        doc = json.loads(body)
+        a = (doc.get("attached") or [{}])[0]
+        error = a.get("error") or ""
+        eq(f"locked again{style}: a 200, as last read, the busy one saying why",
+           (200, [t["name"] for t in doc.get("tables", [])], "app", ["people"], True, True),
+           (st, ["own"], a.get("name"), [t["name"] for t in a.get("tables", [])],
+            "database is locked" in error, "may be stale" in error))
+        stale = doc.get("stale") or ""
+        eq(f"and the document says it may be stale{style}, naming the busy one, last",
+           (True, True, "stale"), ("may be stale" in stale, f"app ({app})" in stale, list(doc)[-1]))
+        if not style:
+            eq("and its columns as last read", last["attached"][0]["tables"], a.get("tables"))
+    started = time.time()
+    fetch(base, "/catalog")
+    took = time.time() - started
+    if took < 1:
+        ok("a read while it stays busy waits on it no longer", f"{took:.2f}s")
+    else:
+        bad("a read while it stays busy waits on it no longer", f"{took:.2f}s")
+    eq("and it stays attached for every connection", None, attached_now())
+    refused = sql(base, "SELECT count(*) FROM app.people") or ""
+    eq("where reading it waits on its lock", (True, False), ("locked" in refused, "does not exist" in refused))
+    release()
+    st, body, _ = fetch(base, "/catalog")
+    eq("the lock gone, it is read anew", (200, None, False),
+       (st, json.loads(body)["attached"][0]["error"], "stale" in json.loads(body)))
+    eq("and reads", None, sql(base, "SELECT count(*) FROM app.people"))
+    locker.close()
+
+    os.rename(app, app + ".away")
+    write_csv(app, "not a SQLite file, and long enough to be read as one: " * 4)
+    st, body, _ = fetch(base, "/catalog")
+    a = json.loads(body)["attached"][0]
+    eq("replaced by a file that is not SQLite: a 200, it detached and listed with why",
+       (200, "app", [], True, True),
+       (st, a["name"], a["tables"], "file is not a database" in (a["error"] or ""), "attach it again" in (a["error"] or "")))
+    eq("and gone from every connection", True, "app is not attached" in (attached_now() or ""))
+    os.replace(app + ".away", app)
+    a = json.loads(fetch(base, "/catalog")[1])["attached"][0]
+    eq("a client's attachment is not attached again by the server once it reads", (False, []),
+       (a["error"] is None, a["tables"]))
+    eq("a client's DETACH of it", None, sql(base, "DETACH IF EXISTS app"))
+    eq("forgets it", [], json.loads(fetch(base, "/catalog")[1])["attached"])
+    eq("and it attaches again", None, sql(base, f"ATTACH '{app}' AS app (TYPE sqlite, READ_ONLY)"))
+    eq("and lists", [["people"]], [[t["name"] for t in a["tables"]] for a in json.loads(fetch(base, "/catalog")[1])["attached"]])
+    os.rename(app, app + ".away")
+    a = json.loads(fetch(base, "/catalog")[1])["attached"][0]
+    eq("a read-only file deleted is detached and listed with why", (True, []),
+       ("unable to open" in (a["error"] or ""), a["tables"]))
+    os.replace(app + ".away", app)
+    sql(base, "DETACH IF EXISTS app")
+
+
+def run_unlisted(base, work, seconds=5):
+    # -----------------------------------------------------------------------
+    section("A view attached while a SQLite file is locked")
+    # -----------------------------------------------------------------------
+    # The server learns which views read the catalog from the engine's
+    # listing of them, which a locked SQLite file fails after its wait.
+    # Until a listing reads, every statement is kept apart from an ATTACH
+    # or DETACH, the ATTACH does not hold the others for the lock's wait,
+    # and the listing is read again at a later ATTACH or DETACH, beside the
+    # statements an ATTACH or DETACH waits for: a view
+    # attached meanwhile that reads the catalog, raced against a SQLite
+    # ATTACH/DETACH loop, does not bring the server down.
+    import sqlite3
+    import threading
+    app = os.path.join(work, "busy.sqlite")
+    other = os.path.join(work, "other.sqlite")
+    sqlite3.connect(other).close()
+    dv = os.path.join(work, "busy_views.duckdb")
+    subprocess.run(["duckdb", "-no-init", dv, "-c", "CREATE VIEW busy_catview AS SELECT count(*) n FROM duckdb_tables()"],
+                   check=True, stdout=subprocess.DEVNULL)
+    eq("a SQLite file attaches, waiting on a lock as the engine does", None,
+       sql(base, f"ATTACH '{app}' AS app (TYPE sqlite)"))
+    locker = sqlite3.connect(app, isolation_level=None)
+    locker.execute("BEGIN EXCLUSIVE")
+    eq("while it is locked, a DuckDB file with a view over the catalog attaches", None,
+       sql(base, f"ATTACH '{dv}' AS dv (READ_ONLY)"))
+    started = time.time()
+    sql(base, "SELECT count(*) FROM pragma_database_list")
+    took = time.time() - started
+    if took < 1:
+        ok("and a catalog read after it does not wait out the lock", f"{took:.2f}s")
+    else:
+        bad("and a catalog read after it does not wait out the lock", f"{took:.2f}s")
+    # An ATTACH and a long answer pipelined on one connection, while another
+    # statement holds the gate: the answer runs in its turn, after the
+    # ATTACH's is written, never beside it holding the gate the ATTACH waits
+    # for while its own answer waits behind the ATTACH's.
+    held = threading.Thread(target=sql, args=(base, "SELECT sum(hash(i)) FROM range(300000000) t(i)"))
+    held.start()
+    time.sleep(0.3)
+    piped = socket.create_connection(("127.0.0.1", int(base.rsplit(":", 1)[1])), timeout=30)
+
+    def post(statement, last=False):
+        body = json.dumps({"sql": statement}).encode()
+        close = b"Connection: close\r\n" if last else b""
+        return b"POST /sql HTTP/1.1\r\nHost: 127.0.0.1\r\n%sContent-Length: %d\r\n\r\n%s" % (close, len(body), body)
+
+    piped.sendall(post("ATTACH ':memory:' AS piped_mem")
+                  + post("SELECT i FROM range(200000) r(i)", last=True))
+    got = b""
+    try:
+        while chunk := piped.recv(65536):
+            got += chunk
+    except OSError:
+        pass
+    piped.close()
+    held.join(timeout=60)
+    eq("an ATTACH and a long answer pipelined behind it are both answered, whole",
+       (2, True), (got.count(b"HTTP/1.1 200"), b'"rowCount":200000' in got))
+    eq("and an ATTACH after them is answered", None, sql(base, "DETACH piped_mem"))
+    locker.execute("ROLLBACK")
+    locker.close()
+    # Not yet read again, every statement shares the gate, and a long one
+    # holds an ATTACH. The statements after the ATTACH do not wait for it:
+    # it asks for the views beside the long one, and they pass the gate by.
+    answers = {}
+
+    def timed(key, statement):
+        began = time.time()
+        answers[key] = (sql(base, statement), time.time() - began)
+
+    long = threading.Thread(target=timed, args=("long", "SELECT sum(hash(i)) FROM range(1000000000) t(i)"))
+    long.start()
+    time.sleep(0.5)
+    attach = threading.Thread(target=timed, args=("attach", "ATTACH ':memory:' AS busy_mem"))
+    attach.start()
+    time.sleep(0.3)
+    timed("after", "SELECT 42")
+    long.join(timeout=60)
+    attach.join(timeout=60)
+    refused, took = answers["after"]
+    if refused is None and took < 1:
+        ok("a statement after an ATTACH that waits on a long one does not wait", f"{took:.2f}s")
+    else:
+        bad("a statement after an ATTACH that waits on a long one does not wait", f"{took:.2f}s {refused}")
+    eq("and the ATTACH runs once the long one is over", (None, None),
+       (answers.get("attach", ("not answered",))[0], answers.get("long", ("not answered",))[0]))
+    sql(base, "DETACH IF EXISTS busy_mem")
+    stop = threading.Event()
+    counts, failures = [0, 0], []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                refused = sql(base, "SELECT n FROM dv.busy_catview")
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                failures.append(str(e))
+                return
+            if refused is not None:
+                failures.append(refused)
+            counts[0] += 1
+
+    def churner():
+        while not stop.is_set():
+            try:
+                for statement in (f"ATTACH '{other}' AS lite_other (TYPE sqlite)", "DETACH lite_other"):
+                    refused = sql(base, statement)
+                    if refused is not None:
+                        failures.append(refused)
+            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                failures.append(str(e))
+                return
+            counts[1] += 1
+
+    threads = [threading.Thread(target=reader, daemon=True), threading.Thread(target=reader, daemon=True),
+               threading.Thread(target=churner, daemon=True)]
+    for thread in threads:
+        thread.start()
+    time.sleep(seconds)
+    stop.set()
+    for thread in threads:
+        thread.join(timeout=30)
+    eq(f"the lock gone, {counts[0]} reads of the view raced against {counts[1]} SQLite ATTACH/DETACH: failures",
+       0, len(failures))
+    if failures:
+        print(f"     \033[2mfirst: {failures[0][:300]}\033[0m")
+    try:
+        alive = sql(base, "SELECT 42")
+    except (urllib.error.URLError, ConnectionError, OSError) as e:
+        alive = str(e)
+    eq("and the server answers after", None, alive)
+    if alive is None:
+        sql(base, "DETACH IF EXISTS dv")
+        sql(base, "DETACH IF EXISTS app")
+
+
+def run_race(base, work, sqlite_ok, rounds=300):
     # -----------------------------------------------------------------------
     section("A relation dropped while the catalog is read is left out")
     # -----------------------------------------------------------------------
@@ -665,6 +914,21 @@ def run_race(base, work, sqlite_ok, rounds=200):
     subprocess.run(["duckdb", "-no-init", churn, "-c", "CREATE TABLE c (i INTEGER); CHECKPOINT;"],
                    check=True, stdout=subprocess.DEVNULL)
     app = os.path.join(work, "app.sqlite")
+    # Readers whose statement names no catalog function and reads the
+    # catalog all the same: through query() and query_table(), through a
+    # view an IMPORT DATABASE makes, and through a view of a DuckDB file
+    # attached under the name sqlite.
+    export, own = os.path.join(work, "export"), os.path.join(work, "own.duckdb")
+    subprocess.run(["duckdb", "-no-init", os.path.join(work, "exported.duckdb"), "-c",
+                    "CREATE VIEW gate_iv AS SELECT * FROM duckdb_tables(); "
+                    f"EXPORT DATABASE '{export}'"], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["duckdb", "-no-init", own, "-c", "CREATE VIEW gate_ov AS SELECT * FROM duckdb_tables()"],
+                   check=True, stdout=subprocess.DEVNULL)
+    for statement in ("CREATE VIEW gate_v AS SELECT * FROM duckdb_tables()",
+                      "CREATE VIEW gate_q AS SELECT * FROM query('SELECT * FROM duckdb_tables()')",
+                      f"IMPORT DATABASE '{export}'",
+                      f"ATTACH '{own}' AS sqlite (READ_ONLY)"):
+        eq(f"set up: {statement[:40]}", None, sql(base, statement))
     stop = threading.Event()
     churned = [0, 0]
 
@@ -691,7 +955,12 @@ def run_race(base, work, sqlite_ok, rounds=200):
         thread.start()
     reads = ("/catalog", "/catalog?style=lite",
              "SELECT database_name, table_name, column_name FROM duckdb_columns()",
-             "SELECT * FROM sql_auto_complete('SELECT * FROM lite_')")
+             "SELECT * FROM sql_auto_complete('SELECT * FROM lite_')",
+             "SELECT count(*) FROM query('SELECT * FROM duckdb_tables()')",
+             "SELECT count(*) FROM gate_q",
+             "SELECT count(*) FROM query_table('gate_v')",
+             "SELECT count(*) FROM gate_iv",
+             "SELECT count(*) FROM sqlite.gate_ov")
     failures = []
     for i in range(rounds):
         read = reads[i % len(reads)]

@@ -379,13 +379,16 @@ pub fn restore(db: &Path, args: &[String]) -> Result<(), String> {
     // where the real one belongs: one would open, and be taken for the
     // thing restored. A restored database is a FILE, not a berth — nobody
     // asked for a server on it — so its server is stopped, folding the WAL
-    // in, before the file moves.
+    // in, before the file moves. A Ctrl-C is honored up to the move, the
+    // stop included; the move, once begun, runs to its end.
     let building = beside(&db, "restoring");
     let building_wal = PathBuf::from(format!("{}.wal", building.display()));
     let target = building.display().to_string();
-    let done = interruptible(&building, || harbor::repl::exec_quiet(&target, &sql, &spawn))
-        .and_then(|()| harbor::repl::shutdown(&building))
-        .and_then(|_| place(&building, &db));
+    let done = interruptible(&building, || {
+        harbor::repl::exec_quiet(&target, &sql, &spawn)?;
+        harbor::repl::shutdown(&building).map(drop)
+    })
+    .and_then(|()| place(&building, &db));
     if let Err(e) = done {
         let _ = harbor::repl::shutdown(&building);
         let _ = fs::remove_file(&building);
@@ -439,13 +442,15 @@ const INTERRUPTED: &str = "interrupted — nothing was restored";
 /// Run `work` with Ctrl-C bound to stopping the server that builds
 /// `building`: the statement under way is cancelled by the stop, quietly,
 /// since the cancel is this run's own, and the caller takes the file back
-/// out. A second Ctrl-C leaves at once.
+/// out. A second Ctrl-C leaves at once. Once `work` is done and no Ctrl-C
+/// came, one that comes is not honored and does not end the process: what
+/// follows is the move, which runs to its end once begun.
 fn interruptible(building: &Path, work: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use signal_hook::{consts::SIGINT, flag};
+    use signal_hook::{consts::SIGINT, flag, low_level};
     let interrupted = Arc::new(AtomicBool::new(false));
-    let _ = flag::register_conditional_shutdown(SIGINT, 130, interrupted.clone());
+    let leave = flag::register_conditional_shutdown(SIGINT, 130, interrupted.clone());
     let _ = flag::register(SIGINT, interrupted.clone());
     let finished = Arc::new(AtomicBool::new(false));
     let watcher = {
@@ -465,6 +470,14 @@ fn interruptible(building: &Path, work: impl FnOnce() -> Result<(), String>) -> 
     let done = work();
     finished.store(true, Ordering::Relaxed);
     let _ = watcher.join();
+    if interrupted.load(Ordering::Relaxed) {
+        return Err(INTERRUPTED.into());
+    }
+    // A Ctrl-C between the look above and this one is still honored; after
+    // it, a Ctrl-C only sets a flag nothing reads.
+    if let Ok(leave) = leave {
+        low_level::unregister(leave);
+    }
     if interrupted.load(Ordering::Relaxed) {
         return Err(INTERRUPTED.into());
     }
@@ -1527,5 +1540,24 @@ mod tests {
             let err = reformat(Path::new("/tmp"), &format!("COPY n FROM '{path}'"), &schema, format).unwrap_err();
             assert!(err.contains("either backup format"), "{err}");
         }
+    }
+
+    /// A Ctrl-C during the work, the stop of the server that builds the file
+    /// included, is honored; one after it, while the file moves, is not, and
+    /// neither is a second, which would otherwise end the process at once.
+    /// One test, in this order: an interrupted run leaves its leaving armed.
+    #[cfg(unix)]
+    #[test]
+    fn a_ctrl_c_is_honored_up_to_the_move_and_not_during_it() {
+        use signal_hook::{consts::SIGINT, low_level::raise};
+        let building = std::env::temp_dir().join(format!("harbor-interrupt-{}", std::process::id()));
+        assert_eq!(interruptible(&building, || Ok(())), Ok(()));
+        raise(SIGINT).unwrap();
+        raise(SIGINT).unwrap();
+        let during = interruptible(&building, || {
+            raise(SIGINT).unwrap();
+            Ok(())
+        });
+        assert_eq!(during, Err(INTERRUPTED.to_string()));
     }
 }
