@@ -5105,8 +5105,11 @@ const CALLED: [&[u8]; 2] = [b"query", b"query_table"];
 
 /// Each name a statement uses, lowercased, as the engine matches names: a
 /// word of its code, a name quoted in `"` or `` ` ``, or a single-quoted
-/// string where the engine resolves one to a relation (`FROM 'cv'`), until
-/// `found` says it is the one looked for. Whether one was. Its spaces are
+/// string, until `found` says it is the one looked for. The engine resolves
+/// a single-quoted string to the view or table it names wherever a relation
+/// may stand (`FROM 'cv'`, `FROM ('cv')`, `USING 'cv'`, `COPY 'cv' TO …`),
+/// so every one counts: one that is only a value costs the shared gate at
+/// most. Whether one was. Its spaces are
 /// the engine's (`wire::scan::plain_spaces`), and one of the `CALLED` names
 /// followed by `(`, past spaces and comments, is passed with it: `query(`.
 fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
@@ -5121,13 +5124,6 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
         }
         found(&name)
     };
-    // Whether a single-quoted string here would be a relation name: the
-    // engine resolves one right after `FROM`, `JOIN`, `TABLE`, `PIVOT`,
-    // `UNPIVOT` or a comma (`FROM 'cv'`) to the view or table it names, but
-    // reads one anywhere else (`SELECT 'cv'`) as a string value. Spaces and
-    // comments between do not change it.
-    let introduces = |w: &[u8]| matches!(w, b"from" | b"join" | b"table" | b"pivot" | b"unpivot");
-    let mut relation = false;
     for (at, span) in spans.iter().enumerate() {
         let text = &bytes[span.start..span.end];
         match span.kind {
@@ -5136,9 +5132,6 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
                 while i < span.end {
                     let c = bytes[i];
                     if !is_word(c) {
-                        if !wire::scan::is_space(c) {
-                            relation = c == b',';
-                        }
                         i += 1;
                         continue;
                     }
@@ -5147,21 +5140,18 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
                         i += 1;
                     }
                     let word = &bytes[start..i];
-                    relation = introduces(&word.to_ascii_lowercase());
                     if used(word, &spans[at..], i) {
                         return true;
                     }
                 }
             }
-            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) || (text.first() == Some(&b'\'') && relation) => {
+            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`' | b'\'')) => {
                 let quote = text[0];
                 let name = text[1..].strip_suffix(&[quote]).unwrap_or(&text[1..]);
-                relation = false;
                 if used(name, &spans[at + 1..], span.end) {
                     return true;
                 }
             }
-            wire::scan::Kind::Str | wire::scan::Kind::Dollar => relation = false,
             _ => {}
         }
     }
@@ -7085,19 +7075,21 @@ mod tests {
             "COPY FROM DATABASE a TO b",
             "FROM 'duckdb_tables'",
             "SELECT * FROM a, 'information_schema'",
+            // A string the engine might resolve to a relation counts wherever
+            // it stands, a value that only looks like one included.
+            "SELECT 'duckdb_tables()' AS s",
+            "SELECT 'duckdb_tables' AS s",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Reads, "{sql}");
         }
         for sql in [
             "SELECT * FROM a.main.t",
-            "SELECT 'duckdb_tables()' AS s",
             "SELECT my_duckdb_tables FROM t",
             "SELECT * FROM \"say duckdb_tables\"",
             "INSERT INTO attached VALUES (1)",
             "SELECT * FROM \"select\"",
             "SELECT 0x10",
             "SELECT now()",
-            "SELECT 'duckdb_tables' AS s",
             "COPY t TO '/x/duckdb_tables.csv'",
             "COPY t FROM '/x/pg_data.csv'",
         ] {
@@ -7127,8 +7119,9 @@ mod tests {
         names.learn(b"w", "CREATE VIEW w AS SELECT * FROM \"Later\"");
         names.learn(b"later", "CREATE VIEW later AS SELECT * FROM main.V");
         names.learn(b"m", "CREATE MACRO m() AS TABLE SELECT * FROM information_schema.tables");
-        // A view's name single-quoted where the engine resolves a relation
-        // (`FROM 'v'`), and a view whose body reaches the catalog that way.
+        // A view's name single-quoted, wherever it stands, since the engine
+        // resolves one in many places (`FROM 'v'`, `FROM ('v')`, `USING
+        // 'v'`), and a view whose body reaches the catalog that way.
         names.learn(b"u", "CREATE VIEW u AS SELECT * FROM 'v'");
         names.rename(b"v", b"renamed");
         for sql in [
@@ -7141,10 +7134,18 @@ mod tests {
             "FROM 'V'",
             "SELECT * FROM a /* c */, 'v'",
             "FROM u",
+            "FROM ('v')",
+            "SELECT * FROM t JOIN ('v') ON true",
+            "DELETE FROM t USING 'v'",
+            "MERGE INTO t USING 'v' ON true WHEN MATCHED THEN DELETE",
+            "COPY 'v' TO 'x.csv'",
+            "EXPLAIN ANALYZE FROM ('v')",
+            "SELECT 'v'",
+            "SELECT 'v', 1",
         ] {
             assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
         }
-        for sql in ["SELECT * FROM plain", "SELECT 'v'", "SELECT 'v', 1", "SELECT 1 -- v", "SELECT vv FROM t"] {
+        for sql in ["SELECT * FROM plain", "SELECT 'w2'", "SELECT 1 -- v", "SELECT vv FROM t"] {
             assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
         }
         // A statement in a string, run by query(), and a table named in one.
