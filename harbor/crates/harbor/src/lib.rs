@@ -1055,6 +1055,12 @@ pub fn open_pool(mut con: Connection) -> Result<(), String> {
     }
 
     lock_operator_settings(&mut con)?;
+    // What --init and the workspace attached are in place, and attaching in
+    // the background may still be under way.
+    {
+        let _reading = reading_catalog();
+        learn_catalog_names(&mut con);
+    }
 
     for _ in 0..configured_pool_size() {
         pool.push(con.try_clone().map_err(|e| format!("harbor: {e}"))?);
@@ -3934,42 +3940,278 @@ enum Gate {
 /// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
 /// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
 /// `information_schema`, `sql_auto_complete` or `sqlite_query`, which reads
-/// an attached SQLite database by its name. A name in a string or a
-/// comment does not count. A view whose body calls one is not seen; it is
-/// read as the plain query it looks like.
+/// an attached SQLite database by its name; or a view or macro whose body
+/// reads it (`CatalogNames`). A name in a string or a comment does not
+/// count.
 fn catalog_gate(sql: &str) -> Gate {
+    gate_of(sql, &CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner))
+}
+
+fn gate_of(sql: &str, names: &CatalogNames) -> Gate {
     match acting_keyword(sql).as_str() {
         "ATTACH" | "DETACH" => return Gate::Changes,
         "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PRAGMA" => return Gate::Reads,
         _ => {}
     }
-    let catalog = |word: &[u8]| {
-        let word = word.to_ascii_lowercase();
-        ["duckdb_", "pragma_", "pg_"].iter().any(|p| word.starts_with(p.as_bytes()))
-            || word == b"information_schema"
-            || word == b"sql_auto_complete"
-            || word == b"sqlite_query"
-    };
+    match names_in(sql, |name| catalog_word(name) || names.reads.contains(name)) {
+        true => Gate::Reads,
+        false => Gate::Open,
+    }
+}
+
+/// Whether a name, lowercased, is one of the engine's catalog functions or
+/// schemas.
+fn catalog_word(word: &[u8]) -> bool {
+    ["duckdb_", "pragma_", "pg_"].iter().any(|p| word.starts_with(p.as_bytes()))
+        || word == b"information_schema"
+        || word == b"sql_auto_complete"
+        || word == b"sqlite_query"
+}
+
+/// Each name a statement uses, lowercased, as the engine matches names: a
+/// word of its code, or a name quoted in `"` or `` ` ``, until `found` says
+/// it is the one looked for. Whether one was.
+fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
     let bytes = sql.as_bytes();
     for span in wire::scan::scan(sql) {
         let text = &bytes[span.start..span.end];
         match span.kind {
             wire::scan::Kind::Code => {
-                if text.split(|&c| !is_word(c)).any(catalog) {
-                    return Gate::Reads;
+                if text.split(|&c| !is_word(c)).any(|word| !word.is_empty() && found(&word.to_ascii_lowercase())) {
+                    return true;
                 }
             }
-            wire::scan::Kind::Str if text.first() == Some(&b'"') => {
-                let name = text[1..].strip_suffix(b"\"").unwrap_or(&text[1..]);
-                if catalog(name) {
-                    return Gate::Reads;
+            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) => {
+                let quote = text[0];
+                let name = text[1..].strip_suffix(&[quote]).unwrap_or(&text[1..]);
+                if found(&name.to_ascii_lowercase()) {
+                    return true;
                 }
             }
             _ => {}
         }
     }
-    Gate::Open
+    false
+}
+
+/// The views and macros whose bodies read the catalog. A view over
+/// `duckdb_tables()` reads it when it is read, and `SELECT * FROM v` names
+/// no catalog function, so the gate knows such names. Each view's and
+/// macro's name is kept with the names its body uses, learned from the
+/// engine's catalog when the pool opens and after each `ATTACH`, since an
+/// attached DuckDB file brings its own, and from each `CREATE VIEW`,
+/// `CREATE MACRO` and `ALTER VIEW … RENAME` as it passes, before it runs.
+/// A name is never forgotten: one dropped, or kept by another schema's view
+/// of its name, costs a statement that names it the shared gate and nothing
+/// else.
+#[derive(Default)]
+struct CatalogNames {
+    /// Each name, lowercased, with the names its bodies use.
+    uses: HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>>,
+    /// The names whose bodies read the catalog, themselves or through
+    /// another such name.
+    reads: std::collections::HashSet<Vec<u8>>,
+}
+
+static CATALOG_NAMES: std::sync::LazyLock<RwLock<CatalogNames>> = std::sync::LazyLock::new(Default::default);
+
+impl CatalogNames {
+    /// `name`, whose body is `body`.
+    fn learn(&mut self, name: &[u8], body: &str) {
+        let mut used = std::collections::HashSet::new();
+        names_in(body, |word| {
+            used.insert(word.to_vec());
+            false
+        });
+        self.uses.entry(name.to_ascii_lowercase()).or_default().extend(used);
+        self.settle();
+    }
+
+    /// `to` takes what `from` uses, as a view renamed does.
+    fn rename(&mut self, from: &[u8], to: &[u8]) {
+        let used = self.uses.get(from).cloned().unwrap_or_default();
+        self.uses.entry(to.to_vec()).or_default().extend(used);
+        self.settle();
+    }
+
+    fn settle(&mut self) {
+        loop {
+            let more: Vec<Vec<u8>> = self
+                .uses
+                .iter()
+                .filter(|(name, used)| {
+                    !self.reads.contains(*name) && used.iter().any(|u| catalog_word(u) || self.reads.contains(u))
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            if more.is_empty() {
+                return;
+            }
+            self.reads.extend(more);
+        }
+    }
+}
+
+/// Learn the views and macros a statement makes or renames, before it runs
+/// (`CatalogNames`).
+fn learn_from_statement(sql: &str) {
+    if !matches!(acting_keyword(sql).as_str(), "CREATE" | "ALTER") {
+        return;
+    }
+    let Some(made) = made_name(sql) else { return };
+    let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
+    match made {
+        Made::Body(name) => names.learn(&name, sql),
+        Made::Renamed { from, to } => names.rename(&from, &to),
+    }
+}
+
+/// Learn every view and macro the engine lists on `conn` (`CatalogNames`).
+/// Its catalog is read, so the caller holds the gate. Said in the log when
+/// the catalog does not read; what was learned stays.
+pub(crate) fn learn_catalog_names(conn: &mut Connection) {
+    let listed = conn.query_strings(
+        "SELECT json_array(view_name, sql)::VARCHAR FROM duckdb_views() WHERE sql IS NOT NULL \
+         UNION ALL SELECT json_array(function_name, macro_definition)::VARCHAR FROM duckdb_functions() \
+         WHERE function_type IN ('macro', 'table_macro') AND macro_definition IS NOT NULL",
+    );
+    let rows = match listed {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("harbor: the views and macros that read the catalog were not read from it: {}", e.into_text());
+            return;
+        }
+    };
+    let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
+    for row in rows {
+        if let Ok((name, body)) = serde_json::from_str::<(String, String)>(&row) {
+            names.learn(name.as_bytes(), &body);
+        }
+    }
+}
+
+/// What a `CREATE` or `ALTER` makes, by its last name part, lowercased.
+#[derive(Debug, PartialEq, Eq)]
+enum Made {
+    /// A view or a macro, whose body is the statement.
+    Body(Vec<u8>),
+    /// A view renamed.
+    Renamed { from: Vec<u8>, to: Vec<u8> },
+}
+
+/// The view or macro a statement makes: `CREATE [OR REPLACE] [TEMP |
+/// TEMPORARY] [RECURSIVE] VIEW | MACRO | FUNCTION [IF NOT EXISTS] name`,
+/// or `ALTER VIEW [IF EXISTS] name RENAME TO name`, a name being one to
+/// three parts, each a word or a quoted name.
+fn made_name(sql: &str) -> Option<Made> {
+    let mut tokens = Vec::new();
+    names_in_order(sql, &mut tokens);
+    let mut at = 0;
+    let word = |at: usize, w: &str| matches!(tokens.get(at), Some(Token::Word(t)) if t == w.as_bytes());
+    let name = |at: &mut usize| -> Option<Vec<u8>> {
+        let mut last = None;
+        loop {
+            match tokens.get(*at) {
+                Some(Token::Word(n) | Token::Quoted(n)) => last = Some(n.clone()),
+                _ => return last,
+            }
+            *at += 1;
+            if !matches!(tokens.get(*at), Some(Token::Dot)) {
+                return last;
+            }
+            *at += 1;
+        }
+    };
+    if word(at, "create") {
+        at += 1;
+        if word(at, "or") && word(at + 1, "replace") {
+            at += 2;
+        }
+        if word(at, "temp") || word(at, "temporary") {
+            at += 1;
+        }
+        if word(at, "recursive") {
+            at += 1;
+        }
+        if !(word(at, "view") || word(at, "macro") || word(at, "function")) {
+            return None;
+        }
+        at += 1;
+        if word(at, "if") && word(at + 1, "not") && word(at + 2, "exists") {
+            at += 3;
+        }
+        return name(&mut at).map(Made::Body);
+    }
+    if word(at, "alter") && word(at + 1, "view") {
+        at += 2;
+        if word(at, "if") && word(at + 1, "exists") {
+            at += 2;
+        }
+        let from = name(&mut at)?;
+        if !(word(at, "rename") && word(at + 1, "to")) {
+            return None;
+        }
+        at += 2;
+        let to = name(&mut at)?;
+        return Some(Made::Renamed { from, to });
+    }
+    None
+}
+
+/// A statement's leading tokens, as `made_name` reads them.
+enum Token {
+    Word(Vec<u8>),
+    Quoted(Vec<u8>),
+    Dot,
+    Other,
+}
+
+/// The tokens of `sql`'s code and quoted names, lowercased, in order, with
+/// comments passed over; reading stops at the first string, which no name
+/// `made_name` reads comes after.
+fn names_in_order(sql: &str, tokens: &mut Vec<Token>) {
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let bytes = sql.as_bytes();
+    for span in wire::scan::scan(sql) {
+        let text = &bytes[span.start..span.end];
+        match span.kind {
+            wire::scan::Kind::Code => {
+                let mut i = 0;
+                while i < text.len() {
+                    let c = text[i];
+                    if is_word(c) {
+                        let start = i;
+                        while i < text.len() && is_word(text[i]) {
+                            i += 1;
+                        }
+                        tokens.push(Token::Word(text[start..i].to_ascii_lowercase()));
+                        continue;
+                    }
+                    if c == b'.' {
+                        tokens.push(Token::Dot);
+                    } else if !c.is_ascii_whitespace() {
+                        tokens.push(Token::Other);
+                    }
+                    i += 1;
+                }
+            }
+            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) => {
+                let quote = text[0];
+                let inner = text[1..].strip_suffix(&[quote]).unwrap_or(&text[1..]);
+                let doubled = [quote, quote];
+                let mut name = Vec::with_capacity(inner.len());
+                let mut i = 0;
+                while i < inner.len() {
+                    name.push(inner[i]);
+                    i += if inner[i..].starts_with(&doubled) { 2 } else { 1 };
+                }
+                tokens.push(Token::Quoted(name.to_ascii_lowercase()));
+            }
+            wire::scan::Kind::LineComment | wire::scan::Kind::BlockComment => {}
+            _ => return,
+        }
+    }
 }
 
 /// The gate as a statement holds it: one guard or the other, or neither.
@@ -4494,6 +4736,9 @@ fn execute_jobs(
         // An ATTACH or DETACH runs alone against the catalog's readers
         // (CATALOG_GATE). A reader cancelled while it waits did not run, and
         // its transaction is left aborted, as for a cancel before it began.
+        // A view or macro the statement makes is known to the gate first.
+        learn_from_statement(&sql);
+        let attaches = acting_keyword(&sql) == "ATTACH";
         let Some(_passed) = pass_gate(catalog_gate(&sql), &state) else {
             on_slot.finish();
             conn.abort_transaction();
@@ -4531,6 +4776,11 @@ fn execute_jobs(
                 true
             }
         };
+        // The views and macros of a database attached, read while the gate
+        // is still held alone.
+        if attaches {
+            learn_catalog_names(&mut conn);
+        }
     }
     // And once more on the way out, so a connection going back to the pool for
     // the next start() is clean too. Unconditional here: this runs once
@@ -4845,6 +5095,39 @@ mod tests {
             "INSERT INTO attached VALUES (1)",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_view_or_macro_whose_body_reads_the_catalog_reads_it() {
+        use super::{CatalogNames, Gate, Made, gate_of, made_name};
+        let mut names = CatalogNames::default();
+        names.learn(b"v", "CREATE VIEW v AS SELECT * FROM duckdb_tables()");
+        names.learn(b"plain", "CREATE VIEW plain AS SELECT 1");
+        // Through another view, learned before or after the one it reads.
+        names.learn(b"w", "CREATE VIEW w AS SELECT * FROM \"Later\"");
+        names.learn(b"later", "CREATE VIEW later AS SELECT * FROM main.V");
+        names.learn(b"m", "CREATE MACRO m() AS TABLE SELECT * FROM information_schema.tables");
+        names.rename(b"v", b"renamed");
+        for sql in ["SELECT * FROM v", "select * from MAIN.\"V\"", "SELECT * FROM w", "FROM m()", "TABLE renamed"] {
+            assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
+        }
+        for sql in ["SELECT * FROM plain", "SELECT 'v'", "SELECT 1 -- v", "SELECT vv FROM t"] {
+            assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
+        }
+
+        let body = |name: &str| Some(Made::Body(name.as_bytes().to_vec()));
+        assert_eq!(made_name("CREATE VIEW v AS SELECT 1"), body("v"));
+        assert_eq!(made_name("create or replace temp view if not exists db.s.\"My \"\"V\"\"\" AS SELECT 1"), body("my \"v\""));
+        assert_eq!(made_name("CREATE /* c */ RECURSIVE VIEW `R`(n) AS SELECT 1"), body("r"));
+        assert_eq!(made_name("CREATE MACRO s.m(a) AS TABLE SELECT a"), body("m"));
+        assert_eq!(made_name("CREATE FUNCTION f(a) AS a + 1"), body("f"));
+        assert_eq!(
+            made_name("ALTER VIEW IF EXISTS s.v RENAME TO w"),
+            Some(Made::Renamed { from: b"v".to_vec(), to: b"w".to_vec() })
+        );
+        for sql in ["CREATE TABLE v AS SELECT 1", "ALTER VIEW v SET SCHEMA s", "CREATE VIEW 'v' AS SELECT 1", "SELECT 1"] {
+            assert_eq!(made_name(sql), None, "{sql}");
         }
     }
 
