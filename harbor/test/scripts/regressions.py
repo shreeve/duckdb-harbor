@@ -628,6 +628,21 @@ class CommitRaces(Harbor, unittest.TestCase):
         doc = self.sql("SELECT r.{a,b}[ 1 ], r.{a,b}[2 : 3], r.{a[ -1 ], b[1:1]}" + source)
         self.assertEqual(doc["data"], [[10, 40, [20, 30], [50, 60], 30, [40]]])
 
+    def test_a_brace_expansion_that_would_surprise_is_refused(self):
+        # A group in a list's brackets would make a list of each alternative,
+        # an empty group would leave the groups after it unexpanded, and an
+        # item cut inside a call's parentheses would split the call. Each is
+        # refused, saying what to write; the forms beside them run.
+        source = " FROM (SELECT {'a': 1, 'b': 2} AS r, [1, 2] AS l)"
+        for sql, fix in (("SELECT [r.{a,b}]", "write the list's items out"),
+                         ("SELECT [0, r.{a,b}]", "write the list's items out"),
+                         ("SELECT r.{}.{a,b}", "take it out, or write the alternatives out"),
+                         ("SELECT r.{list_transform(l, lambda x: x), b}", "as in a call or a lambda"),
+                         ("SELECT r.{coalesce(a, b), b}", "as in a call or a lambda")):
+            with self.subTest(sql=sql):
+                self.assertIn(fix, self.brace_refusal(sql + source))
+        self.assertEqual(self.sql("SELECT [r.a, r.b], [greatest(r.{a,b})]" + source)["data"], [[[1, 2], [2]]])
+
     def test_a_cast_a_brace_group_would_split_is_refused(self):
         # The engine reads `::DECIMAL (10,2)` and `::TIMESTAMP WITH TIME ZONE`
         # as one type, but a term ends at the space: expanded, the first

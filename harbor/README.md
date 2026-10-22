@@ -393,7 +393,13 @@ another way than the statement it came from, as when a quote its parser
 misreads is repeated or an `E` comes to begin the word before a string and
 make it take backslash escapes, is refused with a `400` that says what to
 write instead: most often a space between the group and the quote, or a plain
-space for a Unicode one. A brace that never closes leaves the statement as it
+space for a Unicode one. So is an expansion that would surprise: a group inside
+a list's brackets, `[r.{a,b}]`, which would make a list of each alternative
+rather than one list of them all; an empty group before another in its term,
+`r.{}.{a,b}`, which would leave the other unexpanded; and an item cut inside
+the parentheses of a call or a lambda at a space or comma,
+`r.{list_transform(l, lambda x: x), b}`. A call with nothing to split,
+`r.{f(a), b}`, and a group in a call inside a list, `[f(r.{a,b})]`, expand. A brace that never closes leaves the statement as it
 came; the engine then reports the syntax error at it.
 
 The expansion happens in the server, once, for every client: the REPL,

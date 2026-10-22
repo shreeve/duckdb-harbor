@@ -31,7 +31,9 @@ string, a dollar quote that opens only after a brace), and a cast whose type
 the engine reads on past a space or comment (`::DECIMAL (10,2)`, `::INT []`,
 `::DOUBLE PRECISION`), which a group's term or item would split. Beside them,
 the same casts after a group of one alternative, which split nothing and
-expand.
+expand. And expansions that would surprise, each refused (a group in a list's
+brackets, an empty group before another, an item cut inside a call's
+parentheses), beside neighbours of theirs that expand.
 
 Every failure prints the seed. Exit 77 when there is no duckdb CLI to parse
 with: the suite could not run, which is not a pass.
@@ -178,6 +180,32 @@ SPLIT_CASTS = [
 GAPS = [" ", "\t", "\n", "/* c */", " -- c\n", NBSP, IDEO]
 
 
+# Expansions that would surprise, each refused with its own message: a group
+# in a list's brackets, an empty group before one that holds an item, and an
+# item cut inside a call's parentheses (a lambda's among them). Beside them,
+# their near neighbours that expand as spelled out.
+SURPRISES = [
+    ("[r.{a,b}]", "inside a list's brackets"), ("[1, r.{a, b}]", "inside a list's brackets"),
+    ("ARRAY[r.{a,b}]", "inside a list's brackets"), ("1 + [r.{a,b}][1]", "inside a list's brackets"),
+    ("r.{}.{a,b}", "an empty brace group"), ("{ /* none */ }_{a,b}", "an empty brace group"),
+    ("r.{list_transform(l, lambda x: x), b}", "inside the parentheses"),
+    ("r.{list_transform(l, x -> x)}", "inside the parentheses"), ("r.{coalesce(a, b), c}", "inside the parentheses"),
+]
+NEIGHBOURS = [
+    ("[f(r.{a,b}), 3]", "[f(r.a, r.b), 3]"), ("l[r.{a,b}]", "l[r.a], l[r.b]"), ("[{'k': 1}, {'k': 2}]", "[{'k': 1}, {'k': 2}]"),
+    ("r.{f(a), b}", "r.f(a), r.b"), ("{'k': list_transform(l, lambda x: x)}", "{'k': list_transform(l, lambda x: x)}"),
+]
+
+
+def surprise(rng):
+    """A statement with an expansion that would surprise, the part of the
+    refusal it must get, and a statement with a neighbour that expands:
+    (statement, why, (braced, expanded))."""
+    sql, why = rng.choice(SURPRISES)
+    g = Grammar(rng, "A")
+    return g.statement(sql)[0], why, g.statement(rng.choice(NEIGHBOURS))
+
+
 def misread(rng):
     return Grammar(rng, "A").statement(rng.choice(MISREAD))[0]
 
@@ -282,6 +310,9 @@ def main():
     for _ in range(max(1, args.count // 10)):
         split, (braced, want) = split_cast(rng)
         cases += [("split", split, split), ("one", braced, want)]
+    for _ in range(max(1, args.count // 10)):
+        sql, why, (braced, want) = surprise(rng)
+        cases += [("surprise", sql, why), ("near", braced, want)]
 
     failures, counts = [], {}
     with tempfile.TemporaryDirectory(prefix="hb-braces-", dir="/tmp") as work:
@@ -292,6 +323,8 @@ def main():
             counts[(mode, tag)] = counts.get((mode, tag), 0) + 1
             if mode == "misread":
                 ok = tag == "R" and any(m in out for m in MISREAD_REFUSALS)
+            elif mode == "surprise":
+                ok = tag == "R" and want in out
             elif mode == "split":
                 ok = tag == "R" and "would split" in out
             elif braced == want:
