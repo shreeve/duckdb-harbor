@@ -4241,8 +4241,9 @@ enum Gate {
 /// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
 /// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
 /// `information_schema`, `sql_auto_complete` or `sqlite_query`, which reads
-/// an attached SQLite database by its name; or a view or macro whose body
-/// reads it (`CatalogNames`). A name in a string or a comment does not
+/// an attached SQLite database by its name; `query` or `query_table`,
+/// which run a statement or read a table named in a string; or a view,
+/// macro or prepared statement whose body reads it (`CatalogNames`). A name in a string or a comment does not
 /// count.
 fn catalog_gate(sql: &str) -> Gate {
     gate_of(sql, &CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner))
@@ -4267,6 +4268,8 @@ fn catalog_word(word: &[u8]) -> bool {
         || word == b"information_schema"
         || word == b"sql_auto_complete"
         || word == b"sqlite_query"
+        || word == b"query"
+        || word == b"query_table"
 }
 
 /// Each name a statement uses, lowercased, as the engine matches names: a
@@ -4300,16 +4303,19 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
 /// `duckdb_tables()` reads it when it is read, and `SELECT * FROM v` names
 /// no catalog function, so the gate knows such names. Each view's and
 /// macro's name is kept with the names its body uses, learned from the
-/// engine's catalog when the pool opens and after each `ATTACH`, since an
-/// attached DuckDB file brings its own, and from each `CREATE VIEW`,
-/// `CREATE MACRO` and `ALTER VIEW … RENAME` as it passes, before it runs.
-/// A name is never forgotten: one dropped, or kept by another schema's view
-/// of its name, costs a statement that names it the shared gate and nothing
-/// else.
+/// engine's catalog when the pool opens and after each `ATTACH`, `IMPORT
+/// DATABASE` and `COPY FROM DATABASE`, since each brings views of its own,
+/// and from each `CREATE VIEW`, `CREATE MACRO`, `PREPARE` and `ALTER VIEW …
+/// RENAME` as it passes, before it runs, and the views and macros of the
+/// `schema.sql` an `IMPORT DATABASE` runs, before it runs. A name is never
+/// forgotten: one dropped, or kept by another schema's view of its name,
+/// costs a statement that names it the shared gate and nothing else.
 #[derive(Default)]
 struct CatalogNames {
     /// Each name, lowercased, with the names its bodies use.
     uses: HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>>,
+    /// Each name used, with the names whose bodies use it.
+    used_by: HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>>,
     /// The names whose bodies read the catalog, themselves or through
     /// another such name.
     reads: std::collections::HashSet<Vec<u8>>,
@@ -4317,55 +4323,131 @@ struct CatalogNames {
 
 static CATALOG_NAMES: std::sync::LazyLock<RwLock<CatalogNames>> = std::sync::LazyLock::new(Default::default);
 
+/// The names `body` uses, lowercased.
+fn used_names(body: &str) -> std::collections::HashSet<Vec<u8>> {
+    let mut used = std::collections::HashSet::new();
+    names_in(body, |word| {
+        used.insert(word.to_vec());
+        false
+    });
+    used
+}
+
 impl CatalogNames {
     /// `name`, whose body is `body`.
+    #[cfg(test)]
     fn learn(&mut self, name: &[u8], body: &str) {
-        let mut used = std::collections::HashSet::new();
-        names_in(body, |word| {
-            used.insert(word.to_vec());
-            false
-        });
-        self.uses.entry(name.to_ascii_lowercase()).or_default().extend(used);
-        self.settle();
+        self.learn_all(vec![(name.to_vec(), used_names(body))]);
+    }
+
+    /// Each name with the names its body uses ([`used_names`]), then what
+    /// reads the catalog among them and the names that use them, settled
+    /// once: as cheap for the whole catalog as for one name.
+    fn learn_all(&mut self, learned: Vec<(Vec<u8>, std::collections::HashSet<Vec<u8>>)>) {
+        let mut names = Vec::with_capacity(learned.len());
+        for (name, used) in learned {
+            let name = name.to_ascii_lowercase();
+            self.add(&name, used);
+            names.push(name);
+        }
+        self.settle(names);
     }
 
     /// `to` takes what `from` uses, as a view renamed does.
     fn rename(&mut self, from: &[u8], to: &[u8]) {
         let used = self.uses.get(from).cloned().unwrap_or_default();
-        self.uses.entry(to.to_vec()).or_default().extend(used);
-        self.settle();
+        self.add(to, used);
+        self.settle(vec![to.to_vec()]);
     }
 
-    fn settle(&mut self) {
-        loop {
-            let more: Vec<Vec<u8>> = self
-                .uses
-                .iter()
-                .filter(|(name, used)| {
-                    !self.reads.contains(*name) && used.iter().any(|u| catalog_word(u) || self.reads.contains(u))
-                })
-                .map(|(name, _)| name.clone())
-                .collect();
-            if more.is_empty() {
-                return;
+    fn add(&mut self, name: &[u8], used: std::collections::HashSet<Vec<u8>>) {
+        for u in &used {
+            self.used_by.entry(u.clone()).or_default().insert(name.to_vec());
+        }
+        self.uses.entry(name.to_vec()).or_default().extend(used);
+    }
+
+    /// Mark each of `names` that reads the catalog, and every name that
+    /// uses one marked, through the names that use it: each name is marked
+    /// once, so the work is the names and their uses, once.
+    fn settle(&mut self, names: Vec<Vec<u8>>) {
+        let reads = |this: &Self, name: &Vec<u8>| {
+            this.uses.get(name).is_some_and(|used| used.iter().any(|u| catalog_word(u) || this.reads.contains(u)))
+        };
+        let mut work: Vec<Vec<u8>> = names.into_iter().filter(|n| !self.reads.contains(n) && reads(self, n)).collect();
+        while let Some(name) = work.pop() {
+            if !self.reads.insert(name.clone()) {
+                continue;
             }
-            self.reads.extend(more);
+            if let Some(users) = self.used_by.get(&name) {
+                work.extend(users.iter().filter(|u| !self.reads.contains(*u)).cloned());
+            }
         }
     }
 }
 
 /// Learn the views and macros a statement makes or renames, before it runs
-/// (`CatalogNames`).
+/// (`CatalogNames`), and those of the `schema.sql` an `IMPORT DATABASE`
+/// runs.
 fn learn_from_statement(sql: &str) {
-    if !matches!(acting_keyword(sql).as_str(), "CREATE" | "ALTER") {
-        return;
+    match acting_keyword(sql).as_str() {
+        "CREATE" | "ALTER" | "PREPARE" => learn_made(sql),
+        "IMPORT" => {
+            for statement in imported_statements(sql) {
+                if matches!(acting_keyword(&statement).as_str(), "CREATE" | "ALTER") {
+                    learn_made(&statement);
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+fn learn_made(sql: &str) {
     let Some(made) = made_name(sql) else { return };
+    let used = match &made {
+        Made::Body(_) => used_names(sql),
+        Made::Renamed { .. } => Default::default(),
+    };
     let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
     match made {
-        Made::Body(name) => names.learn(&name, sql),
+        Made::Body(name) => names.learn_all(vec![(name, used)]),
         Made::Renamed { from, to } => names.rename(&from, &to),
     }
+}
+
+/// The statements of the `schema.sql` an `IMPORT DATABASE 'directory'`
+/// runs, where the engine finds it: none when there is no such file.
+fn imported_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let Some(path) = wire::scan::scan(sql)
+        .into_iter()
+        .find(|s| matches!(s.kind, wire::scan::Kind::Str) && bytes[s.start] == b'\'')
+    else {
+        return Vec::new();
+    };
+    let quoted = &sql[path.start + 1..path.end.saturating_sub(1).max(path.start + 1)];
+    let directory = quoted.replace("''", "'");
+    let Ok(schema) = std::fs::read_to_string(std::path::Path::new(&directory).join("schema.sql")) else {
+        return Vec::new();
+    };
+    statements_of(&schema)
+}
+
+/// `script`'s statements, split at each `;` of its code.
+fn statements_of(script: &str) -> Vec<String> {
+    let bytes = script.as_bytes();
+    let mut statements = Vec::new();
+    let mut start = 0;
+    for span in wire::scan::scan(script).into_iter().filter(|s| matches!(s.kind, wire::scan::Kind::Code)) {
+        for at in (span.start..span.end).filter(|&i| bytes[i] == b';') {
+            statements.push(script[start..at].to_string());
+            start = at + 1;
+        }
+    }
+    statements.push(script[start..].to_string());
+    statements.retain(|s| !s.trim().is_empty());
+    statements
 }
 
 /// Learn every view and macro the engine lists on `conn` (`CatalogNames`).
@@ -4384,20 +4466,75 @@ pub(crate) fn learn_catalog_names(conn: &mut Connection) {
             return;
         }
     };
-    let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
-    for row in rows {
-        if let Ok((name, body)) = serde_json::from_str::<(String, String)>(&row) {
-            names.learn(name.as_bytes(), &body);
+    // Read outside the lock, which the gate of every statement takes.
+    let learned: Vec<_> = rows
+        .iter()
+        .filter_map(|row| serde_json::from_str::<(String, String)>(row).ok())
+        .map(|(name, body)| (name.into_bytes(), used_names(&body)))
+        .collect();
+    CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).learn_all(learned);
+}
+
+/// Whether a statement brings views and macros the engine makes, read from
+/// the engine once it has run: an `ATTACH` but of a SQLite file
+/// (`attaches_sqlite`), whose views are SQLite's, so that reading its
+/// catalog, which waits on its file, is spared, and so is harbor's own
+/// question whether one reads; an `IMPORT DATABASE`; and a `COPY FROM
+/// DATABASE`.
+fn brings_views(sql: &str) -> bool {
+    match acting_keyword(sql).as_str() {
+        "ATTACH" => !attaches_sqlite(sql),
+        "IMPORT" => true,
+        "COPY" => {
+            let mut tokens = Vec::new();
+            names_in_order(sql, &mut tokens);
+            let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(t)) if t == w.as_bytes());
+            tokens
+                .iter()
+                .position(|t| word(Some(t), "copy"))
+                .is_some_and(|at| word(tokens.get(at + 1), "from") && word(tokens.get(at + 2), "database"))
         }
+        _ => false,
     }
 }
 
-/// Whether a statement attaches a database that may hold views and macros
-/// of the engine's own: an `ATTACH` but of a SQLite file, whose views are
-/// SQLite's, so that reading its catalog, which waits on its file, is
-/// spared, and so is harbor's own question whether one reads.
-fn attaches_views(sql: &str) -> bool {
-    acting_keyword(sql) == "ATTACH" && !names_in(sql, |word| word == b"sqlite" || word == b"sqlite3")
+/// Whether an `ATTACH` attaches a SQLite file, as the engine reads the
+/// statement: a path led by `sqlite:`, or a `TYPE sqlite` option. A
+/// database named `sqlite` is not one.
+fn attaches_sqlite(sql: &str) -> bool {
+    let sqlite = |name: &[u8]| name == b"sqlite" || name == b"sqlite3";
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let bytes = sql.as_bytes();
+    let (mut path, mut after_type) = (true, false);
+    for span in wire::scan::scan(sql) {
+        let text = &bytes[span.start..span.end];
+        match span.kind {
+            wire::scan::Kind::Code => {
+                for word in text.split(|&c| !is_word(c)).filter(|w| !w.is_empty()) {
+                    let word = word.to_ascii_lowercase();
+                    if after_type && sqlite(&word) {
+                        return true;
+                    }
+                    after_type = word == b"type";
+                }
+            }
+            wire::scan::Kind::Str => {
+                let inner = text.get(1..text.len().saturating_sub(1)).unwrap_or_default().to_ascii_lowercase();
+                if path && text[0] == b'\'' {
+                    path = false;
+                    if inner.starts_with(b"sqlite:") || inner.starts_with(b"sqlite3:") {
+                        return true;
+                    }
+                } else if after_type && sqlite(&inner) {
+                    return true;
+                }
+                after_type = false;
+            }
+            wire::scan::Kind::LineComment | wire::scan::Kind::BlockComment => {}
+            wire::scan::Kind::Dollar => after_type = false,
+        }
+    }
+    false
 }
 
 /// What a `CREATE` or `ALTER` makes, by its last name part, lowercased.
@@ -4412,7 +4549,8 @@ enum Made {
 /// The view or macro a statement makes: `CREATE [OR REPLACE] [TEMP |
 /// TEMPORARY] [RECURSIVE] VIEW | MACRO | FUNCTION [IF NOT EXISTS] name`,
 /// or `ALTER VIEW [IF EXISTS] name RENAME TO name`, a name being one to
-/// three parts, each a word or a quoted name.
+/// three parts, each a word or a quoted name; or the prepared statement a
+/// `PREPARE name AS` makes, which `EXECUTE name` runs.
 fn made_name(sql: &str) -> Option<Made> {
     let mut tokens = Vec::new();
     names_in_order(sql, &mut tokens);
@@ -4450,6 +4588,10 @@ fn made_name(sql: &str) -> Option<Made> {
         if word(at, "if") && word(at + 1, "not") && word(at + 2, "exists") {
             at += 3;
         }
+        return name(&mut at).map(Made::Body);
+    }
+    if word(at, "prepare") {
+        at += 1;
         return name(&mut at).map(Made::Body);
     }
     if word(at, "alter") && word(at + 1, "view") {
@@ -4546,7 +4688,7 @@ fn names_in_order(sql: &str, tokens: &mut Vec<Token>) {
 }
 
 /// The gate as a statement holds it: one guard or the other, or neither.
-/// Held, never read; dropped when the statement is over.
+/// Held, and asked only which it is; dropped when the statement is over.
 #[allow(dead_code)]
 enum Passed {
     Open,
@@ -5115,7 +5257,7 @@ fn execute_jobs(
         // its transaction is left aborted, as for a cancel before it began.
         // A view or macro the statement makes is known to the gate first.
         learn_from_statement(&sql);
-        let attaches = attaches_views(&sql);
+        let brings = brings_views(&sql);
         let Some(_passed) = pass_gate(catalog_gate(&sql), &state) else {
             on_slot.finish();
             conn.abort_transaction();
@@ -5153,9 +5295,10 @@ fn execute_jobs(
                 true
             }
         };
-        // The views and macros of a database attached, read while the gate
-        // is still held alone.
-        if attaches {
+        // The views and macros a database attached or imported brings, read
+        // under the gate: still held alone after an ATTACH.
+        if brings {
+            let _reading = matches!(_passed, Passed::Open).then(reading_catalog);
             learn_catalog_names(&mut conn);
         }
     }
@@ -5492,6 +5635,17 @@ mod tests {
         for sql in ["SELECT * FROM plain", "SELECT 'v'", "SELECT 1 -- v", "SELECT vv FROM t"] {
             assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
         }
+        // A statement in a string, run by query(), and a table named in one.
+        names.learn(b"q", "CREATE VIEW q AS SELECT * FROM query('SELECT * FROM duckdb_tables()')");
+        names.learn(b"p", "PREPARE p AS SELECT * FROM duckdb_columns()");
+        for sql in [
+            "SELECT count(*) FROM query('SELECT * FROM duckdb_tables()')",
+            "SELECT count(*) FROM query_table('v')",
+            "FROM q",
+            "EXECUTE p",
+        ] {
+            assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
+        }
 
         let body = |name: &str| Some(Made::Body(name.as_bytes().to_vec()));
         assert_eq!(made_name("CREATE VIEW v AS SELECT 1"), body("v"));
@@ -5499,6 +5653,7 @@ mod tests {
         assert_eq!(made_name("CREATE /* c */ RECURSIVE VIEW `R`(n) AS SELECT 1"), body("r"));
         assert_eq!(made_name("CREATE MACRO s.m(a) AS TABLE SELECT a"), body("m"));
         assert_eq!(made_name("CREATE FUNCTION f(a) AS a + 1"), body("f"));
+        assert_eq!(made_name("PREPARE \"P\" AS SELECT 1"), body("p"));
         assert_eq!(
             made_name("ALTER VIEW IF EXISTS s.v RENAME TO w"),
             Some(Made::Renamed { from: b"v".to_vec(), to: b"w".to_vec() })
@@ -5509,15 +5664,74 @@ mod tests {
     }
 
     #[test]
+    fn the_names_that_read_the_catalog_settle_once_however_many() {
+        use super::{CatalogNames, used_names};
+        // A chain of twenty thousand views, each over the one before, the
+        // first over the catalog, listed last first, as the engine may
+        // list them: settled in one pass, where a pass per name is
+        // quadratic.
+        let mut learned: Vec<_> = (1..20_000)
+            .rev()
+            .map(|i| (format!("v{i}").into_bytes(), used_names(&format!("CREATE VIEW v{i} AS SELECT * FROM v{}", i - 1))))
+            .collect();
+        learned.push((b"v0".to_vec(), used_names("CREATE VIEW v0 AS SELECT * FROM duckdb_tables()")));
+        learned.push((b"plain".to_vec(), used_names("CREATE VIEW plain AS SELECT * FROM t")));
+        let mut names = CatalogNames::default();
+        names.learn_all(learned);
+        assert_eq!(names.reads.len(), 20_000);
+        assert!(names.reads.contains(b"v19999".as_slice()) && !names.reads.contains(b"plain".as_slice()));
+        // One learned later over the chain reads it too.
+        names.learn(b"top", "CREATE VIEW top AS SELECT * FROM v19999");
+        assert!(names.reads.contains(b"top".as_slice()));
+    }
+
+    #[test]
+    fn an_import_names_the_views_its_schema_makes() {
+        use super::{imported_statements, statements_of};
+        assert_eq!(
+            statements_of("CREATE VIEW a AS SELECT ';';\n-- ; x\nCREATE MACRO m() AS 1 ;\n\n"),
+            ["CREATE VIEW a AS SELECT ';'", "\n-- ; x\nCREATE MACRO m() AS 1 "]
+        );
+        let dir = std::env::temp_dir().join(format!("harbor-import-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("it's")).unwrap();
+        std::fs::write(dir.join("it's").join("schema.sql"), "CREATE TABLE t(a INTEGER);\nCREATE VIEW iv AS SELECT * FROM duckdb_tables();\n").unwrap();
+        let path = dir.join("it's").to_string_lossy().replace('\'', "''");
+        let statements = imported_statements(&format!("IMPORT DATABASE '{path}'"));
+        assert_eq!(statements.len(), 2);
+        assert!(statements[1].contains("CREATE VIEW iv"));
+        assert!(imported_statements("IMPORT DATABASE '/no/such/directory'").is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_detach_names_its_database_and_a_sqlite_attach_brings_no_views() {
-        use super::{attaches_views, detached_name};
+        use super::{brings_views, detached_name};
         assert_eq!(detached_name("DETACH app"), Some(b"app".to_vec()));
         assert_eq!(detached_name("/* x */ detach database if exists \"My App\""), Some(b"my app".to_vec()));
         assert_eq!(detached_name("SELECT 1"), None);
-        assert!(attaches_views("ATTACH '/x/a.duckdb' AS a"));
-        assert!(attaches_views("ATTACH 'sqlite.duckdb'"));
-        assert!(!attaches_views("ATTACH '/x/a.db' AS a (TYPE sqlite, READ_ONLY)"));
-        assert!(!attaches_views("DETACH a"));
+        for sql in [
+            "ATTACH '/x/a.duckdb' AS a",
+            "ATTACH 'sqlite.duckdb'",
+            "ATTACH '/x/a.duckdb' AS sqlite",
+            "ATTACH '/x/sqlite' AS \"sqlite\" (READ_ONLY) -- TYPE sqlite",
+            "ATTACH '/x/a.duckdb' AS a (TYPE duckdb, READ_ONLY)",
+            "IMPORT DATABASE '/x/export'",
+            "COPY FROM DATABASE a TO b",
+            "explain analyze copy from database a to b (schema)",
+        ] {
+            assert!(brings_views(sql), "{sql}");
+        }
+        for sql in [
+            "ATTACH '/x/a.db' AS a (TYPE sqlite, READ_ONLY)",
+            "ATTACH '/x/a.db' AS a (READ_ONLY, type SQLITE3)",
+            "ATTACH '/x/a.db' AS a (TYPE 'sqlite')",
+            "ATTACH 'sqlite:/x/a.db' AS a",
+            "DETACH a",
+            "COPY t FROM 'x.csv'",
+            "SELECT 1",
+        ] {
+            assert!(!brings_views(sql), "{sql}");
+        }
     }
 
     #[test]

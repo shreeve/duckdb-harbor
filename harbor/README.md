@@ -458,13 +458,16 @@ A table or view another client drops, or a database it detaches, while the
 catalog is being read is left out; it never fails the read. An `ATTACH` or
 `DETACH` runs alone against every statement that reads the catalog — `/catalog`
 itself, the `duckdb_…` and `pragma_…` functions, `information_schema`, `SHOW`,
-`DESCRIBE` and the engine's completer — waiting for those running and holding
-back those that come after, since the engine brings itself down when a SQLite
-database is detached while a catalog read walks it. A view or macro whose body
-reads the catalog, itself or through another, reads it too: the server learns
-each one's body from the engine's catalog when it starts and after each
-`ATTACH`, and from each `CREATE VIEW`, `CREATE MACRO` and `ALTER VIEW … RENAME`
-before it runs.
+`DESCRIBE`, the engine's completer, and `query` and `query_table`, which run a
+statement or read a table named in a string — waiting for those running and
+holding back those that come after, since the engine brings itself down when a
+SQLite database is detached while a catalog read walks it. A view, macro or
+prepared statement whose body reads the catalog, itself or through another,
+reads it too: the server learns each one's body from the engine's catalog when
+it starts and after each `ATTACH`, `IMPORT DATABASE` and `COPY FROM DATABASE`,
+from each `CREATE VIEW`, `CREATE MACRO`, `PREPARE` and `ALTER VIEW … RENAME`
+before it runs, and from the `schema.sql` an `IMPORT DATABASE` runs, before it
+runs.
 
 The document is stable — same database, same bytes — so clients can diff it.
 A client that only wants an inventory asks `GET /catalog?style=lite` and gets
