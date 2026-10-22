@@ -514,6 +514,12 @@ impl SlotState {
         run.expired(now).then_some(run.job)
     }
 
+    /// The running job's id if a canceller has reached it, else None.
+    fn unheeded_job(&self) -> Option<u64> {
+        let run = self.run.lock().unwrap();
+        (run.job != 0 && run.cancelled).then_some(run.job)
+    }
+
     /// The job running right now (0 = idle). A snapshot for reapers that must
     /// name their target instead of firing at "whatever is running".
     fn current_job(&self) -> u64 {
@@ -614,10 +620,19 @@ fn cancel_query(id: &str) -> bool {
     }
 }
 
-/// Stop any statement that has outlived its deadline. Runs on the reaper's
+/// Stop any statement that has outlived its deadline, and interrupt again
+/// any a canceller has reached that is still running. Runs on the reaper's
 /// tick, so the granularity of a timeout is the reap interval — which is the
 /// right trade for a limit measured in seconds and enforced by a thread that
 /// would otherwise be asleep.
+///
+/// The engine can lose an interrupt: one that lands a moment after a
+/// statement is submitted was measured to leave it running as if nobody had
+/// asked, a scan over a document param to its deadline, with its cancel
+/// answered true. A retained statement's canceller would wait on it all
+/// that time. So a cancel is fired again each tick for as long as its
+/// statement runs, which is harmless: it is aimed by id, and the engine
+/// clears a stray one as the next statement starts.
 fn cancel_expired() {
     let slots: Vec<Arc<SlotState>> = SLOTS.lock().unwrap().clone();
     let now = Instant::now();
@@ -626,7 +641,7 @@ fn cancel_expired() {
         // firing, the expired statement can finish and a fresh one begin, and
         // a cancel(None) would kill that innocent — the exact race the job-id
         // machinery exists to close (see SlotRun). A stale id finds nothing.
-        if let Some(job) = slot.expired_job(now) {
+        if let Some(job) = slot.expired_job(now).or_else(|| slot.unheeded_job()) {
             slot.cancel(Some(job));
         }
     }
