@@ -449,28 +449,38 @@ On the workspace, a file it records as attached and could not attach at its
 start, or whose catalog did not read once attached, is listed too, holding
 nothing, with why in `error` (`"/data/app.sqlite: no such file"`); `error` is
 `null` for a database that is attached. The engine reads every attached
-database's catalog together and lists none while one does not, so an
-attached SQLite file whose catalog does not read — not SQLite after all,
-replaced, or held locked by another program — is detached by the read that
-finds it, on any server, and listed the same way, holding nothing, with the
-engine's reason in `error`, while the rest of the catalog lists; the first
-read after it reads attaches it again under its name, as harbor attaches a
-SQLite file. While it is detached a read asks it on an attachment of its own
-that waits a tenth of a second on a lock, and the workspace records it as
-attached. A SQLite file harbor attaches waits a second on a lock
-(`BUSY_TIMEOUT 1000`; the engine's own default is five), so the read that
-finds a locked one waits about a second on it.
+database's catalog together and lists none while one does not, so an attached
+SQLite file whose catalog does not read fails every listing, on any server.
+One that does not read for good — not SQLite after all, replaced by a file
+that is not, or a read-only one deleted — is detached by the read that finds
+it and listed the same way, holding nothing, with the engine's reason in
+`error`, while the rest of the catalog lists. The first read after it reads
+attaches it again under its name when the workspace attached it from its
+record; one a client attached is left for the client to attach again, and a
+client's `DETACH` of its name forgets it. The workspace records either as
+attached. One that is only busy — held locked by a long write, harbor's own or
+another program's — stays attached, since detaching it would take it from
+every connection using it: the read answers with the catalog the server last
+read, the busy file's entry saying why in `error` and that the document may be
+stale, or, when the server has read none yet, a `400` that names the file.
+The read that meets a lock waits out the file's own wait on it, and a read
+while it stays busy asks the file alone, waiting a tenth of a second. A SQLite
+file harbor attaches waits a second on a lock (`BUSY_TIMEOUT 1000`; the
+engine's own default is five).
 A table or view another client drops, or a database it detaches, while the
 catalog is being read is left out; it never fails the read. An `ATTACH` or
 `DETACH` runs alone against every statement that reads the catalog — `/catalog`
 itself, the `duckdb_…` and `pragma_…` functions, `information_schema`, `SHOW`,
-`DESCRIBE` and the engine's completer — waiting for those running and holding
-back those that come after, since the engine brings itself down when a SQLite
-database is detached while a catalog read walks it. A view or macro whose body
-reads the catalog, itself or through another, reads it too: the server learns
-each one's body from the engine's catalog when it starts and after each
-`ATTACH`, and from each `CREATE VIEW`, `CREATE MACRO` and `ALTER VIEW … RENAME`
-before it runs.
+`DESCRIBE`, the engine's completer, and `query` and `query_table`, which run a
+statement or read a table named in a string — waiting for those running and
+holding back those that come after, since the engine brings itself down when a
+SQLite database is detached while a catalog read walks it. A view, macro or
+prepared statement whose body reads the catalog, itself or through another,
+reads it too: the server learns each one's body from the engine's catalog when
+it starts and after each `ATTACH`, `IMPORT DATABASE` and `COPY FROM DATABASE`,
+from each `CREATE VIEW`, `CREATE MACRO`, `PREPARE` and `ALTER VIEW … RENAME`
+before it runs, and from the `schema.sql` an `IMPORT DATABASE` runs, before it
+runs.
 
 The document is stable — same database, same bytes — so clients can diff it.
 A client that only wants an inventory asks `GET /catalog?style=lite` and gets

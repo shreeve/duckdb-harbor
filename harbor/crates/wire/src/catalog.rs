@@ -69,9 +69,11 @@ pub struct Attached {
     /// Why it is not attached, when it is a file the workspace records and
     /// its server could not attach at its start, the file gone or the
     /// engine's refusal, or a SQLite file the server detached because its
-    /// catalog stopped reading, locked or replaced, which it attaches again
-    /// once it reads. It then holds nothing. None for a database that is
-    /// attached.
+    /// catalog stopped reading for good, replaced or gone. It then holds
+    /// nothing. Or why it is listed as last read: a SQLite file still
+    /// attached whose catalog does not read for the moment, locked, so that the
+    /// whole document is the one the server last read, and may be stale.
+    /// None for a database that is attached and read.
     pub error: Option<String>,
     /// By (schema, name), in the served database's shape. `rowCount` is
     /// exact for a DuckDB catalog, and None for another engine's, where a

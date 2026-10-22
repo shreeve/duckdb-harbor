@@ -2832,6 +2832,9 @@ fn sessions_report() -> String {
 enum CatalogFailure {
     Refused(Refusal),
     Gone,
+    /// A listing met attached SQLite databases whose catalogs do not read
+    /// for the moment (`catalog_listing`).
+    Busy(Vec<Busy>),
 }
 
 /// Run one catalog query on this worker's own executor — the same connection
@@ -2892,7 +2895,22 @@ fn catalog_refuse(req: Request, failure: CatalogFailure) -> (bool, u16) {
             let _ = req.respond(error_response(503, code::UNAVAILABLE, "harbor is shutting down"));
             (false, 503)
         }
+        CatalogFailure::Busy(busy) => {
+            let named: Vec<String> = busy.iter().map(|b| format!("{} ({}): {}", b.name, b.path, b.why)).collect();
+            catalog_refuse(req, CatalogFailure::Refused(not_reading(&named)))
+        }
     }
+}
+
+/// The refusal of a listing that does not read while the attached
+/// databases `named`, each with why, do not.
+fn not_reading(named: &[String]) -> Refusal {
+    Refusal::sql(format!(
+        "the catalog does not read while an attached database's does not, since the engine reads \
+         every attached database's catalog together: {}. It reads again once that one does, or \
+         once it is detached",
+        named.join("; ")
+    ))
 }
 
 // One cell out of a catalog row, by position. The queries below name their
@@ -3223,21 +3241,64 @@ fn unattached_now(
     Ok(listed)
 }
 
-/// Why a SQLite file set aside is not attached, after the engine's reason.
+/// Why a SQLite file set aside is not attached, after the engine's reason,
+/// when the server attached it from the workspace's record
+/// ([`workspace::ours`]).
+const SET_ASIDE_OURS: &str = "detached by the server, since an attached database whose catalog does not read \
+                              fails every catalog read, and attached again by the first catalog read after it reads";
+/// The same, for any other: a client's to attach again.
 const SET_ASIDE: &str = "detached by the server, since an attached database whose catalog does not read \
-                         fails every catalog read, and attached again by the first catalog read after it reads";
+                         fails every catalog read; attach it again once it reads";
+
+/// Why an attached SQLite database is listed as the server last read it,
+/// after the engine's reason (`catalog_stale`).
+const STALE: &str = "its catalog does not read for the moment, and the engine reads every attached database's catalog \
+                     together, so this catalog is the one the server last read, and may be stale; it is read \
+                     anew once this one reads";
+
+/// An attached SQLite database whose catalog does not read for the moment, and
+/// the engine's reason: a lock another connection or program holds on its
+/// file, or a failure not known to last (`for_good`).
+#[derive(Debug, Clone)]
+struct Busy {
+    name: String,
+    path: String,
+    why: String,
+}
+
+/// The attached SQLite databases the last catalog read found busy, asked
+/// first by the next one (`still_busy`).
+static BUSY: Mutex<Vec<Busy>> = Mutex::new(Vec::new());
+
+/// The last catalog each style answered in full, for a read that meets a
+/// busy database (`catalog_stale`).
+static LAST_CATALOG: Mutex<(Option<Catalog>, Option<Inventory>)> = Mutex::new((None, None));
+
+/// Whether a SQLite file's catalog does not read for good, as far as the
+/// server can tell from `why`, the engine's reason: its file is gone, or
+/// the engine finds it is not a SQLite database or cannot open it. A lock
+/// passes, and so may anything else.
+fn for_good(path: &str, why: &str) -> bool {
+    let in_memory = path.is_empty() || path == ":memory:";
+    (!in_memory && !std::path::Path::new(path).is_file())
+        || ["file is not a database", "malformed", "unable to open database file"].iter().any(|m| why.contains(m))
+}
 
 /// One of the catalog functions' listings, which read every attached
 /// database's catalog at once: one database whose catalog does not read
 /// fails the listing of all of them, and the engine names the statement it
 /// sent the database and not the database. A SQLite file that is not
-/// SQLite, or that another program holds locked, does that, and attaching
-/// one reads nothing of it; and the engine lists no database's catalog
-/// alone. So a listing that fails asks each attached SQLite database alone,
-/// detaches each one that does not read and sets it aside, with its reason,
-/// as `aside` among `databases`, and lists again; a later read attaches it
-/// again once it reads (`take_back`). One that does not wait on a lock is
-/// not slowed. One that cannot be detached fails the listing, named.
+/// SQLite, or that a connection or another program holds locked, does
+/// that, and attaching one reads nothing of it; and the engine lists no
+/// database's catalog alone. So a listing that fails asks each attached
+/// SQLite database alone. One that does not read for good (`for_good`) is
+/// detached and set aside, with its reason, as `aside` among `databases`,
+/// and the listing runs again; a later read attaches it again once it
+/// reads when the server attached it from the workspace's record
+/// (`take_back`). One that is busy is left as it is, attached, and the
+/// listing fails as `Busy`, answered from the catalog last read
+/// (`catalog_stale`). One that does not wait on a lock is not slowed. One
+/// that cannot be detached fails the listing, named.
 fn catalog_listing(
     exec: Executor,
     peer: &justhttp::Peer,
@@ -3250,6 +3311,7 @@ fn catalog_listing(
     };
     let mut recorded: Option<Option<Vec<String>>> = None;
     let mut unreadable = Vec::new();
+    let mut busy = Vec::new();
     let mut set_aside = false;
     for i in 0..databases.len() {
         let database = &databases[i];
@@ -3261,6 +3323,10 @@ fn catalog_listing(
             Ok(()) => continue,
             Err(why) => why,
         };
+        if !for_good(&path, &why) {
+            busy.push(Busy { name: database.name.clone(), path, why });
+            continue;
+        }
         let detach = format!("DETACH {}", wire::open::quote_ident(&database.name));
         match catalog_rows(exec, peer, &detach) {
             Ok(_) => {}
@@ -3292,22 +3358,192 @@ fn catalog_listing(
             read_only: database.read_only,
         };
         let in_record = recorded.as_ref().and_then(|r| r.as_ref()).is_some_and(|r| r.contains(&record.name));
+        let ours = in_record && workspace::ours(&record.name);
+        let reason = format!("{why}: {}", if ours { SET_ASIDE_OURS } else { SET_ASIDE });
         workspace::set_aside(workspace::SetAside {
-            unattached: workspace::Unattached { record, reason: format!("{why}: {SET_ASIDE}") },
+            unattached: workspace::Unattached { record, reason },
             recorded: in_record,
+            ours,
         });
     }
     if !unreadable.is_empty() {
-        return Err(CatalogFailure::Refused(Refusal::sql(format!(
-            "the catalog does not read while an attached database's does not, since the engine reads \
-             every attached database's catalog together: {}. It reads again once that one does, or \
-             once it is detached",
-            unreadable.join("; ")
-        ))));
+        return Err(CatalogFailure::Refused(not_reading(&unreadable)));
     }
-    match set_aside {
-        true => catalog_rows(exec, peer, sql),
-        false => Err(CatalogFailure::Refused(refusal)),
+    if set_aside {
+        match catalog_rows(exec, peer, sql) {
+            Err(CatalogFailure::Refused(refusal)) if refusal.code == code::SQL_ERROR && !busy.is_empty() => {}
+            other => return other,
+        }
+    }
+    if busy.is_empty() {
+        return Err(CatalogFailure::Refused(refusal));
+    }
+    for b in &busy {
+        eprintln!("harbor: {} ({}) does not read for the moment, and stays attached: {}", b.name, b.path, b.why);
+    }
+    *BUSY.lock().unwrap() = busy.clone();
+    Err(CatalogFailure::Busy(busy))
+}
+
+/// The databases the last catalog read found busy that still are, asked
+/// alone (`reads_alone`) before the listings, so a read while one stays
+/// busy does not wait out its lock again: none when each reads, or is gone.
+fn still_busy(exec: Executor, peer: &justhttp::Peer, databases: &[CatalogDatabase]) -> Result<Vec<Busy>, CatalogFailure> {
+    let known = BUSY.lock().unwrap().clone();
+    let mut busy = Vec::new();
+    for b in known {
+        let attached = databases.iter().any(|d| !d.served && d.name == b.name && d.path.as_deref().unwrap_or_default() == b.path);
+        if !attached {
+            continue;
+        }
+        if let Err(why) = reads_alone(exec, peer, &b.name, &b.path)?
+            && !for_good(&b.path, &why)
+        {
+            busy.push(Busy { why, ..b });
+        }
+    }
+    if busy.is_empty() {
+        BUSY.lock().unwrap().clear();
+    }
+    Ok(busy)
+}
+
+/// An attached database's entry in either style, as a document answered
+/// from the one last read (`catalog_stale`) rewrites it.
+trait AttachedEntry: Clone {
+    fn key(&self) -> (&str, Option<&str>, bool);
+    fn error_mut(&mut self) -> &mut Option<String>;
+    fn holding_nothing(name: String, path: Option<String>, storage: String, read_only: bool, error: Option<String>) -> Self;
+}
+
+impl AttachedEntry for Attached {
+    fn key(&self) -> (&str, Option<&str>, bool) {
+        (&self.name, self.path.as_deref(), self.error.is_none())
+    }
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+    fn holding_nothing(name: String, path: Option<String>, storage: String, read_only: bool, error: Option<String>) -> Self {
+        Attached { name, path, storage, read_only, error, ..Attached::default() }
+    }
+}
+
+impl AttachedEntry for AttachedInventory {
+    fn key(&self) -> (&str, Option<&str>, bool) {
+        (&self.name, self.path.as_deref(), self.error.is_none())
+    }
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+    fn holding_nothing(name: String, path: Option<String>, storage: String, read_only: bool, error: Option<String>) -> Self {
+        AttachedInventory { name, path, storage, read_only, error, tables: Vec::new(), views: Vec::new() }
+    }
+}
+
+/// The attached databases of a document answered from `last`, the one last
+/// read: each database attached at this read, as `last` lists it when it lists it
+/// attached from the same path, holding nothing when it does not; each busy
+/// one with why (`STALE`); then what is unattached at this read, with why.
+fn stale_attached<E: AttachedEntry>(
+    last: &[E],
+    databases: &[CatalogDatabase],
+    busy: &[Busy],
+    unattached: Vec<workspace::Unattached>,
+) -> Vec<E> {
+    let mut attached: Vec<E> = Vec::new();
+    for d in databases.iter().filter(|d| !d.served && !d.aside) {
+        let mut entry = last
+            .iter()
+            .find(|e| e.key() == (d.name.as_str(), d.path.as_deref(), true))
+            .cloned()
+            .unwrap_or_else(|| E::holding_nothing(d.name.clone(), d.path.clone(), d.storage.clone(), d.read_only, None));
+        if let Some(b) = busy.iter().find(|b| b.name == d.name) {
+            *entry.error_mut() = Some(format!("{}: {STALE}", b.why));
+        }
+        attached.push(entry);
+    }
+    attached.extend(unattached.into_iter().map(|u| {
+        E::holding_nothing(u.record.name, Some(u.record.path), u.record.storage, u.record.read_only, Some(u.reason))
+    }));
+    attached.sort_by(|a, b| a.key().0.cmp(b.key().0));
+    attached
+}
+
+/// Answer a catalog read that met `busy`, attached SQLite databases whose
+/// catalogs do not read for the moment: the engine reads every attached
+/// database's catalog together, so nothing of the catalog lists until they
+/// read, and detaching one would take it from every connection using it,
+/// the server's own among them, as a long write to it holds its lock. So
+/// the read is answered with the catalog the server last read in the same
+/// style (the lite one from the full one when it has read only that), each
+/// busy database's entry saying why (`STALE`), the databases attached and
+/// unattached as this read finds them, and the sizes as it stats them. With no
+/// catalog read yet, the read is refused, naming each busy database.
+fn catalog_stale(
+    req: Request,
+    exec: Executor,
+    peer: &justhttp::Peer,
+    style: CatalogStyle,
+    databases: &[CatalogDatabase],
+    busy: Vec<Busy>,
+) -> (bool, u16) {
+    let (full, lite) = LAST_CATALOG.lock().unwrap().clone();
+    let lite = match (&style, lite, &full) {
+        (CatalogStyle::Lite, None, Some(full)) => Some(inventory_of(full)),
+        (_, lite, _) => lite,
+    };
+    let refused = matches!((&style, &full, &lite), (CatalogStyle::Full, None, _) | (CatalogStyle::Lite, _, None));
+    if refused {
+        return catalog_refuse(req, CatalogFailure::Busy(busy));
+    }
+    let unattached = match unattached_now(exec, peer, databases) {
+        Ok(unattached) => unattached,
+        Err(failure) => return catalog_refuse(req, failure),
+    };
+    let (database_size_bytes, wal_size_bytes) = database_disk_sizes();
+    let body = match style {
+        CatalogStyle::Full => {
+            let mut catalog = full.unwrap_or_default();
+            catalog.attached = stale_attached(&catalog.attached, databases, &busy, unattached);
+            (catalog.database_size_bytes, catalog.wal_size_bytes) = (database_size_bytes, wal_size_bytes);
+            serde_json::to_string(&catalog).unwrap()
+        }
+        CatalogStyle::Lite => {
+            let Some(mut inventory) = lite else { return catalog_refuse(req, CatalogFailure::Busy(busy)) };
+            inventory.attached = stale_attached(&inventory.attached, databases, &busy, unattached);
+            (inventory.database_size_bytes, inventory.wal_size_bytes) = (database_size_bytes, wal_size_bytes);
+            serde_json::to_string(&inventory).unwrap()
+        }
+    };
+    let _ = req.respond(json_response(200, &body));
+    (true, 200)
+}
+
+/// The lite style of a full catalog: what it names.
+fn inventory_of(catalog: &Catalog) -> Inventory {
+    let named = |schema: &str, name: &str| Named { name: name.to_string(), schema: schema.to_string() };
+    let tables = |tables: &[Table]| tables.iter().map(|t| named(&t.schema, &t.name)).collect::<Vec<_>>();
+    let views = |views: &[View]| views.iter().map(|v| named(&v.schema, &v.name)).collect::<Vec<_>>();
+    Inventory {
+        harbor_version: catalog.harbor_version.clone(),
+        duckdb_version: catalog.duckdb_version.clone(),
+        database_size_bytes: catalog.database_size_bytes,
+        wal_size_bytes: catalog.wal_size_bytes,
+        tables: tables(&catalog.tables),
+        views: views(&catalog.views),
+        attached: catalog
+            .attached
+            .iter()
+            .map(|a| AttachedInventory {
+                name: a.name.clone(),
+                path: a.path.clone(),
+                storage: a.storage.clone(),
+                read_only: a.read_only,
+                error: a.error.clone(),
+                tables: tables(&a.tables),
+                views: views(&a.views),
+            })
+            .collect(),
     }
 }
 
@@ -3330,7 +3566,7 @@ fn reads_alone(
         return match catalog_rows(exec, peer, &read(name)) {
             Ok(_) => Ok(Ok(())),
             Err(CatalogFailure::Refused(refusal)) => Ok(Err(why(refusal))),
-            Err(CatalogFailure::Gone) => Err(CatalogFailure::Gone),
+            Err(failure) => Err(failure),
         };
     }
     let probe = format!("harbor_probe_{}", next_job_id());
@@ -3342,14 +3578,14 @@ fn reads_alone(
     match catalog_rows(exec, peer, &attach) {
         Ok(_) => {}
         Err(CatalogFailure::Refused(refusal)) => return Ok(Err(why(refusal))),
-        Err(CatalogFailure::Gone) => return Err(CatalogFailure::Gone),
+        Err(failure) => return Err(failure),
     }
     let read = catalog_rows(exec, peer, &read(&probe));
     let _ = catalog_rows(exec, peer, &format!("DETACH {}", wire::open::quote_ident(&probe)));
     match read {
         Ok(_) => Ok(Ok(())),
         Err(CatalogFailure::Refused(refusal)) => Ok(Err(why(refusal))),
-        Err(CatalogFailure::Gone) => Err(CatalogFailure::Gone),
+        Err(failure) => Err(failure),
     }
 }
 
@@ -3357,10 +3593,13 @@ fn reads_alone(
 /// milliseconds: long enough to ride over a writer's commit.
 const PROBE_BUSY_MS: u32 = 100;
 
-/// Attach again each SQLite file set aside whose file reads (`reads_alone`),
-/// under its name, as its record attaches it, so one still locked costs a
-/// catalog read a few milliseconds. One whose row the workspace's record no
-/// longer holds is forgotten, not attached.
+/// Attach again each SQLite file set aside that the server attached from
+/// the workspace's record ([`workspace::ours`]) and whose file reads
+/// (`reads_alone`), under its name, as its record attaches it, so one still
+/// not reading costs a catalog read a few milliseconds. One whose row the
+/// record no longer holds is forgotten, not attached. Any other is a
+/// client's, attached with the client's options, and is left for a client
+/// to attach again.
 fn take_back(exec: Executor, peer: &justhttp::Peer) -> Result<(), CatalogFailure> {
     let aside = workspace::set_aside_now();
     if aside.is_empty() {
@@ -3388,9 +3627,17 @@ fn take_back(exec: Executor, peer: &justhttp::Peer) -> Result<(), CatalogFailure
             workspace::taken_back(&record.name);
             continue;
         }
+        if !a.ours {
+            continue;
+        }
         // A file gone is not attached, since attaching a missing path makes
         // an empty database there.
         if !std::path::Path::new(&record.path).is_file() || reads_alone(exec, peer, &record.name, &record.path)?.is_err() {
+            continue;
+        }
+        // A client's DETACH of its name since forgot it.
+        let _taking = workspace::taking();
+        if !workspace::set_aside_now().iter().any(|s| s.unattached.record.name == record.name) {
             continue;
         }
         match catalog_rows(exec, peer, &record.attach_sql()) {
@@ -3399,7 +3646,7 @@ fn take_back(exec: Executor, peer: &justhttp::Peer) -> Result<(), CatalogFailure
                 workspace::taken_back(&record.name);
             }
             Err(CatalogFailure::Refused(_)) => {}
-            Err(CatalogFailure::Gone) => return Err(CatalogFailure::Gone),
+            Err(failure) => return Err(failure),
         }
     }
     Ok(())
@@ -3494,9 +3741,12 @@ fn view_error(refusal: &Refusal) -> Option<String> {
 /// file it records and could not attach at its start is listed there too,
 /// holding nothing, with why in `error`, and the record itself, in the
 /// `_harbor` schema, is not listed (`workspace`). An attached SQLite file
-/// whose own catalog does not read, which would fail every listing, is
-/// detached and listed there the same way, and attached again by a later
-/// read once it reads (`catalog_listing`, `take_back`).
+/// whose own catalog does not read fails every listing: one that does not
+/// read for good is detached and listed there the same way, and attached
+/// again by a later read once it reads when the workspace attached it
+/// (`catalog_listing`, `take_back`); one that is busy stays attached, and
+/// the read is answered with the catalog last read, the busy one saying
+/// why (`catalog_stale`).
 ///
 /// Ordering is part of the contract: tables and views by (schema, name),
 /// attached databases by name, columns in ordinal position, indexes and
@@ -3544,6 +3794,13 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         .collect();
     let database_of: HashMap<String, usize> =
         databases.iter().enumerate().map(|(i, d)| (d.name.clone(), i)).collect();
+    // A database the last read found busy that still is answers this one
+    // from the catalog last read, without waiting out its lock again.
+    match still_busy(exec, &peer, &databases) {
+        Ok(busy) if !busy.is_empty() => return catalog_stale(req, exec, &peer, style, &databases, busy),
+        Ok(_) => {}
+        Err(failure) => return catalog_refuse(req, failure),
+    }
     let table_sql = match style {
         CatalogStyle::Full => {
             "SELECT database_name, schema_name, table_name, sql FROM duckdb_tables() \
@@ -3558,6 +3815,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
     };
     let table_rows = match catalog_listing(exec, &peer, table_sql, &mut databases) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     let view_rows = match catalog_listing(
@@ -3568,6 +3826,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     // The workspace's record of what is attached in it is Harbor's, and is
@@ -3630,6 +3889,8 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
             views: named_in(&view_rows, served),
             attached,
         };
+        LAST_CATALOG.lock().unwrap().1 = Some(inventory.clone());
+        BUSY.lock().unwrap().clear();
         let _ = req.respond(json_response(200, &serde_json::to_string(&inventory).unwrap()));
         return (true, 200);
     }
@@ -3704,6 +3965,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     let constraint_rows = match catalog_listing(
@@ -3716,6 +3978,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     // duckdb_indexes() lists only the indexes CREATE INDEX made; the internal
@@ -3730,6 +3993,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     let sequence_rows = match catalog_rows(
@@ -3859,6 +4123,7 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         &mut databases,
     ) {
         Ok(rows) => rows,
+        Err(CatalogFailure::Busy(busy)) => return catalog_stale(req, exec, &peer, style, &databases, busy),
         Err(failure) => return catalog_refuse(req, failure),
     };
     let mut present: std::collections::HashSet<RelationKey> = present_rows.iter().map(key_of).collect();
@@ -3970,7 +4235,10 @@ fn run_catalog(req: Request, exec: Executor) -> (bool, u16) {
         views: served_views,
         attached,
     };
-    let _ = req.respond(json_response(200, &serde_json::to_string(&catalog).unwrap()));
+    let body = serde_json::to_string(&catalog).unwrap();
+    LAST_CATALOG.lock().unwrap().0 = Some(catalog);
+    BUSY.lock().unwrap().clear();
+    let _ = req.respond(json_response(200, &body));
     (true, 200)
 }
 
@@ -4068,10 +4336,11 @@ fn run_sql(req: Request, mut parsed: SqlRequest, pooled: Option<Executor>) -> (b
         Ok(std::borrow::Cow::Borrowed(_)) => {}
         Err(e) => return refuse(req, Refusal::bad_request(e)),
     }
-    // A client's DETACH of a SQLite file the server set aside detaches it as
-    // the client meant: it is not attached again.
-    if let Some(name) = detached_name(&parsed.sql) {
-        workspace::taken_back(&String::from_utf8_lossy(&name));
+    // A client's DETACH or ATTACH of a name is the client's: a file the
+    // server set aside under it, or one the server attached under it from
+    // the workspace's record, is not the server's to attach again.
+    if let Some(name) = detached_name(&parsed.sql).or_else(|| attached_name(&parsed.sql)) {
+        workspace::claimed(&String::from_utf8_lossy(&name));
     }
 
     // `USE` sets the CURRENT DATABASE on the connection it runs on, and
@@ -4366,8 +4635,9 @@ enum Gate {
 /// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
 /// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
 /// `information_schema`, `sql_auto_complete` or `sqlite_query`, which reads
-/// an attached SQLite database by its name; or a view or macro whose body
-/// reads it (`CatalogNames`). A name in a string or a comment does not
+/// an attached SQLite database by its name; `query` or `query_table`,
+/// which run a statement or read a table named in a string; or a view,
+/// macro or prepared statement whose body reads it (`CatalogNames`). A name in a string or a comment does not
 /// count.
 fn catalog_gate(sql: &str) -> Gate {
     gate_of(sql, &CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner))
@@ -4392,6 +4662,8 @@ fn catalog_word(word: &[u8]) -> bool {
         || word == b"information_schema"
         || word == b"sql_auto_complete"
         || word == b"sqlite_query"
+        || word == b"query"
+        || word == b"query_table"
 }
 
 /// Each name a statement uses, lowercased, as the engine matches names: a
@@ -4425,16 +4697,19 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
 /// `duckdb_tables()` reads it when it is read, and `SELECT * FROM v` names
 /// no catalog function, so the gate knows such names. Each view's and
 /// macro's name is kept with the names its body uses, learned from the
-/// engine's catalog when the pool opens and after each `ATTACH`, since an
-/// attached DuckDB file brings its own, and from each `CREATE VIEW`,
-/// `CREATE MACRO` and `ALTER VIEW … RENAME` as it passes, before it runs.
-/// A name is never forgotten: one dropped, or kept by another schema's view
-/// of its name, costs a statement that names it the shared gate and nothing
-/// else.
+/// engine's catalog when the pool opens and after each `ATTACH`, `IMPORT
+/// DATABASE` and `COPY FROM DATABASE`, since each brings views of its own,
+/// and from each `CREATE VIEW`, `CREATE MACRO`, `PREPARE` and `ALTER VIEW …
+/// RENAME` as it passes, before it runs, and the views and macros of the
+/// `schema.sql` an `IMPORT DATABASE` runs, before it runs. A name is never
+/// forgotten: one dropped, or kept by another schema's view of its name,
+/// costs a statement that names it the shared gate and nothing else.
 #[derive(Default)]
 struct CatalogNames {
     /// Each name, lowercased, with the names its bodies use.
     uses: HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>>,
+    /// Each name used, with the names whose bodies use it.
+    used_by: HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>>,
     /// The names whose bodies read the catalog, themselves or through
     /// another such name.
     reads: std::collections::HashSet<Vec<u8>>,
@@ -4442,55 +4717,131 @@ struct CatalogNames {
 
 static CATALOG_NAMES: std::sync::LazyLock<RwLock<CatalogNames>> = std::sync::LazyLock::new(Default::default);
 
+/// The names `body` uses, lowercased.
+fn used_names(body: &str) -> std::collections::HashSet<Vec<u8>> {
+    let mut used = std::collections::HashSet::new();
+    names_in(body, |word| {
+        used.insert(word.to_vec());
+        false
+    });
+    used
+}
+
 impl CatalogNames {
     /// `name`, whose body is `body`.
+    #[cfg(test)]
     fn learn(&mut self, name: &[u8], body: &str) {
-        let mut used = std::collections::HashSet::new();
-        names_in(body, |word| {
-            used.insert(word.to_vec());
-            false
-        });
-        self.uses.entry(name.to_ascii_lowercase()).or_default().extend(used);
-        self.settle();
+        self.learn_all(vec![(name.to_vec(), used_names(body))]);
+    }
+
+    /// Each name with the names its body uses ([`used_names`]), then what
+    /// reads the catalog among them and the names that use them, settled
+    /// once: as cheap for the whole catalog as for one name.
+    fn learn_all(&mut self, learned: Vec<(Vec<u8>, std::collections::HashSet<Vec<u8>>)>) {
+        let mut names = Vec::with_capacity(learned.len());
+        for (name, used) in learned {
+            let name = name.to_ascii_lowercase();
+            self.add(&name, used);
+            names.push(name);
+        }
+        self.settle(names);
     }
 
     /// `to` takes what `from` uses, as a view renamed does.
     fn rename(&mut self, from: &[u8], to: &[u8]) {
         let used = self.uses.get(from).cloned().unwrap_or_default();
-        self.uses.entry(to.to_vec()).or_default().extend(used);
-        self.settle();
+        self.add(to, used);
+        self.settle(vec![to.to_vec()]);
     }
 
-    fn settle(&mut self) {
-        loop {
-            let more: Vec<Vec<u8>> = self
-                .uses
-                .iter()
-                .filter(|(name, used)| {
-                    !self.reads.contains(*name) && used.iter().any(|u| catalog_word(u) || self.reads.contains(u))
-                })
-                .map(|(name, _)| name.clone())
-                .collect();
-            if more.is_empty() {
-                return;
+    fn add(&mut self, name: &[u8], used: std::collections::HashSet<Vec<u8>>) {
+        for u in &used {
+            self.used_by.entry(u.clone()).or_default().insert(name.to_vec());
+        }
+        self.uses.entry(name.to_vec()).or_default().extend(used);
+    }
+
+    /// Mark each of `names` that reads the catalog, and every name that
+    /// uses one marked, through the names that use it: each name is marked
+    /// once, so the work is the names and their uses, once.
+    fn settle(&mut self, names: Vec<Vec<u8>>) {
+        let reads = |this: &Self, name: &Vec<u8>| {
+            this.uses.get(name).is_some_and(|used| used.iter().any(|u| catalog_word(u) || this.reads.contains(u)))
+        };
+        let mut work: Vec<Vec<u8>> = names.into_iter().filter(|n| !self.reads.contains(n) && reads(self, n)).collect();
+        while let Some(name) = work.pop() {
+            if !self.reads.insert(name.clone()) {
+                continue;
             }
-            self.reads.extend(more);
+            if let Some(users) = self.used_by.get(&name) {
+                work.extend(users.iter().filter(|u| !self.reads.contains(*u)).cloned());
+            }
         }
     }
 }
 
 /// Learn the views and macros a statement makes or renames, before it runs
-/// (`CatalogNames`).
+/// (`CatalogNames`), and those of the `schema.sql` an `IMPORT DATABASE`
+/// runs.
 fn learn_from_statement(sql: &str) {
-    if !matches!(acting_keyword(sql).as_str(), "CREATE" | "ALTER") {
-        return;
+    match acting_keyword(sql).as_str() {
+        "CREATE" | "ALTER" | "PREPARE" => learn_made(sql),
+        "IMPORT" => {
+            for statement in imported_statements(sql) {
+                if matches!(acting_keyword(&statement).as_str(), "CREATE" | "ALTER") {
+                    learn_made(&statement);
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+fn learn_made(sql: &str) {
     let Some(made) = made_name(sql) else { return };
+    let used = match &made {
+        Made::Body(_) => used_names(sql),
+        Made::Renamed { .. } => Default::default(),
+    };
     let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
     match made {
-        Made::Body(name) => names.learn(&name, sql),
+        Made::Body(name) => names.learn_all(vec![(name, used)]),
         Made::Renamed { from, to } => names.rename(&from, &to),
     }
+}
+
+/// The statements of the `schema.sql` an `IMPORT DATABASE 'directory'`
+/// runs, where the engine finds it: none when there is no such file.
+fn imported_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let Some(path) = wire::scan::scan(sql)
+        .into_iter()
+        .find(|s| matches!(s.kind, wire::scan::Kind::Str) && bytes[s.start] == b'\'')
+    else {
+        return Vec::new();
+    };
+    let quoted = &sql[path.start + 1..path.end.saturating_sub(1).max(path.start + 1)];
+    let directory = quoted.replace("''", "'");
+    let Ok(schema) = std::fs::read_to_string(std::path::Path::new(&directory).join("schema.sql")) else {
+        return Vec::new();
+    };
+    statements_of(&schema)
+}
+
+/// `script`'s statements, split at each `;` of its code.
+fn statements_of(script: &str) -> Vec<String> {
+    let bytes = script.as_bytes();
+    let mut statements = Vec::new();
+    let mut start = 0;
+    for span in wire::scan::scan(script).into_iter().filter(|s| matches!(s.kind, wire::scan::Kind::Code)) {
+        for at in (span.start..span.end).filter(|&i| bytes[i] == b';') {
+            statements.push(script[start..at].to_string());
+            start = at + 1;
+        }
+    }
+    statements.push(script[start..].to_string());
+    statements.retain(|s| !s.trim().is_empty());
+    statements
 }
 
 /// Learn every view and macro the engine lists on `conn` (`CatalogNames`).
@@ -4509,20 +4860,75 @@ pub(crate) fn learn_catalog_names(conn: &mut Connection) {
             return;
         }
     };
-    let mut names = CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner);
-    for row in rows {
-        if let Ok((name, body)) = serde_json::from_str::<(String, String)>(&row) {
-            names.learn(name.as_bytes(), &body);
+    // Read outside the lock, which the gate of every statement takes.
+    let learned: Vec<_> = rows
+        .iter()
+        .filter_map(|row| serde_json::from_str::<(String, String)>(row).ok())
+        .map(|(name, body)| (name.into_bytes(), used_names(&body)))
+        .collect();
+    CATALOG_NAMES.write().unwrap_or_else(PoisonError::into_inner).learn_all(learned);
+}
+
+/// Whether a statement brings views and macros the engine makes, read from
+/// the engine once it has run: an `ATTACH` but of a SQLite file
+/// (`attaches_sqlite`), whose views are SQLite's, so that reading its
+/// catalog, which waits on its file, is spared, and so is harbor's own
+/// question whether one reads; an `IMPORT DATABASE`; and a `COPY FROM
+/// DATABASE`.
+fn brings_views(sql: &str) -> bool {
+    match acting_keyword(sql).as_str() {
+        "ATTACH" => !attaches_sqlite(sql),
+        "IMPORT" => true,
+        "COPY" => {
+            let mut tokens = Vec::new();
+            names_in_order(sql, &mut tokens);
+            let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(t)) if t == w.as_bytes());
+            tokens
+                .iter()
+                .position(|t| word(Some(t), "copy"))
+                .is_some_and(|at| word(tokens.get(at + 1), "from") && word(tokens.get(at + 2), "database"))
         }
+        _ => false,
     }
 }
 
-/// Whether a statement attaches a database that may hold views and macros
-/// of the engine's own: an `ATTACH` but of a SQLite file, whose views are
-/// SQLite's, so that reading its catalog, which waits on its file, is
-/// spared, and so is harbor's own question whether one reads.
-fn attaches_views(sql: &str) -> bool {
-    acting_keyword(sql) == "ATTACH" && !names_in(sql, |word| word == b"sqlite" || word == b"sqlite3")
+/// Whether an `ATTACH` attaches a SQLite file, as the engine reads the
+/// statement: a path led by `sqlite:`, or a `TYPE sqlite` option. A
+/// database named `sqlite` is not one.
+fn attaches_sqlite(sql: &str) -> bool {
+    let sqlite = |name: &[u8]| name == b"sqlite" || name == b"sqlite3";
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let bytes = sql.as_bytes();
+    let (mut path, mut after_type) = (true, false);
+    for span in wire::scan::scan(sql) {
+        let text = &bytes[span.start..span.end];
+        match span.kind {
+            wire::scan::Kind::Code => {
+                for word in text.split(|&c| !is_word(c)).filter(|w| !w.is_empty()) {
+                    let word = word.to_ascii_lowercase();
+                    if after_type && sqlite(&word) {
+                        return true;
+                    }
+                    after_type = word == b"type";
+                }
+            }
+            wire::scan::Kind::Str => {
+                let inner = text.get(1..text.len().saturating_sub(1)).unwrap_or_default().to_ascii_lowercase();
+                if path && text[0] == b'\'' {
+                    path = false;
+                    if inner.starts_with(b"sqlite:") || inner.starts_with(b"sqlite3:") {
+                        return true;
+                    }
+                } else if after_type && sqlite(&inner) {
+                    return true;
+                }
+                after_type = false;
+            }
+            wire::scan::Kind::LineComment | wire::scan::Kind::BlockComment => {}
+            wire::scan::Kind::Dollar => after_type = false,
+        }
+    }
+    false
 }
 
 /// What a `CREATE` or `ALTER` makes, by its last name part, lowercased.
@@ -4537,7 +4943,8 @@ enum Made {
 /// The view or macro a statement makes: `CREATE [OR REPLACE] [TEMP |
 /// TEMPORARY] [RECURSIVE] VIEW | MACRO | FUNCTION [IF NOT EXISTS] name`,
 /// or `ALTER VIEW [IF EXISTS] name RENAME TO name`, a name being one to
-/// three parts, each a word or a quoted name.
+/// three parts, each a word or a quoted name; or the prepared statement a
+/// `PREPARE name AS` makes, which `EXECUTE name` runs.
 fn made_name(sql: &str) -> Option<Made> {
     let mut tokens = Vec::new();
     names_in_order(sql, &mut tokens);
@@ -4577,6 +4984,10 @@ fn made_name(sql: &str) -> Option<Made> {
         }
         return name(&mut at).map(Made::Body);
     }
+    if word(at, "prepare") {
+        at += 1;
+        return name(&mut at).map(Made::Body);
+    }
     if word(at, "alter") && word(at + 1, "view") {
         at += 2;
         if word(at, "if") && word(at + 1, "exists") {
@@ -4614,8 +5025,33 @@ fn detached_name(sql: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// A statement's leading tokens, as `made_name` and `detached_name` read
-/// them.
+/// The database an `ATTACH` names, lowercased: the name after `AS`, else
+/// the file's name without its extension, as the engine names it.
+fn attached_name(sql: &str) -> Option<Vec<u8>> {
+    if acting_keyword(sql) != "ATTACH" {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let spans = wire::scan::scan(sql);
+    let at = spans.iter().position(|s| matches!(s.kind, wire::scan::Kind::Str) && bytes[s.start] == b'\'')?;
+    let path = &spans[at];
+    let after = &sql[path.end..];
+    let mut tokens = Vec::new();
+    names_in_order(after, &mut tokens);
+    match (tokens.first(), tokens.get(1)) {
+        (Some(Token::Word(w)), Some(Token::Word(name) | Token::Quoted(name))) if w == b"as" => Some(name.clone()),
+        _ => {
+            let quoted = sql[path.start + 1..path.end.saturating_sub(1).max(path.start + 1)].replace("''", "'");
+            let file = quoted.rsplit(['/', '\\']).next().unwrap_or_default();
+            let file = file.split_once(':').map_or(file, |(_, rest)| rest);
+            let stem = file.split('.').next().unwrap_or_default();
+            (!stem.is_empty()).then(|| stem.to_ascii_lowercase().into_bytes())
+        }
+    }
+}
+
+/// A statement's leading tokens, as `made_name`, `detached_name` and
+/// `attached_name` read them.
 enum Token {
     Word(Vec<u8>),
     Quoted(Vec<u8>),
@@ -4671,7 +5107,7 @@ fn names_in_order(sql: &str, tokens: &mut Vec<Token>) {
 }
 
 /// The gate as a statement holds it: one guard or the other, or neither.
-/// Held, never read; dropped when the statement is over.
+/// Held, and asked only which it is; dropped when the statement is over.
 #[allow(dead_code)]
 enum Passed {
     Open,
@@ -5249,7 +5685,7 @@ fn execute_jobs(
         // its transaction is left aborted, as for a cancel before it began.
         // A view or macro the statement makes is known to the gate first.
         learn_from_statement(&sql);
-        let attaches = attaches_views(&sql);
+        let brings = brings_views(&sql);
         let Some(_passed) = pass_gate(catalog_gate(&sql), &state) else {
             on_slot.finish();
             conn.abort_transaction();
@@ -5287,9 +5723,10 @@ fn execute_jobs(
                 true
             }
         };
-        // The views and macros of a database attached, read while the gate
-        // is still held alone.
-        if attaches {
+        // The views and macros a database attached or imported brings, read
+        // under the gate: still held alone after an ATTACH.
+        if brings {
+            let _reading = matches!(_passed, Passed::Open).then(reading_catalog);
             learn_catalog_names(&mut conn);
         }
     }
@@ -5626,6 +6063,17 @@ mod tests {
         for sql in ["SELECT * FROM plain", "SELECT 'v'", "SELECT 1 -- v", "SELECT vv FROM t"] {
             assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
         }
+        // A statement in a string, run by query(), and a table named in one.
+        names.learn(b"q", "CREATE VIEW q AS SELECT * FROM query('SELECT * FROM duckdb_tables()')");
+        names.learn(b"p", "PREPARE p AS SELECT * FROM duckdb_columns()");
+        for sql in [
+            "SELECT count(*) FROM query('SELECT * FROM duckdb_tables()')",
+            "SELECT count(*) FROM query_table('v')",
+            "FROM q",
+            "EXECUTE p",
+        ] {
+            assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
+        }
 
         let body = |name: &str| Some(Made::Body(name.as_bytes().to_vec()));
         assert_eq!(made_name("CREATE VIEW v AS SELECT 1"), body("v"));
@@ -5633,6 +6081,7 @@ mod tests {
         assert_eq!(made_name("CREATE /* c */ RECURSIVE VIEW `R`(n) AS SELECT 1"), body("r"));
         assert_eq!(made_name("CREATE MACRO s.m(a) AS TABLE SELECT a"), body("m"));
         assert_eq!(made_name("CREATE FUNCTION f(a) AS a + 1"), body("f"));
+        assert_eq!(made_name("PREPARE \"P\" AS SELECT 1"), body("p"));
         assert_eq!(
             made_name("ALTER VIEW IF EXISTS s.v RENAME TO w"),
             Some(Made::Renamed { from: b"v".to_vec(), to: b"w".to_vec() })
@@ -5643,15 +6092,139 @@ mod tests {
     }
 
     #[test]
+    fn the_names_that_read_the_catalog_settle_once_however_many() {
+        use super::{CatalogNames, used_names};
+        // A chain of twenty thousand views, each over the one before, the
+        // first over the catalog, listed last first, as the engine may
+        // list them: settled in one pass, where a pass per name is
+        // quadratic.
+        let mut learned: Vec<_> = (1..20_000)
+            .rev()
+            .map(|i| (format!("v{i}").into_bytes(), used_names(&format!("CREATE VIEW v{i} AS SELECT * FROM v{}", i - 1))))
+            .collect();
+        learned.push((b"v0".to_vec(), used_names("CREATE VIEW v0 AS SELECT * FROM duckdb_tables()")));
+        learned.push((b"plain".to_vec(), used_names("CREATE VIEW plain AS SELECT * FROM t")));
+        let mut names = CatalogNames::default();
+        names.learn_all(learned);
+        assert_eq!(names.reads.len(), 20_000);
+        assert!(names.reads.contains(b"v19999".as_slice()) && !names.reads.contains(b"plain".as_slice()));
+        // One learned later over the chain reads it too.
+        names.learn(b"top", "CREATE VIEW top AS SELECT * FROM v19999");
+        assert!(names.reads.contains(b"top".as_slice()));
+    }
+
+    #[test]
+    fn an_import_names_the_views_its_schema_makes() {
+        use super::{imported_statements, statements_of};
+        assert_eq!(
+            statements_of("CREATE VIEW a AS SELECT ';';\n-- ; x\nCREATE MACRO m() AS 1 ;\n\n"),
+            ["CREATE VIEW a AS SELECT ';'", "\n-- ; x\nCREATE MACRO m() AS 1 "]
+        );
+        let dir = std::env::temp_dir().join(format!("harbor-import-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("it's")).unwrap();
+        std::fs::write(dir.join("it's").join("schema.sql"), "CREATE TABLE t(a INTEGER);\nCREATE VIEW iv AS SELECT * FROM duckdb_tables();\n").unwrap();
+        let path = dir.join("it's").to_string_lossy().replace('\'', "''");
+        let statements = imported_statements(&format!("IMPORT DATABASE '{path}'"));
+        assert_eq!(statements.len(), 2);
+        assert!(statements[1].contains("CREATE VIEW iv"));
+        assert!(imported_statements("IMPORT DATABASE '/no/such/directory'").is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sqlite_file_that_is_busy_is_listed_as_last_read_and_one_gone_for_good_is_not() {
+        use super::{Busy, CatalogDatabase, STALE, for_good, stale_attached, workspace};
+        let here = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        let locked = "Failed to prepare query \"SELECT count(*) FROM sqlite_master\": database is locked";
+        assert!(!for_good(&here, locked));
+        assert!(!for_good("", locked));
+        assert!(for_good("/no/such/file.sqlite", locked));
+        assert!(for_good(&here, "Failed to prepare query: file is not a database"));
+        assert!(for_good(&here, "Unable to open database: unable to open database file"));
+
+        let entry = |name: &str, path: &str, tables: &[&str], error: Option<&str>| wire::catalog::Attached {
+            name: name.into(),
+            path: Some(path.into()),
+            storage: "sqlite".into(),
+            error: error.map(str::to_string),
+            tables: tables.iter().map(|t| wire::catalog::Table { name: t.to_string(), ..Default::default() }).collect(),
+            ..Default::default()
+        };
+        let last = [
+            entry("app", "/x/app.sqlite", &["people"], None),
+            entry("gone", "/x/gone.sqlite", &[], Some("/x/gone.sqlite: no such file")),
+            entry("moved", "/x/old.sqlite", &["t"], None),
+        ];
+        let database = |name: &str, path: &str, served: bool| CatalogDatabase {
+            name: name.into(),
+            path: Some(path.into()),
+            storage: if served { "duckdb".into() } else { "sqlite".into() },
+            read_only: false,
+            served,
+            aside: false,
+        };
+        let databases = [
+            database("app", "/x/app.sqlite", false),
+            database("main", "/x/main.duckdb", true),
+            database("moved", "/x/new.sqlite", false),
+            database("since", "/x/since.sqlite", false),
+        ];
+        let busy = [Busy { name: "app".into(), path: "/x/app.sqlite".into(), why: "database is locked".into() }];
+        let unattached = vec![workspace::Unattached {
+            record: wire::open::Record { name: "gone".into(), path: "/x/gone.sqlite".into(), storage: "sqlite".into(), read_only: false },
+            reason: "/x/gone.sqlite: no such file".into(),
+        }];
+        let listed: Vec<_> = stale_attached(&last, &databases, &busy, unattached)
+            .into_iter()
+            .map(|a| (a.name, a.tables.into_iter().map(|t| t.name).collect::<Vec<_>>(), a.error))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("app".to_string(), vec!["people".to_string()], Some(format!("database is locked: {STALE}"))),
+                ("gone".to_string(), vec![], Some("/x/gone.sqlite: no such file".to_string())),
+                // Attached from another file since: nothing of the last read is its.
+                ("moved".to_string(), vec![], None),
+                ("since".to_string(), vec![], None),
+            ]
+        );
+    }
+
+    #[test]
     fn a_detach_names_its_database_and_a_sqlite_attach_brings_no_views() {
-        use super::{attaches_views, detached_name};
+        use super::{brings_views, detached_name};
         assert_eq!(detached_name("DETACH app"), Some(b"app".to_vec()));
         assert_eq!(detached_name("/* x */ detach database if exists \"My App\""), Some(b"my app".to_vec()));
         assert_eq!(detached_name("SELECT 1"), None);
-        assert!(attaches_views("ATTACH '/x/a.duckdb' AS a"));
-        assert!(attaches_views("ATTACH 'sqlite.duckdb'"));
-        assert!(!attaches_views("ATTACH '/x/a.db' AS a (TYPE sqlite, READ_ONLY)"));
-        assert!(!attaches_views("DETACH a"));
+        use super::attached_name;
+        assert_eq!(attached_name("ATTACH '/x/a.sqlite' AS App (TYPE sqlite)"), Some(b"app".to_vec()));
+        assert_eq!(attached_name("attach database if not exists '/x/a.db' as \"My App\""), Some(b"my app".to_vec()));
+        assert_eq!(attached_name("ATTACH '/x/Some.File.duckdb'"), Some(b"some".to_vec()));
+        assert_eq!(attached_name("ATTACH 'sqlite:/x/b.db' (READ_ONLY)"), Some(b"b".to_vec()));
+        assert_eq!(attached_name("DETACH a"), None);
+        for sql in [
+            "ATTACH '/x/a.duckdb' AS a",
+            "ATTACH 'sqlite.duckdb'",
+            "ATTACH '/x/a.duckdb' AS sqlite",
+            "ATTACH '/x/sqlite' AS \"sqlite\" (READ_ONLY) -- TYPE sqlite",
+            "ATTACH '/x/a.duckdb' AS a (TYPE duckdb, READ_ONLY)",
+            "IMPORT DATABASE '/x/export'",
+            "COPY FROM DATABASE a TO b",
+            "explain analyze copy from database a to b (schema)",
+        ] {
+            assert!(brings_views(sql), "{sql}");
+        }
+        for sql in [
+            "ATTACH '/x/a.db' AS a (TYPE sqlite, READ_ONLY)",
+            "ATTACH '/x/a.db' AS a (READ_ONLY, type SQLITE3)",
+            "ATTACH '/x/a.db' AS a (TYPE 'sqlite')",
+            "ATTACH 'sqlite:/x/a.db' AS a",
+            "DETACH a",
+            "COPY t FROM 'x.csv'",
+            "SELECT 1",
+        ] {
+            assert!(!brings_views(sql), "{sql}");
+        }
     }
 
     #[test]

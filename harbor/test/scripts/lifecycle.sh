@@ -911,10 +911,10 @@ workspace_stop
 check "its row stays in the record" 0 "1" \
   "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'notsq'"
 wait_gone
-# A writer that holds a SQLite file locked: a catalog read detaches it and
-# lists it with why, in about the second harbor's attachment waits, not the
-# engine's five, and the rest of the catalog reads; a later read attaches it
-# again once it reads.
+# A writer that holds a SQLite file locked, any connection or another
+# program: the file stays attached, and a catalog read answers as the
+# server last read it, the file saying why, in about the second harbor's
+# attachment waits, not the engine's five; a later read asks the file alone.
 lock_sqlite() { # lock_sqlite <file>: hold it locked until killed; returns once held
   python3 -c '
 import sqlite3, sys, time
@@ -925,6 +925,12 @@ time.sleep(60)' "$1" > "$work/lock.out" 2>&1 &
   locker=$!
   for _ in $(seq 1 50); do grep -q locked "$work/lock.out" 2>/dev/null && return; sleep 0.1; done
 }
+# A file replaced by one that is not SQLite, and put back.
+replace_sqlite() {
+  mv "$work/files/app.sqlite" "$work/files/app.keep"
+  printf 'not a SQLite file, and long enough to be read as one: %.0s' 1 2 3 4 > "$work/files/app.sqlite"
+}
+restore_sqlite() { mv "$work/files/app.keep" "$work/files/app.sqlite"; }
 workspace_start
 check "a SQLite file attaches in the workspace again" 0 "app: the SQLite database" \
   "$harbor" "$work/files/app.sqlite" --mode csv -c "SELECT count(*) FROM app.people"
@@ -932,35 +938,58 @@ catalog_timed() { # the status and seconds of a catalog read, its lines in $work
   curl -s -o "$work/cat.json" -w '%{http_code} %{time_total}\n' --max-time 20 \
     --unix-socket "$(live_sock)" http://harbor/catalog
 }
+# Attached by the start, from the record, as harbor attaches a SQLite file.
+workspace_stop
+workspace_start
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "the start attaches it, and the catalog reads it" \
+  || bad "before the lock: $(catalog_lines)"
 lock_sqlite "$work/files/app.sqlite"
 read -r status secs < <(catalog_timed)
 lines=$(catalog_lines)
-[[ $status == 200 && $lines == *"attached app [] "*"database is locked"*"detached by the server"* ]] \
-  && ok "a locked one is detached, and the catalog lists it with why" || bad "the catalog of a locked file: $status $lines"
+[[ $status == 200 && $lines == *"attached app ['people'] "*"database is locked"*"may be stale"* ]] \
+  && ok "a locked one stays attached, and the catalog lists it as last read, with why" \
+  || bad "the catalog of a locked file: $status $lines"
 [[ $lines == *"view it_s_q1 reads"* ]] && ok "and the rest of the catalog reads" || bad "the catalog beside it: $lines"
 python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 4 else 1)" "$secs" \
   && ok "in about a second (${secs}s)" || bad "the catalog of a locked file took ${secs}s"
 read -r status secs < <(catalog_timed)
 python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 1 else 1)" "$secs" \
   && ok "and a read while it stays locked waits on it no longer (${secs}s)" || bad "the next read took ${secs}s"
+out=$("$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM app.people" 2>&1)
+[[ $out == *"locked"* && $out != *"does not exist"* ]] && ok "and a statement that reads it waits on its lock" \
+  || bad "a statement on a locked file: $out"
 kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
-[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is attached again once the lock is gone" \
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is read anew once the lock is gone" \
   || bad "after the lock: $(catalog_lines)"
-lock_sqlite "$work/files/app.sqlite"
+# A recorded file that stops being SQLite: detached, listed with why, and,
+# since this server attached it from the record, attached again once it
+# reads.
+replace_sqlite
+lines=$(catalog_lines)
+[[ $lines == *"attached app [] "*"file is not a database"*"detached by the server"*"attached again"* ]] \
+  && ok "a recorded file replaced by one that is not SQLite is detached, and the catalog says why" \
+  || bad "the catalog of a replaced file: $lines"
+[[ $lines == *"view it_s_q1 reads"* ]] && ok "and the rest of the catalog reads" || bad "the catalog beside it: $lines"
+restore_sqlite
+[[ $(catalog_lines) == *"attached app ['people'] None"* ]] && ok "and it is attached again once it reads" \
+  || bad "after it is back: $(catalog_lines)"
+replace_sqlite
 catalog_timed >/dev/null
 check "a file set aside whose row is deleted" 0 "" \
   "$harbor" "$work/workspace.duckdb" -c "DELETE FROM _harbor.attached WHERE name = 'app'"
 [[ $(catalog_lines) != *"attached app"* ]] && ok "is forgotten" || bad "after its row: $(catalog_lines)"
-kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
-[[ $(catalog_lines) != *"attached app"* ]] && ok "and not attached again once it reads" || bad "after the lock: $(catalog_lines)"
+restore_sqlite
+[[ $(catalog_lines) != *"attached app"* ]] && ok "and not attached again once it reads" || bad "after it is back: $(catalog_lines)"
 check "a SQLite file attaches in the workspace again" 0 "app: the SQLite database" \
   "$harbor" "$work/files/app.sqlite" --mode csv -c "SELECT count(*) FROM app.people"
-lock_sqlite "$work/files/app.sqlite"
+replace_sqlite
 catalog_timed >/dev/null
 workspace_stop
+restore_sqlite
 check "a file set aside as the server stops keeps its row" 0 "1" \
   "$harbor" "$work/workspace.duckdb" --mode csv -c "SELECT count(*) FROM _harbor.attached WHERE name = 'app'"
 wait_gone
+lock_sqlite "$work/files/app.sqlite"
 started=$(python3 -c 'import time; print(time.time())')
 workspace_start
 took=$(python3 -c "import time, sys; print(round(time.time() - float(sys.argv[1]), 2))" "$started")
