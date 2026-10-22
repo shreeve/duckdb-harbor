@@ -7311,7 +7311,7 @@ mod tests {
                 }
             }
         };
-        let count = |run: &dyn Fn(&str, bool) -> Result<String, (u16, String)>| {
+        let count = || {
             let out = run("SELECT count(*) FROM t", true).unwrap();
             out.lines().find(|l| l.contains("\"row\"")).unwrap().to_string()
         };
@@ -7321,7 +7321,7 @@ mod tests {
         for sql in ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"] {
             run(sql, true).unwrap();
         }
-        assert!(count(&run).contains("[1]"));
+        assert!(count().contains("[1]"));
 
         // One an error aborted does not, and the COMMIT says so.
         for sql in ["BEGIN", "INSERT INTO t VALUES (2)"] {
@@ -7332,7 +7332,7 @@ mod tests {
         assert_eq!(status, 400);
         assert!(message.contains("rolled back") && message.contains("nothing since BEGIN"), "{message}");
         // Rolled back, with no transaction left behind it.
-        assert!(count(&run).contains("[1]"));
+        assert!(count().contains("[1]"));
         assert!(run("ROLLBACK", true).is_err(), "no transaction is open after it");
 
         // In every spelling the engine runs as a commit.
@@ -7351,7 +7351,7 @@ mod tests {
         let (_, message) = run("SELECT 1", true).unwrap_err();
         assert!(message.contains("aborted"), "{message}");
         assert_eq!(run("COMMIT", true).unwrap_err().0, 400);
-        assert!(count(&run).contains("[1]"));
+        assert!(count().contains("[1]"));
 
         drop(jobs);
         executor.join().unwrap();

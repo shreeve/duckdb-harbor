@@ -126,7 +126,6 @@ mod smoke {
         assert!(!e.message.is_empty(), "error carried no text");
         eprintln!("v2: parse error as expected — {e}");
 
-        let mut iter = iter;
         unsafe {
             (eng.api.statement_iterator_destroy.unwrap())(&mut iter);
             (eng.api.connection_destroy.unwrap())(&mut conn);

@@ -39,8 +39,8 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             "--restart" => restart = true,
             s if s.starts_with('-') => return Err(format!("update takes a version, --check or --restart — not {s}")),
             s => {
-                if wanted.is_some() {
-                    return Err(format!("update takes one version — got {} and {s}", wanted.unwrap()));
+                if let Some(first) = &wanted {
+                    return Err(format!("update takes one version — got {first} and {s}"));
                 }
                 wanted = Some(s.trim_start_matches('v').to_string());
             }
