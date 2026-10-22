@@ -198,6 +198,13 @@ its transaction aborted, as a cancel does: a transaction with a statement
 missing does not commit. A result small enough to have been sent whole before
 the client left was not cut short, and its transaction stands.
 
+Shutting down the sending side is departure even with a request still in
+flight. A client that pipelines two requests and then half-closes — sends
+both, then `shutdown(SHUT_WR)` — has the first cancelled and the second never
+run, the same as a client that sends one request and half-closes to say it
+wants nothing more. A client that means to send a second request keeps its
+sending side open until it has the first answer.
+
 Two smaller things follow from the same machinery. Releasing a session whose
 statement is still running stops it — `{"released":false,"cancelling":true}`
 — and the connection comes back on a reaper tick after execution stops. And a
