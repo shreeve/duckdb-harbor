@@ -591,6 +591,125 @@ def run_tests(h, db, proc):
     eq("and every answer arrives whole", [[(499, None), (200, 6000)]] * 10, drawn)
 
     # -----------------------------------------------------------------------
+    section("A cancel says truly whether it stopped a write")
+
+    # An autocommit INSERT has run and committed by the time its first chunk
+    # comes back, its RETURNING rows included: the engine runs every
+    # statement but a SELECT to its end before it hands back a row. A cancel
+    # that reaches it after that, while its rows stream or as it commits,
+    # stops nothing, and is answered false. Cancels are fired across the
+    # whole life of each statement, on workers and on a session, and every
+    # answer is checked against the table: a cancel answered true, or a
+    # statement answered cancelled, kept nothing, and one answered false ran
+    # to its end and kept every row.
+    port = int(h.base.rsplit(":", 1)[1])
+    h.sql("CREATE TABLE told(k INTEGER, i BIGINT)")
+    size = {False: 200_000, True: 20_000}
+
+    def insert(k, returning):
+        tail = " RETURNING i" if returning else ""
+        return f"INSERT INTO told SELECT {k}, i FROM range({size[returning]}) t(i){tail}"
+
+    def stream(body):
+        """(status, last NDJSON record or the refusal) of one statement, streamed."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        try:
+            c.request("POST", "/sql", json.dumps(body), {"Content-Type": "application/json"})
+            r = c.getresponse()
+            raw = r.read()
+            if r.status == 200:
+                return 200, json.loads(raw.splitlines()[-1])
+            return r.status, json.loads(raw)
+        finally:
+            c.close()
+
+    def length(returning):
+        started = time.monotonic()
+        stream({"sql": insert(-1, returning)})
+        return time.monotonic() - started
+
+    span = {r: sorted(length(r) for _ in range(5))[2] for r in (False, True)}
+    h.sql("DELETE FROM told")
+    runs, threads = 2000, 4
+    lies, tally = [], {}
+    tally_lock = threading.Lock()
+
+    def tell(k, rng, sid):
+        returning = k % 2 == 1
+        name = f"told{k}"
+        body = {"sql": insert(k, returning), "queryId": name}
+        if sid:
+            body["sessionId"] = sid
+        answer = {}
+        shaped = rng.random() < 0.7
+
+        def run():
+            if shaped:
+                answer["a"] = stream(body)
+            else:
+                st, doc, _ = h.call("POST", "/sql", body)
+                answer["a"] = (st, doc)
+
+        t = threading.Thread(target=run)
+        t.start()
+        said = []
+        if rng.random() < 0.3:
+            # Asked until answered, so cancels land from the very start.
+            while t.is_alive() and not any(said):
+                said.append(h.cancel(name)[1].get("cancelled"))
+        else:
+            time.sleep(rng.uniform(0, span[returning] * 1.3))
+            said.append(h.cancel(name)[1].get("cancelled"))
+        t.join()
+        st, doc = answer["a"]
+        if st == 200 and doc.get("type") != "error":
+            stopped = False
+        elif doc.get("code") == "cancelled":
+            stopped = True
+        else:
+            stopped = None
+        kept = h.value(f"SELECT count(*) FROM told WHERE k = {k}")
+        whole = size[returning]
+        lie = (
+            "a partial write" if kept not in (0, whole)
+            else f"answered {st} {doc.get('code')}" if stopped is None
+            else "the cancel said true, and the rows were kept" if any(said) and kept
+            else "the statement said cancelled, and the rows were kept" if stopped and kept
+            else "the statement said done, and the rows are gone" if not stopped and not kept
+            else "the cancel said false, and the statement was cancelled" if stopped and not any(said)
+            else None
+        )
+        with tally_lock:
+            key = ("stopped" if stopped else "ran", "returning" if returning else "insert")
+            tally[key] = tally.get(key, 0) + 1
+            if lie:
+                lies.append((k, lie, said, st, "ndjson" if shaped else "json", "session" if sid else "worker"))
+
+    def teller(seed):
+        rng = random.Random(seed)
+        st, doc, _ = h.open()
+        sid = doc.get("sessionId") if st == 200 else None
+        for k in range(seed, runs, threads):
+            tell(k, rng, sid if rng.random() < 0.25 else None)
+        if sid:
+            h.release(sid)
+
+    started = time.monotonic()
+    workers = [threading.Thread(target=teller, args=(i,), daemon=True) for i in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join(600)
+    eq("every answer is true to the table", [], lies[:5])
+    yes(
+        "over every run, both answers given to both kinds of write",
+        sum(tally.values()) == runs and all(tally.get((a, b), 0) > 0
+            for a in ("stopped", "ran") for b in ("insert", "returning")),
+        f"{runs} runs in {time.monotonic() - started:.0f}s, {len(lies)} lies, "
+        + ", ".join(f"{a} {b} {n}" for (a, b), n in sorted(tally.items())),
+    )
+
+    # -----------------------------------------------------------------------
     section("A session needs no free worker")
 
     # Every worker busy with a long scan: a session's statements, COMMIT

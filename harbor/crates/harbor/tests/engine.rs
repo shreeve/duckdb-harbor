@@ -207,7 +207,7 @@ mod conn {
             // As the server does: a document aimed at a VARIANT is marked.
             let mut params = params.to_vec();
             let bound = c.bind(stmt, &mut params)?;
-            let mut stream = c.execute(stmt, bound, || true)?.expect("wanted");
+            let mut stream = c.execute(stmt, bound, |_| true)?.expect("wanted");
             // Encode through the shared cell encoder so this test exercises
             // the same path the server will.
             let columns = std::mem::take(&mut stream.columns);
@@ -320,7 +320,7 @@ mod conn {
         assert!(c.execute_batch("SELECT no_such_column FROM t").is_err());
         let stmts = c.statements(insert).unwrap();
         let bound = c.bind(&stmts[0], &mut [doc(r#"{"a":1}"#)]).unwrap();
-        let err = c.execute(&stmts[0], bound, || true).err().expect("aborted").to_string();
+        let err = c.execute(&stmts[0], bound, |_| true).err().expect("aborted").to_string();
         assert!(err.contains("aborted"), "{err}");
         c.execute_batch("ROLLBACK").unwrap();
 
@@ -522,14 +522,14 @@ mod conn {
         c.execute_batch("CREATE TABLE t(i INTEGER)").unwrap();
         let stmts = c.statements("INSERT INTO t VALUES (1)").unwrap();
         let bound = c.bind(&stmts[0], &mut []).unwrap();
-        assert!(c.execute(&stmts[0], bound, || false).unwrap().is_none());
+        assert!(c.execute(&stmts[0], bound, |_| false).unwrap().is_none());
         assert_eq!(rows(&mut c, "SELECT count(*) FROM t", &[]).unwrap(), ["0"]);
 
         let handle = c.interrupt_handle();
         let stmts = c.statements("SELECT count(*) FROM range(10000000000)").unwrap();
         let bound = c.bind(&stmts[0], &mut []).unwrap();
         let mut stream = c
-            .execute(&stmts[0], bound, || {
+            .execute(&stmts[0], bound, |_| {
                 handle.interrupt();
                 true
             })
@@ -537,6 +537,41 @@ mod conn {
             .expect("wanted");
         let err = std::iter::from_fn(|| stream.next_chunk().transpose()).find_map(Result::err);
         assert_eq!(err.map(|e| e.code), Some(ffi::ERROR_RUNTIME_INTERRUPT));
+    }
+
+    /// Every statement but a SELECT is retained: run to its end, and in
+    /// autocommit committed, before its first chunk comes back. An
+    /// interrupt fired after that stops nothing, and the rest of its rows,
+    /// RETURNING rows included, arrive.
+    #[test]
+    fn a_write_is_done_by_its_first_chunk() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        c.execute_batch("CREATE TABLE t(i BIGINT)").unwrap();
+        let open = |c: &mut conn::Conn, sql: &str| {
+            let stmts = c.statements(sql).unwrap();
+            let bound = c.bind(&stmts[0], &mut []).unwrap();
+            let mut retained = None;
+            let stream = c.execute(&stmts[0], bound, |r| { retained = Some(r); true }).unwrap().expect("wanted");
+            (retained.expect("told"), stream)
+        };
+        assert!(!open(&mut c, "SELECT 42").0, "a SELECT streams");
+        let handle = c.interrupt_handle();
+        for (sql, rows_back) in [
+            ("INSERT INTO t SELECT * FROM range(10000)", 1),
+            ("INSERT INTO t SELECT * FROM range(10000) RETURNING i", 10000),
+        ] {
+            let (retained, mut stream) = open(&mut c, sql);
+            assert!(retained, "{sql}");
+            let first = stream.next_chunk().unwrap().expect("a first chunk");
+            handle.interrupt();
+            let mut back = first.rows;
+            while let Some(chunk) = stream.next_chunk().unwrap() {
+                back += chunk.rows;
+            }
+            assert_eq!(back, rows_back, "{sql}");
+        }
+        assert_eq!(rows(&mut c, "SELECT count(*) FROM t", &[]).unwrap(), ["20000"]);
     }
 
     #[test]
