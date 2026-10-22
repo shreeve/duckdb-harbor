@@ -4962,13 +4962,27 @@ enum Gate {
 /// view, macro or prepared statement whose body reads it (`CatalogNames`).
 /// A name in a string or a comment does not count, and neither does a
 /// column named `query`. While the views and macros are not all learned
-/// (`CatalogNames::complete`), every statement reads the catalog, since
-/// any name may be one that does.
+/// (`CatalogNames::complete`), every statement that names anything
+/// (`names_any`) reads the catalog, since any name may be one that does.
 fn catalog_gate(sql: &str) -> Gate {
     gate_of(sql, &CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner))
 }
 
+/// The gate a statement passes, and whether it reads the catalog only
+/// because the names are not all known.
+fn catalog_gate_known(sql: &str) -> (Gate, bool) {
+    let names = CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner);
+    let gate = gate_of(sql, &names);
+    let unknown = gate == Gate::Reads && !names.complete && gate_in(sql, &names, true) == Gate::Open;
+    (gate, unknown)
+}
+
 fn gate_of(sql: &str, names: &CatalogNames) -> Gate {
+    gate_in(sql, names, names.complete)
+}
+
+/// The gate as the names say, as if all known when `complete`.
+fn gate_in(sql: &str, names: &CatalogNames, complete: bool) -> Gate {
     match acting_keyword(sql).as_str() {
         "ATTACH" | "DETACH" => return Gate::Changes,
         "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PRAGMA" => return Gate::Reads,
@@ -4976,9 +4990,44 @@ fn gate_of(sql: &str, names: &CatalogNames) -> Gate {
     }
     match names_in(sql, |name| catalog_word(name) || names.reads.contains(name)) {
         true => Gate::Reads,
-        false if !names.complete => Gate::Reads,
+        false if !complete && names_any(sql) => Gate::Reads,
         false => Gate::Open,
     }
+}
+
+/// The engine's reserved keywords (`duckdb_keywords()`). One is a name only
+/// quoted, or as the part after a `.` of a name whose first part is not
+/// one.
+const RESERVED: &[&[u8]] = &[
+    b"all", b"analyse", b"analyze", b"and", b"any", b"array", b"as", b"asc", b"asymmetric", b"both", b"case",
+    b"cast", b"check", b"collate", b"column", b"constraint", b"create", b"default", b"deferrable", b"desc",
+    b"describe", b"distinct", b"do", b"else", b"end", b"except", b"false", b"fetch", b"for", b"foreign", b"from",
+    b"group", b"having", b"in", b"initially", b"intersect", b"into", b"lambda", b"lateral", b"leading", b"limit",
+    b"not", b"null", b"offset", b"on", b"only", b"or", b"order", b"pivot", b"pivot_longer", b"pivot_wider",
+    b"placing", b"primary", b"qualify", b"references", b"returning", b"select", b"show", b"some", b"summarize",
+    b"symmetric", b"table", b"then", b"to", b"trailing", b"true", b"union", b"unique", b"unpivot", b"using",
+    b"variadic", b"when", b"where", b"window", b"with",
+];
+
+/// Whether a statement names anything a view, a macro or a catalog
+/// function may be: a quoted name, or a word of its code that is neither
+/// a reserved keyword nor a number, digits and `_` after a digit.
+/// `SELECT 42` names nothing.
+fn names_any(sql: &str) -> bool {
+    let plain = wire::scan::plain_spaces(sql.as_bytes());
+    let bytes = &*plain;
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    wire::scan::spans(bytes).iter().any(|span| {
+        let text = &bytes[span.start..span.end];
+        match span.kind {
+            wire::scan::Kind::Code => text.split(|&c| !is_word(c)).filter(|word| !word.is_empty()).any(|word| {
+                let number = word[0].is_ascii_digit() && word.iter().all(|&c| c.is_ascii_digit() || c == b'_');
+                !number && !RESERVED.contains(&word.to_ascii_lowercase().as_slice())
+            }),
+            wire::scan::Kind::Str => matches!(text.first(), Some(b'"' | b'`')),
+            _ => false,
+        }
+    })
 }
 
 /// Whether a name, lowercased, is one of the engine's catalog functions or
@@ -5810,9 +5859,10 @@ enum Passed {
 /// found; it gives up as a reader does.
 ///
 /// While the names are not all known (`CatalogNames::complete`), every
-/// statement is a reader, and a long one would hold an ATTACH for as long
-/// as it runs. So a reader waits for a listing begun (`LEARNING`) and
-/// passes as the names it learned say, and one in autocommit is let go of once a listing
+/// statement that names anything is a reader, and a long one would hold an
+/// ATTACH for as long as it runs. So a reader that reads only because they
+/// are not known waits for a listing begun (`LEARNING`) and passes as the
+/// names it learned say, and one in autocommit is let go of once a listing
 /// says it reads nothing (`let_unread_go`); and an ATTACH or DETACH does
 /// not keep readers out while it waits, but asks for the names beside them (`learn_beside`), and
 /// keeps them out once they are known, or once it has asked for
@@ -5820,7 +5870,7 @@ enum Passed {
 /// overlap would otherwise keep it out for as long as they came, and the
 /// names may not read for longer, while a SQLite file stays locked.
 fn pass_gate(sql: &str, slot: &SlotState, autocommit: bool) -> Option<Passed> {
-    let gate = catalog_gate(sql);
+    let (gate, mut unknown) = catalog_gate_known(sql);
     match gate {
         Gate::Open => Some(Passed::Open),
         Gate::Changes => {
@@ -5829,7 +5879,6 @@ fn pass_gate(sql: &str, slot: &SlotState, autocommit: bool) -> Option<Passed> {
             hold_alone(Some(slot), None, keep).map(Passed::Changing)
         }
         Gate::Reads => {
-            let mut unknown = !names_complete();
             while unknown && LEARNING.load(Ordering::SeqCst) > 0 {
                 if slot.cancelled() {
                     return None;
@@ -6769,19 +6818,27 @@ mod tests {
             assert_eq!(catalog_gate(sql), Gate::Reads, "{sql}");
         }
         for sql in [
-            "SELECT 42",
             "SELECT * FROM a.main.t",
             "SELECT 'duckdb_tables()' AS s",
-            "SELECT 1 -- information_schema",
             "SELECT my_duckdb_tables FROM t",
             "SELECT * FROM \"say duckdb_tables\"",
             "INSERT INTO attached VALUES (1)",
+            "SELECT * FROM \"select\"",
+            "SELECT 0x10",
+            "SELECT now()",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
-            // Every statement reads it while the names are not all known.
+            // Every statement that names anything reads it while the names
+            // are not all known.
             assert_eq!(gate_of(sql, &CatalogNames::default()), Gate::Reads, "{sql}");
         }
+        // One that names nothing reads nothing, known or not.
+        for sql in ["SELECT 42", "select 1 + 2 AS select", "SELECT 1 -- information_schema", "SELECT 'v', 1_000"] {
+            assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
+            assert_eq!(gate_of(sql, &CatalogNames::default()), Gate::Open, "{sql}");
+        }
         assert_eq!(gate_of("DETACH a", &CatalogNames::default()), Gate::Changes);
+        assert_eq!(gate_of("SHOW ALL TABLES", &CatalogNames::default()), Gate::Reads);
     }
 
     #[test]
