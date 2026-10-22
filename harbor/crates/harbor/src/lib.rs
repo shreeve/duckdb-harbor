@@ -1547,6 +1547,43 @@ pub fn stop() -> Result<String, String> {
     stop_with(RUNNING.lock().unwrap())
 }
 
+/// Wait up to `patience` for `executors` to finish, putting the connections
+/// they hand back in `pool`, and return those still running. The reaper
+/// is gone by now, so its work is done here: a cancel the engine lost is
+/// fired again each tick at a statement still running, as `cancel_expired`
+/// does, or the stop would wait that statement out.
+fn drain(
+    executors: Vec<thread::JoinHandle<Option<Connection>>>,
+    slots: &[Arc<SlotState>],
+    pool: &mut Vec<Connection>,
+    patience: Duration,
+) -> Vec<thread::JoinHandle<Option<Connection>>> {
+    let started = Instant::now();
+    let mut fired = started;
+    let mut pending = executors;
+    loop {
+        let (done, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|h| h.is_finished());
+        for h in done {
+            if let Ok(Some(conn)) = h.join() {
+                pool.push(conn);
+            }
+        }
+        pending = rest;
+        if pending.is_empty() || started.elapsed() >= patience {
+            return pending;
+        }
+        if fired.elapsed() >= REAP_INTERVAL {
+            fired = Instant::now();
+            for slot in slots {
+                if let Some(job) = slot.unheeded_job() {
+                    slot.cancel(Some(job));
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Stop the server only if no client has connected since `accepted` had been
 /// accepted and none is connected now: a refcounted server's departure. The
 /// last look and the start of the stop are one step under the server's lock,
@@ -1618,7 +1655,6 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     for slot in &slots {
         slot.cancel(None);
     }
-    drop(slots);
     // Nothing can be cancelled by name once the registry is gone, and an id
     // left behind would outlive the server that could act on it.
     *QUERIES.lock().unwrap() = None;
@@ -1636,23 +1672,10 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     // the CHECKPOINT this drain exists to reach. After the deadline the
     // straggler is abandoned exactly as a panicked worker would be: its
     // connection is forfeited, and the checkpoint below runs regardless.
-    let deadline = Instant::now() + Duration::from_secs(10);
     let mut pool = POOL.lock().unwrap();
-    let mut pending: Vec<thread::JoinHandle<Option<Connection>>> =
-        r.workers.into_iter().chain(r.leases).collect();
-    loop {
-        let (done, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|h| h.is_finished());
-        for h in done {
-            if let Ok(Some(conn)) = h.join() {
-                pool.push(conn);
-            }
-        }
-        pending = rest;
-        if pending.is_empty() || Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    let pending = drain(r.workers.into_iter().chain(r.leases).collect(), &slots, &mut pool,
+        Duration::from_secs(10));
+    drop(slots);
     if !pending.is_empty() {
         eprintln!(
             "harbor: {} executor(s) still writing to stalled clients; abandoning them to checkpoint",
@@ -5926,6 +5949,43 @@ mod tests {
         assert!(status == 400 && message.contains("boom"), "{status} {message}");
         assert_eq!(said, Some(false), "the cancel was answered true for the statement's own error");
         assert_eq!(conn.query_strings("SELECT count(*)::VARCHAR FROM e").unwrap(), ["0"]);
+    }
+
+    /// A stop fires the reaper's re-fire itself while it waits for the
+    /// executors: a cancel the engine lost would otherwise make it wait
+    /// the statement out. The lost cancel is a slot marked cancelled with no
+    /// interrupt fired.
+    #[test]
+    fn a_stop_fires_again_a_cancel_the_engine_lost() {
+        use std::sync::{Arc, mpsc::sync_channel};
+        if crate::engine::engine().is_err() { return; }
+        let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        let state = super::SlotState::new(conn.interrupt_handle());
+        let (ready, result) = sync_channel(1);
+        let executor = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                state.begin(super::next_job_id(), None);
+                let mut slot = super::OnSlot { slot: &state, done: false };
+                let (body, _output) = sync_channel(1);
+                super::run_statement(&mut conn, &mut slot,
+                    "SELECT count(*) FROM range(1000000000000) t(i) WHERE i % 7 = 3".into(),
+                    vec![], super::Shape::Json, ready, body, Instant::now());
+                drop(slot);
+                Some(conn)
+            })
+        };
+        while state.current_job() == 0 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        state.run.lock().unwrap().cancelled = true;
+        let started = Instant::now();
+        let mut pool = Vec::new();
+        let left = super::drain(vec![executor], &[Arc::clone(&state)], &mut pool, Duration::from_secs(8));
+        assert!(left.is_empty() && pool.len() == 1, "the stop waited out its patience");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(result.recv().unwrap().err().unwrap().status, 499);
     }
 
     #[test]
