@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "ducktable"
-version = "0.24.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2682,7 +2682,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-client"
-version = "0.24.1"
+version = "2.0.0"
 dependencies = [
  "harbor-common",
  "harbor-http",
@@ -2695,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-common"
-version = "0.46.0"
+version = "2.0.0"
 dependencies = [
  "libc",
  "serde",
@@ -2705,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "harbor-http"
-version = "0.46.0"
+version = "2.0.0"
 dependencies = [
  "harbor-common",
  "libc",
@@ -7919,7 +7919,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.46.0"
+version = "2.0.0"
 dependencies = [
  "serde",
  "serde_json",
