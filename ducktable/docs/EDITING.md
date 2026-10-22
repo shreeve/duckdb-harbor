@@ -417,25 +417,35 @@ affected-exactly-one check are the backstop there, as everywhere.
 
 ## Commit
 
-⌘S opens a Harbor session (a pinned connection), then:
-`BEGIN` → parameterized statements, each verified to have affected or returned
-**exactly one row** → `COMMIT` → release. The engine checks a key as each
-statement runs, so they run in the order that frees a key before another row
-takes it: duplicates of rows the commit changes, then deletes, then updates,
-each after the one whose key it takes, then the other duplicates and new rows.
-A DELETE of 7 beside a re-key of 3 to 7 commits, as does a new row or a
-duplicate keyed like a deleted one, or a chain of re-keys; a swap of two keys
-has no such order, and the engine refuses it, edits kept. The order has
-limits, each refused the same way, and each committed in two steps:
+⌘S opens a Harbor session (a pinned connection), then: one read of what the
+statements free and take → `BEGIN` → parameterized statements, each verified
+to have affected or returned **exactly one row** → `COMMIT` → release. The
+engine checks the key and every `UNIQUE` constraint as each statement runs,
+so the statements run in an order that frees a value before another row takes
+it. The read lists, on the key, on each `UNIQUE` constraint and on each unique
+index of plain columns, the values each statement's row holds and the values
+it types, cast to the column's type as the statement's assignment casts them,
+and matches them by the engine's own equality: `1.5` typed into a
+`DECIMAL(5,2)` key takes the row keyed 1.50, and a `DATE` or a `TIMESTAMP`
+typed in any spelling the engine reads takes the row it names. Each statement
+runs after the one that frees what it takes, and otherwise in this order:
+duplicates of rows the commit changes, deletes, updates, the other duplicates,
+and new rows. A duplicate reads its source row before the change that deletes
+the row, moves its key, or changes a cell the duplicate copies (on a keyless
+table, any change, since the row's hash names it). A DELETE of 7 beside a
+re-key of 3 to 7 commits, as does a chain of re-keys, a new row or a duplicate
+keyed like a deleted row or taking its `UNIQUE` value, and a `UNIQUE` column's
+`a` moved to `b` while `b` goes to `c`. What has no such order is refused by
+the engine, edits kept, and commits in two steps:
 
-- A duplicate of a row the commit changes runs before any key is freed, so it
-  cannot take one.
-- A chain of re-keys is seen as one only when each new key is typed as the
-  wire spells the old one: a `DATE`, a `TIMESTAMP` or a `DECIMAL` typed another
-  way (`1.5` for `1.50`) is not seen to take the other row's key.
-- Only the primary key is ordered. Moves on another `UNIQUE` column (`a` to
-  `b` while `b` goes to `c`) run in the order of their rows' keys, which need
-  not free a value before another row takes it.
+- A swap of two values, on the key or on a `UNIQUE` column.
+- A duplicate that takes a value its own source row gives up, where it reads
+  that row before the change: it cannot take the value until after it.
+
+A new row that leaves a unique column to its default takes a value no one
+knows before it runs, and is ordered as a new row. If the read fails, the
+statements run in the order above with each key matched as typed, and the
+engine refuses what that order cannot take.
 
 Before opening
 the session, DuckTable refuses a draft missing a `NOT NULL` column with no

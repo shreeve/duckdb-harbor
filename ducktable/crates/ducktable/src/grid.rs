@@ -538,7 +538,7 @@ impl Grid {
             }
             Err(message) => (Some(message), 0),
         };
-        let edits = delegate.new_edits(&source, &pk_cols, rowid, !structure.as_ref().is_some_and(|s| s.foreign));
+        let edits = delegate.new_edits(&source, &pk_cols, rowid, structure.as_ref());
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&delegate.names, structure.as_ref());
         delegate.draft_hints = hints;
@@ -1090,7 +1090,7 @@ impl Grid {
     fn settle_schema(&mut self, cx: &mut Context<Self>) {
         let d = self.table.read(cx).delegate();
         let names = d.names.clone();
-        self.edits = d.new_edits(&self.source, &self.pk_cols, self.rowid, !self.structure.as_ref().is_some_and(|s| s.foreign));
+        self.edits = d.new_edits(&self.source, &self.pk_cols, self.rowid, self.structure.as_ref());
         let (not_null, defaults, generated, hints, types) =
             insert_metadata(&names, self.structure.as_ref());
         self.not_null = not_null;
@@ -2882,8 +2882,8 @@ impl Grid {
             cx.notify();
             return;
         }
-        let stmts = edits.statements();
-        if stmts.is_empty() {
+        let plan = edits.plan();
+        if plan.is_empty() {
             return;
         }
         self.committing = true;
@@ -2905,7 +2905,7 @@ impl Grid {
                     // the one request whose lost answer leaves the outcome
                     // unknown, since the server may have committed before the
                     // connection failed.
-                    let result = match run_statements(&conn, &sid, &stmts) {
+                    let result = match run_statements(&conn, &sid, &plan) {
                         Err(message) => Committed::Refused(message),
                         Ok(()) => commit_verdict(harbor_client::exec_checked(
                             &conn,
@@ -3239,8 +3239,15 @@ impl GridDelegate {
     /// A staging set for the columns this delegate holds, when they carry
     /// the whole key: the catalog's, or the hidden rowid of a table
     /// without one. None for a source without an identity, which is
-    /// read-only.
-    fn new_edits(&self, source: &str, pk_cols: &[String], rowid: bool, returning: bool) -> Option<Edits> {
+    /// read-only. A table of another engine's catalog takes no `INSERT …
+    /// RETURNING`.
+    fn new_edits(
+        &self,
+        source: &str,
+        pk_cols: &[String],
+        rowid: bool,
+        structure: Option<&crate::structure::TableStructure>,
+    ) -> Option<Edits> {
         if self.pk_ix.is_empty() {
             return None;
         }
@@ -3250,8 +3257,9 @@ impl GridDelegate {
             self.names.iter().map(|n| n.to_string()).collect(),
             self.schema_cols.iter().map(|c| c.duckdb_type.clone()).collect(),
         );
+        let edits = edits.with_uniques(structure.map(|s| s.uniques.clone()).unwrap_or_default());
         let edits = if rowid { edits.keyed_by_rowid() } else { edits };
-        Some(if returning { edits } else { edits.without_returning() })
+        Some(if structure.is_some_and(|s| s.foreign) { edits.without_returning() } else { edits })
     }
 
     /// Clear the selection, the ring, the Tab run and the editor's cell:
@@ -4565,12 +4573,20 @@ enum Page<'a> {
 }
 
 /// Open the transaction on session `sid` and run a staged set's statements
-/// in it, each checked for the one row it must touch. The first that fails
+/// in it, in the order its claims read (`edits::Plan`), each checked for the one row it must touch. The first that fails
 /// stops the run with the reason, and nothing has landed: the caller's
 /// release of the session rolls the transaction back.
-pub(crate) fn run_statements(conn: &Conn, sid: &str, stmts: &[edits::Statement]) -> Result<(), String> {
+pub(crate) fn run_statements(conn: &Conn, sid: &str, plan: &edits::Plan) -> Result<(), String> {
+    // What each statement frees and takes, read before the transaction: a
+    // read that fails costs only the order, where inside the transaction
+    // it would abort it.
+    let learned = plan
+        .claims()
+        .and_then(|(sql, params)| harbor_client::exec(conn, sql, Some(params.to_vec()), Some(sid)).ok())
+        .map(|r| edits::read_claims(&r.rows))
+        .unwrap_or_default();
     harbor_client::exec(conn, "BEGIN", None, Some(sid))?;
-    for stmt in stmts {
+    for stmt in &plan.ordered(&learned) {
         let r = harbor_client::exec(conn, &stmt.sql, Some(stmt.params.clone()), Some(sid))?;
         match stmt.expectation {
             // The engine answers UPDATE/DELETE with one count row; anything
@@ -5153,11 +5169,11 @@ mod tests {
             primary,
             ..Default::default()
         };
-        let keyed = TableStructure { cols: vec![col("a", true), col("b", true), col("v", false)], ddl: None, view: false, foreign: false };
+        let keyed = TableStructure { cols: vec![col("a", true), col("b", true), col("v", false)], ddl: None, view: false, foreign: false, uniques: Vec::new() };
         assert_eq!(identity_columns(Some(&keyed)), ["a", "b"]);
-        let keyless = TableStructure { cols: vec![col("v", false)], ddl: None, view: false, foreign: false };
+        let keyless = TableStructure { cols: vec![col("v", false)], ddl: None, view: false, foreign: false, uniques: Vec::new() };
         assert_eq!(identity_columns(Some(&keyless)), ["rowid"]);
-        let shadowed = TableStructure { cols: vec![col("ROWID", false), col("v", false)], ddl: None, view: false, foreign: false };
+        let shadowed = TableStructure { cols: vec![col("ROWID", false), col("v", false)], ddl: None, view: false, foreign: false, uniques: Vec::new() };
         assert!(identity_columns(Some(&shadowed)).is_empty());
         assert!(identity_columns(None).is_empty());
     }
@@ -5204,6 +5220,7 @@ mod tests {
             ddl: None,
             view: false,
             foreign: false,
+            uniques: Vec::new(),
         };
         let names: Vec<SharedString> = ["g", "d", "r", "n", "rowid"].map(Into::into).into();
         let (_, _, _, hints, types) = super::insert_metadata(&names, Some(&structure));
@@ -5680,8 +5697,13 @@ mod tests {
 
     /// Run `e` as ⌘S does, in one session's transaction, and commit it.
     fn commit_live(conn: &harbor_client::Conn, e: &Edits) -> Result<(), String> {
+        commit_plan(conn, e.plan())
+    }
+
+    /// Run `plan` as ⌘S runs a set's, and commit it.
+    fn commit_plan(conn: &harbor_client::Conn, plan: edits::Plan) -> Result<(), String> {
         let sid = harbor_client::session_new(conn)?;
-        let run = super::run_statements(conn, &sid, &e.statements())
+        let run = super::run_statements(conn, &sid, &plan)
             .and_then(|()| harbor_client::exec(conn, "COMMIT", None, Some(&sid)).map(drop));
         harbor_client::session_release(conn, &sid);
         run
@@ -5760,6 +5782,117 @@ mod tests {
         alone("DROP TABLE _dt_order");
         alone("DROP SEQUENCE _dt_order_seq");
         alone("DROP TABLE _dt_double");
+    }
+
+    /// Values moved on a key typed in another spelling, on UNIQUE columns
+    /// and by a duplicate of a changed row commit, each after the step that
+    /// frees what it takes, and a swap is still refused. The sets are built
+    /// from the catalog as the grid builds them. Live, as above.
+    #[test]
+    #[ignore]
+    fn values_moved_by_value_and_on_unique_columns_commit() {
+        let Some(db) = std::env::var_os("HARBOR_LIVE_DB") else {
+            println!("set HARBOR_LIVE_DB to a scratch database file; skipping");
+            return;
+        };
+        let conn = harbor_client::fleet::connect_path(std::path::Path::new(&db)).expect("connect");
+        let alone = |sql: &str| harbor_client::exec(&conn, sql, None, None).expect(sql);
+        let txt = |s: &str| Some(SharedString::from(s.to_string()));
+        let edits_for = |name: &str| {
+            let catalog = harbor_client::catalog(&conn).expect("catalog");
+            let s = crate::structure::structure_of(&catalog, &crate::sql::Rel::own("main", name)).expect(name);
+            Edits::new(
+                crate::sql::source("main", name),
+                super::identity_columns(Some(&s)),
+                s.cols.iter().map(|c| c.name.clone()).collect(),
+                s.cols.iter().map(|c| c.duck_type.clone()).collect(),
+            )
+            .with_uniques(s.uniques.clone())
+        };
+        let rows = |sql: &str| alone(sql).rows;
+
+        // Keys typed in another spelling than the wire's: 2.50 goes to 7
+        // and 1.50 to `2.5`; a DATE's 2024-01-02 to 2024-01-09 and 2024-01-01
+        // to `2024-1-2`; a TIMESTAMP's to a time written without seconds.
+        alone("CREATE OR REPLACE TABLE _dt_dec(k DECIMAL(5,2) PRIMARY KEY, v VARCHAR)");
+        alone("INSERT INTO _dt_dec VALUES (1.50, 'a'), (2.50, 'b')");
+        alone("CREATE OR REPLACE TABLE _dt_date(k DATE PRIMARY KEY, v VARCHAR)");
+        alone("INSERT INTO _dt_date VALUES ('2024-01-01', 'a'), ('2024-01-02', 'b')");
+        alone("CREATE OR REPLACE TABLE _dt_ts(k TIMESTAMP PRIMARY KEY, v VARCHAR)");
+        alone("INSERT INTO _dt_ts VALUES ('2024-01-01 10:00:00', 'a'), ('2024-01-01 11:00:00', 'b')");
+        for (table, moves) in [
+            ("_dt_dec", [("2.5", "a"), ("7", "b")]),
+            ("_dt_date", [("2024-1-2", "a"), ("2024-01-09", "b")]),
+            ("_dt_ts", [("2024-01-01 11:00", "a"), ("2024-01-02 09:00", "b")]),
+        ] {
+            let page = rows(&format!("SELECT k FROM {table} ORDER BY k"));
+            let mut e = edits_for(table);
+            for (key, (to, _)) in page.iter().zip(moves) {
+                let wire = key[0].as_str().map(str::to_string).unwrap_or_else(|| key[0].to_string());
+                e.stage_cell(vec![key[0].clone()], 0, txt(&wire), txt(to), json!(to));
+            }
+            assert_eq!(e.statements()[0].params[1], page[0][0], "{table}: unread, the first key runs first");
+            let unread = commit_plan(&conn, e.plan().unread()).unwrap_err();
+            assert!(unread.contains("Duplicate key"), "{table}: {unread}");
+            commit_live(&conn, &e).unwrap_or_else(|err| panic!("{table}: {err}"));
+            let v = rows(&format!("SELECT v FROM {table} ORDER BY k"));
+            assert_eq!(v, [[json!("a")], [json!("b")]], "{table}");
+        }
+        assert_eq!(rows("SELECT k::VARCHAR FROM _dt_dec ORDER BY k"), [[json!("2.50")], [json!("7.00")]]);
+
+        // A chain on a UNIQUE column, on a composite UNIQUE, and on a
+        // unique index, each taken by the row whose key sorts first.
+        alone("CREATE OR REPLACE TABLE _dt_uniq(id INTEGER PRIMARY KEY, slug VARCHAR UNIQUE, a INTEGER, b INTEGER, code INTEGER, name VARCHAR, UNIQUE (a, b))");
+        alone("CREATE UNIQUE INDEX _dt_uniq_code ON _dt_uniq(code)");
+        alone("INSERT INTO _dt_uniq VALUES (1, 'a', 1, 1, 10, 'one'), (2, 'b', 1, 2, 20, 'two'), (3, 'z', 9, 9, 90, 'three'), (4, 'y', 4, 4, 40, 'four'), (5, 'e', 5, 5, 50, 'five')");
+        let mut e = edits_for("_dt_uniq");
+        e.stage_cell(vec![json!(1)], 1, txt("a"), txt("b"), json!("b"));
+        e.stage_cell(vec![json!(2)], 1, txt("b"), txt("c"), json!("c"));
+        e.stage_cell(vec![json!(1)], 3, txt("1"), txt("2"), json!(2));
+        e.stage_cell(vec![json!(2)], 3, txt("2"), txt("3"), json!(3));
+        e.stage_cell(vec![json!(1)], 4, txt("10"), txt("20"), json!(20));
+        e.stage_cell(vec![json!(2)], 4, txt("20"), txt("30"), json!(30));
+        let unread = commit_plan(&conn, e.plan().unread()).unwrap_err();
+        assert!(unread.contains("Duplicate key"), "{unread}");
+        commit_live(&conn, &e).expect("the chains commit");
+        assert_eq!(
+            rows("SELECT id, slug, b, code FROM _dt_uniq WHERE id < 3 ORDER BY id"),
+            [[json!(1), json!("b"), json!(2), json!(20)], [json!(2), json!("c"), json!(3), json!(30)]]
+        );
+
+        // Duplicates of a row the set changes take the key one delete frees
+        // and the slug another frees, and copy the row's name as it was.
+        let mut e = edits_for("_dt_uniq");
+        e.stage_delete(vec![json!(3)]);
+        e.stage_delete(vec![json!(4)]);
+        e.stage_cell(vec![json!(5)], 5, txt("five"), txt("FIVE"), json!("FIVE"));
+        e.stage_duplicate(vec![json!(5)], vec![(0, txt("3"), Bind::Value(json!(3))), (5, txt("five"), Bind::Source)]);
+        e.stage_duplicate(
+            vec![json!(5)],
+            vec![(0, txt("8"), Bind::Value(json!(8))), (1, txt("y"), Bind::Value(json!("y"))), (5, txt("five"), Bind::Source)],
+        );
+        let unread = commit_plan(&conn, e.plan().unread()).unwrap_err();
+        assert!(unread.contains("Duplicate key \"slug: y\""), "{unread}");
+        commit_live(&conn, &e).expect("the duplicates take what the deletes free");
+        assert_eq!(
+            rows("SELECT id, slug, name FROM _dt_uniq WHERE id >= 3 ORDER BY id"),
+            [
+                [json!(3), json!(null), json!("five")],
+                [json!(5), json!("e"), json!("FIVE")],
+                [json!(8), json!("y"), json!("five")],
+            ]
+        );
+
+        // A swap of two slugs has no order: refused, nothing landed.
+        let mut e = edits_for("_dt_uniq");
+        e.stage_cell(vec![json!(1)], 1, txt("b"), txt("c"), json!("c"));
+        e.stage_cell(vec![json!(2)], 1, txt("c"), txt("b"), json!("b"));
+        let err = commit_live(&conn, &e).unwrap_err();
+        assert!(err.contains("Duplicate key"), "{err}");
+        assert_eq!(rows("SELECT slug FROM _dt_uniq WHERE id < 3 ORDER BY id"), [[json!("b")], [json!("c")]]);
+        for table in ["_dt_dec", "_dt_date", "_dt_ts", "_dt_uniq"] {
+            alone(&format!("DROP TABLE {table}"));
+        }
     }
 
     #[test]
