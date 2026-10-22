@@ -582,7 +582,11 @@ impl Asked {
 
 /// Answer the cancels in ASKED as their statements tell them, for the life
 /// of the process. A statement harbor abandoned at a stop never tells, and
-/// its cancel is left unanswered, as its statement is.
+/// its cancel is left unanswered, as its statement is. Each answer is
+/// written on a thread of its own (`write_cancel`): a response waits for
+/// the one before it on its connection, which a client can pipeline behind
+/// a statement of its own that runs for minutes, and no other cancel waits
+/// on that.
 fn answer_cancels() {
     let (asked, said) = &ASKED;
     loop {
@@ -594,11 +598,32 @@ fn answer_cancels() {
         *waiting = rest;
         drop(waiting);
         for Asked { told, req, line } in told {
-            let status = answer_cancel(req, *told.get().unwrap()).1;
-            if let Some(line) = line {
-                line.write(status);
-            }
+            write_cancel(req, *told.get().unwrap(), line);
         }
+    }
+}
+
+/// Write a cancel's answer and its log line on a thread that ends with the
+/// write, one for each cancel told, so at most one for each waiting; on
+/// this thread when none can start.
+fn write_cancel(req: Request, cancelled: bool, line: Option<LogLine>) {
+    let answer = move |req: Request, line: Option<LogLine>| {
+        let status = answer_cancel(req, cancelled).1;
+        if let Some(line) = line {
+            line.write(status);
+        }
+    };
+    let (hand, take) = mpsc::sync_channel::<(Request, Option<LogLine>)>(1);
+    let spawned = thread::Builder::new().name("harbor-cancel-answer".to_string()).spawn(move || {
+        if let Ok((req, line)) = take.recv() {
+            answer(req, line);
+        }
+    });
+    match spawned {
+        Ok(_) => {
+            let _ = hand.send((req, line));
+        }
+        Err(_) => answer(req, line),
     }
 }
 
