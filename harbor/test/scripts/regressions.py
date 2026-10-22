@@ -557,6 +557,17 @@ class CommitRaces(Harbor, unittest.TestCase):
                 doc = self.sql("SELECT r.{a,b}" + gap + "FROM (SELECT {'a': 1, 'b': 2} AS r)")
                 self.assertEqual(doc["data"], [[1, 2]])
 
+    def test_a_comment_in_a_brace_group_comes_out_with_its_item(self):
+        # A comment between items comes out after each alternative its item
+        # makes, a line comment with its line break: without it, the comment
+        # would hide the rest of the line, the alternatives after it among it.
+        source = "FROM (SELECT {'a': 1, 'b': 2, 'c': 3} AS r)"
+        for sql, data in (("SELECT r.{a -- the a\n, b /* the b */, c} ", [1, 2, 3]),
+                          ("SELECT r.{ -- first\r a,\n  -- b,\n  c -- last\n} ", [1, 3]),
+                          ("SELECT r.{a /* , */ c}, r.{b}-- b\n", [1, 3, 2])):
+            with self.subTest(sql=sql):
+                self.assertEqual(self.sql(sql + source)["data"], [data])
+
     def brace_refusal(self, sql):
         # Harbor's own 400, before the engine sees anything.
         doc = self.sql(sql, status=400)

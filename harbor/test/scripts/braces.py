@@ -71,7 +71,8 @@ class Grammar:
         # constant: these follow names with no cast.
         self.subscripts = ["[i : j]", "[ f(1, 2) ]", "[ 'k' ][ /* c */ 1 ]", "[ -1 ]"]
         self.joins = [",", ", ", " ,", " ", "\n  ", "\x0b", " /* , */ ", " -- }\n", ",\x0c"]
-        self.leads = ["", "", "\n  ", " "]
+        self.leads = ["", "", "\n  ", " ", " /* lead */ ", "-- lead {\n  "]
+        self.trails = ["", "", "\n", " ", " -- trail }\n", "/* trail */", " -- trail\r"]
         self.plain = ["'{a,b}'", "{'k': 1, 'j': {'m': 'n'}}", '"weird{n}"', "1", "{'a': [1,2]}", "'don''t'",
                       "MAP {'k': 'v'}", "{'k': 'v'}.k", "[1,2][1]", "list_transform([1], lambda x: x)",
                       "1.5::DECIMAL(10,2)", "CAST(x AS DECIMAL(10,2))"]
@@ -111,7 +112,7 @@ class Grammar:
         body = braced[0] + "".join(r.choice(self.joins) + item for item in braced[1:])
         if r.random() < 0.2:
             body += ","
-        return "{" + r.choice(self.leads) + body + r.choice(["", "", "\n", " "]) + "}", expanded
+        return "{" + r.choice(self.leads) + body + r.choice(self.trails) + "}", expanded
 
     def term(self):
         r = self.r

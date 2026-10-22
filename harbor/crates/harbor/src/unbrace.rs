@@ -26,7 +26,10 @@
 //! or `::DOUBLE PRECISION`, would reach only the last alternative, so a
 //! term or an item that ends inside one is refused. Items
 //! in a group are separated by commas; spaces and comments alone separate
-//! them too, so a comma is never required, only clearer. A group nests; two
+//! them too, so a comma is never required, only clearer. A comment between
+//! items goes with the item before it, those before the first item with the
+//! first, and comes out after each alternative its item makes, after a
+//! space; a line comment keeps the line break that ends it. A group nests; two
 //! groups in one term multiply, as they do in a shell. The alternatives a
 //! term expands to are joined with `, `, which is what a select list, a
 //! `FROM` list and an argument list all take.
@@ -211,7 +214,7 @@ fn push_term(out: &mut Piece, term: Text, braced: bool, budget: &mut usize) -> R
         out.push(term);
         return Ok(1);
     }
-    let mut frames = vec![Frame::new(Whole::Term(term), group, items, budget)?];
+    let mut frames = vec![Frame::new(Whole::Term(term), term.len(), group, items, budget)?];
     let mut alts = 0;
     while let Some(frame) = frames.last_mut() {
         let mark = out.len();
@@ -219,12 +222,12 @@ fn push_term(out: &mut Piece, term: Text, braced: bool, budget: &mut usize) -> R
             out.push(JOIN);
         }
         let start = out.len();
-        frame.write(frame.next, out);
+        let body = frame.write(frame.next, out) - start;
         frame.next += 1;
         if frame.next == frame.items.len() {
             frames.pop();
         }
-        let alt = out.text().slice(start, out.len());
+        let alt = out.text().slice(start, start + body);
         let Some(group) = alt.first_group() else {
             alts += 1;
             continue;
@@ -236,13 +239,17 @@ fn push_term(out: &mut Piece, term: Text, braced: bool, budget: &mut usize) -> R
         }
         let alt = out.split_off(start);
         out.truncate(mark);
-        frames.push(Frame::new(Whole::Alt(alt), group, items, budget)?);
+        frames.push(Frame::new(Whole::Alt(alt), body, group, items, budget)?);
     }
     Ok(alts)
 }
 
 /// `, `, read as code.
 const JOIN: Text = Text { src: b", ", read: &[CODE, CODE] };
+
+/// A space, read as one, that sets a comment a group carries after the
+/// alternative it goes with.
+const SPACE: Text = Text { src: b" ", read: &[CODE] };
 
 /// Charges `cost` to the budget, or refuses the statement.
 fn spend(budget: &mut usize, cost: usize) -> Result<(), String> {
@@ -252,10 +259,12 @@ fn spend(budget: &mut usize, cost: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// A group being resolved: the text it sits in, where it opens and closes,
-/// its items, and the next of them to write.
+/// A group being resolved: the text it sits in, how much of that text is
+/// the alternative before the comments it carries, where the group opens and
+/// closes, its items, and the next of them to write.
 struct Frame<'a> {
     whole: Whole<'a>,
+    body: usize,
     group: (usize, usize),
     items: Vec<Item>,
     next: usize,
@@ -267,29 +276,46 @@ enum Whole<'a> {
     Alt(Piece),
 }
 
-/// Where an item sits in the text of its group.
+/// Where an item sits in the text of its group, and where the separators
+/// after it end: at the next item, or at the group's close.
 #[derive(Clone, Copy)]
 struct Item {
     start: usize,
     end: usize,
+    to: usize,
 }
 
 impl<'a> Frame<'a> {
     /// The frame for the group at `group` in `whole`, charged what its
     /// alternatives will write.
-    fn new(whole: Whole<'a>, group: (usize, usize), items: Vec<Item>, budget: &mut usize) -> Result<Self, String> {
-        let each = whole.text().len() - (group.1 + 1 - group.0);
-        spend(budget, items.iter().fold(0usize, |sum, item| sum.saturating_add(each + item.end - item.start)))?;
-        Ok(Frame { whole, group, items, next: 0 })
+    fn new(whole: Whole<'a>, body: usize, group: (usize, usize), items: Vec<Item>, budget: &mut usize) -> Result<Self, String> {
+        let (text, (lbrace, rbrace)) = (whole.text(), group);
+        let each = text.len() - (rbrace + 1 - lbrace);
+        let mut notes = 0usize;
+        text.notes(lbrace + 1, items[0].start, |note| notes += note.len());
+        for item in &items {
+            text.notes(item.end, item.to, |note| notes += note.len());
+        }
+        spend(budget, items.iter().fold(notes, |sum, item| sum.saturating_add(each + item.end - item.start)))?;
+        Ok(Frame { whole, body, group, items, next: 0 })
     }
 
     /// Writes the alternative item `k` makes: the text before the group,
-    /// the item, and the text after it.
-    fn write(&self, k: usize, out: &mut Piece) {
+    /// the item, and the text after it; then the comments the text carries,
+    /// and those beside the item in the group. Returns where the
+    /// alternative ends and its comments begin.
+    fn write(&self, k: usize, out: &mut Piece) -> usize {
         let (text, (lbrace, rbrace), item) = (self.whole.text(), self.group, self.items[k]);
         out.push(text.slice(0, lbrace));
         out.push(text.slice(item.start, item.end));
-        out.push(text.slice(rbrace + 1, text.len()));
+        out.push(text.slice(rbrace + 1, self.body));
+        let end = out.len();
+        out.push(text.slice(self.body, text.len()));
+        if k == 0 {
+            text.notes(lbrace + 1, item.start, |note| out.push(note));
+        }
+        text.notes(item.end, item.to, |note| out.push(note));
+        end
     }
 }
 
@@ -639,12 +665,33 @@ impl<'a> Text<'a> {
         ))
     }
 
+    /// What the comments between `from` and `to` write, given to `note`
+    /// piece by piece: a space, each comment, and the line break that ends
+    /// a line comment, so the comment ends where it did.
+    fn notes(&self, from: usize, to: usize, mut note: impl FnMut(Text<'a>)) {
+        let mut i = from;
+        while i < to {
+            let kind = self.read[i] & KIND;
+            if self.read[i] & BEGINS == 0 || !matches!(kind, LINE_COMMENT | BLOCK_COMMENT) {
+                i += 1;
+                continue;
+            }
+            let end = (i + 1..to).find(|&j| self.read[j] & (KIND | BEGINS) != kind).unwrap_or(to);
+            note(SPACE);
+            note(self.slice(i, end));
+            if kind == LINE_COMMENT {
+                note(self.slice(end, end + 1));
+            }
+            i = end;
+        }
+    }
+
     /// The items between `from` and `to`, split at top-level spaces, comments
     /// and commas; a nested group travels whole inside its item, as do a
     /// cast's type parameters. An error when an item ends inside a cast's
     /// type ([`Text::cast_beyond`]).
     fn items(&self, from: usize, to: usize) -> Result<Vec<Item>, String> {
-        let mut items = Vec::new();
+        let mut items: Vec<Item> = Vec::new();
         let mut depth = 0usize;
         let mut start = from;
         let (mut lists, mut brackets) = (None, None);
@@ -686,14 +733,20 @@ impl<'a> Text<'a> {
                     {
                         return Err(refusal);
                     }
-                    items.push(Item { start, end: i });
+                    if let Some(last) = items.last_mut() {
+                        last.to = start;
+                    }
+                    items.push(Item { start, end: i, to });
                 }
                 start = i + 1;
             }
             i += 1;
         }
         if to > start {
-            items.push(Item { start, end: to });
+            if let Some(last) = items.last_mut() {
+                last.to = start;
+            }
+            items.push(Item { start, end: to, to });
         }
         Ok(items)
     }
@@ -814,13 +867,35 @@ mod tests {
         assert_eq!(x("select r.{a\u{3000}b\u{b}c} from t"), "select r.a, r.b, r.c from t");
         assert_eq!(x("select r.{a,b}-- c\nfrom t"), "select r.a, r.b-- c\nfrom t");
         assert_eq!(x("select r.{a,b}/* c */from t"), "select r.a, r.b/* c */from t");
-        assert_eq!(x("select r.{a /* , */ b -- }\n c} from t"), "select r.a, r.b, r.c from t");
+        assert_eq!(x("select r.{a /* , */ b -- }\n c} from t"), "select r.a /* , */, r.b -- }\n, r.c from t");
         // Where the pre-pass keeps a Unicode space, here inside the quote a
         // `'` in a comment opens for it, its bytes are part of the word, and
         // of the item.
         assert_eq!(x("select /* ' */ r.{a\u{a0}b} from t"), "select /* ' */ r.a\u{a0}b from t");
         // U+1680 is no space to the engine.
         assert_eq!(x("select r.{a,b}\u{1680}x"), "select r.a\u{1680}x, r.b\u{1680}x");
+    }
+
+    /// A comment in a group goes with the item before it, and those before
+    /// the first item with the first: each comes out after every
+    /// alternative its item makes, after a space, a line comment with the
+    /// line break that ends it.
+    #[test]
+    fn a_comment_in_a_group_goes_with_its_item() {
+        assert_eq!(x("select r.{a /* keep */, b} from t"), "select r.a /* keep */, r.b from t");
+        assert_eq!(x("select r.{\n  a,  -- the a\n  -- b,\n  c\n} from t"), "select r.a -- the a\n -- b,\n, r.c from t");
+        assert_eq!(x("select r.{a,b -- last\r}, c"), "select r.a, r.b -- last\r, c");
+        assert_eq!(x("select r.{ /* first */ a b/**/}"), "select r.a /* first */, r.b /**/");
+        // After the whole alternative, so a word after the group stays whole.
+        assert_eq!(x("select {first /* f */, last}Name"), "select firstName /* f */, lastName");
+        assert_eq!(x("select r.{a /* a */, b}::INT[2]"), "select r.a::INT[2] /* a */, r.b::INT[2]");
+        // Each alternative carries its items' comments, in the order their
+        // groups are resolved; a group of nothing keeps its own as written.
+        assert_eq!(x("select {a /* A */, b}.{x /* X */ y}"), "select a.x /* A */ /* X */, a.y /* A */, b.x /* X */, b.y");
+        assert_eq!(x("select r.{p.{x /* X */} /* P */}"), "select r.p.x /* P */ /* X */");
+        assert_eq!(x("select r.{a}.{ /* none */ }"), "select r.a.{ /* none */ }");
+        // A comment in a struct literal, a string or a comment is text.
+        assert_eq!(x("select r.{a {'k': 1 /* c */}}"), "select r.a, r.{'k': 1 /* c */}");
     }
 
     /// The statement is read once, and every alternative keeps that reading:
@@ -1076,14 +1151,15 @@ mod tests {
         // The term's alternatives written out; how many there were, or
         // `None` when an item splits a cast.
         let flush = |out: &mut Vec<Unit>, term: &mut Vec<Unit>| {
-            let alts = if term.iter().any(|u| u.0 == Tok::Code(b'{')) { reference_alternatives(term)? } else { vec![term.clone()] };
+            let alts = if term.iter().any(|u| u.0 == Tok::Code(b'{')) { reference_alternatives(term)? } else { vec![(term.clone(), vec![])] };
             let n = alts.len();
-            for (k, alt) in alts.into_iter().enumerate() {
+            for (k, (alt, notes)) in alts.into_iter().enumerate() {
                 if k > 0 {
                     out.push((Tok::Code(b','), b",".to_vec()));
                     out.push((Tok::Space, b" ".to_vec()));
                 }
                 out.extend(alt);
+                out.extend(notes);
             }
             term.clear();
             Some(n)
@@ -1236,7 +1312,10 @@ mod tests {
         None
     }
 
-    fn reference_alternatives(term: &[Unit]) -> Option<Vec<Vec<Unit>>> {
+    /// Each alternative a term stands for, beside the comments it carries:
+    /// those beside its item in each group, in the order the groups are
+    /// resolved, each after a space, a line comment with its line break.
+    fn reference_alternatives(term: &[Unit]) -> Option<Vec<(Vec<Unit>, Vec<Unit>)>> {
         let close = |open: usize| {
             let mut depth = 0;
             for (k, u) in term.iter().enumerate().skip(open) {
@@ -1256,7 +1335,7 @@ mod tests {
         let mut open = 0;
         let group = loop {
             match term[open..].iter().position(|u| u.0 == Tok::Code(b'{')) {
-                None => return Some(vec![term.to_vec()]),
+                None => return Some(vec![(term.to_vec(), vec![])]),
                 Some(k) => {
                     let (o, c) = (open + k, close(open + k));
                     let inner = &term[o + 1..c];
@@ -1280,7 +1359,9 @@ mod tests {
             }
         };
         let (o, c) = group;
-        let mut items: Vec<Vec<Unit>> = vec![Vec::new()];
+        let mut items: Vec<(Vec<Unit>, Vec<Unit>)> = vec![(Vec::new(), Vec::new())];
+        // Comments before the first item go with it.
+        let mut lead: Vec<Unit> = Vec::new();
         let mut depth = 0;
         let inner = &term[o + 1..c];
         let mut k = 0;
@@ -1291,7 +1372,7 @@ mod tests {
                 Tok::Code(b'}') => depth -= 1,
                 _ => {}
             }
-            let item = items.last_mut().unwrap();
+            let item = &mut items.last_mut().unwrap().0;
             let close = (depth == 0).then(|| reference_type_parameters(item, inner, k)).flatten();
             if let Some(close) = close.or_else(|| (depth == 0 && !item.is_empty()).then(|| reference_subscript(inner, k)).flatten()) {
                 item.extend_from_slice(&inner[k..=close]);
@@ -1302,19 +1383,33 @@ mod tests {
                 if separates(&u.0) && reference_cast_beyond(item, &inner[k..]) {
                     return None;
                 }
-                items.push(Vec::new());
+                if let Tok::Comment(read) = &u.0 {
+                    let mut note = vec![(Tok::Space, b" ".to_vec()), u.clone()];
+                    if read.starts_with(b"--") {
+                        note.push(inner[k + 1].clone());
+                    }
+                    match items.iter_mut().rev().find(|(item, _)| !item.is_empty()) {
+                        Some((_, notes)) => notes.extend(note),
+                        None => lead.extend(note),
+                    }
+                }
+                items.push((Vec::new(), Vec::new()));
             } else {
                 item.push(u.clone());
             }
             k += 1;
         }
-        items.retain(|item| !item.is_empty());
+        items.retain(|(item, _)| !item.is_empty());
         if items.is_empty() {
-            return Some(vec![term.to_vec()]);
+            return Some(vec![(term.to_vec(), vec![])]);
         }
+        lead.append(&mut items[0].1);
+        items[0].1 = lead;
         let mut alts = Vec::new();
-        for item in items {
-            alts.extend(reference_alternatives(&[&term[..o], &item[..], &term[c + 1..]].concat())?);
+        for (item, notes) in items {
+            for (alt, deeper) in reference_alternatives(&[&term[..o], &item[..], &term[c + 1..]].concat())? {
+                alts.push((alt, [&notes[..], &deeper[..]].concat()));
+            }
         }
         Some(alts)
     }
@@ -1328,6 +1423,7 @@ mod tests {
         "::DECIMAL(10,2)", "::T(", "::S(a {b} c)", "{a::V(1, 2) b}", "::X(E'\\', \"(\")", "2(",
         "::DOUBLE", " PRECISION", "::INTERVAL", " year", " ARRAY", "::INT[]", "[2]", " [", "]", " (",
         "[", "[ 1 ]", "[i : j]", "[ 3 ]", "[f(1, 2)]", "['k']", "{l[1:2]}",
+        "{a /* c */ b}", "{a -- c\n, b}", "{ /* ' */ x}", "{x,y -- c\r}",
         "'", "'{a,b}'", "''", "'\\'", "E'\\''", "e'a\\\\b'", "\"", "\"{a,b}\"", "`", "`{a,b}`", "`it's`",
         "$$", "$$x.{a,b}$$", "$t$", "$t${a,b}$t$", "$t$t$",
         "--", "-- {a,b}\n", "/*", "*/", "/* ' */", "/* {a,b} */", "\n", "\r",

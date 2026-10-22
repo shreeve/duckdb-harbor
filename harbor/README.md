@@ -360,12 +360,16 @@ select id, raw_request.requisitionNumber, raw_request.visitDate,
 ```
 
 Items are separated by commas. Whitespace or a comment alone separates them
-too, so the comma is never required, only clearer; a comment between items
-goes with the separator and is not in the expansion. A group nests. It can sit
-anywhere in a term — `orders_{2025,2026}`, `{first,last}Name`,
-`r.{a,b}::VARCHAR` — where a term ends at whitespace, a comment, a comma, a
-parenthesis or a semicolon, whitespace being whatever the engine takes for it,
-the vertical tab and the Unicode spaces it strips among it. A cast's type
+too, so the comma is never required, only clearer. A comment between items
+goes with the item before it, and one before the first item with the first:
+it comes out after each alternative that item makes, so
+`r.{a /* the a */, b}` is `r.a /* the a */, r.b`, a line comment keeps the
+line break that ends it, and an item commented out stays a comment in the
+statement the engine runs. A group nests. It can sit anywhere in a term —
+`orders_{2025,2026}`, `{first,last}Name`, `r.{a,b}::VARCHAR` — where a term
+ends at whitespace, a comment, a comma, a parenthesis or a semicolon,
+whitespace being whatever the engine takes for it, the vertical tab and the
+Unicode spaces it strips among it. A cast's type
 parameters written right after its type name stay in the term, so
 `r.{a,b}::DECIMAL(10,2)` casts both, and a subscript or slice written right
 after a term stays in it whatever it holds, so `r.{a,b}[ 1 ]` and
