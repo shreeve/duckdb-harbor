@@ -37,8 +37,9 @@
 //! afresh, and a quote its pre-pass misreads can change where it strips a
 //! Unicode space; an expansion the engine would read in any way other than
 //! byte for byte as the statement it came from (a string's bytes taken for
-//! code, two strings run into one, a space stripped in one and kept in the
-//! other) leaves the whole statement as it came.
+//! code, two strings run into one, a string that takes backslash escapes in
+//! one and not in the other, a space stripped in one and kept in the other)
+//! leaves the whole statement as it came.
 //!
 //! Each group multiplies, so a short statement can stand for an enormous one:
 //! thirty two-item groups in a term are a billion alternatives. Expansion
@@ -176,8 +177,9 @@ fn alternatives(term: Text, budget: &mut usize) -> Result<Vec<Piece>, String> {
 }
 
 // How the engine reads a byte, packed in one: the kind of span it falls in,
-// whether it begins a string, quoted name, dollar quote or comment, and
-// whether the engine's pre-pass turns it into a space.
+// whether it begins a string, quoted name, dollar quote or comment, whether
+// the string it begins takes backslash escapes, and whether the engine's
+// pre-pass turns it into a space.
 const CODE: u8 = 0;
 const STR: u8 = 1;
 const DOLLAR: u8 = 2;
@@ -186,6 +188,7 @@ const BLOCK_COMMENT: u8 = 4;
 const KIND: u8 = 7;
 const BEGINS: u8 = 8;
 const STRIPPED: u8 = 16;
+const ESCAPES: u8 = 32;
 
 /// The engine's reading of each byte of `src`. Two texts with the same bytes
 /// that agree here are one statement to the engine.
@@ -202,6 +205,9 @@ fn reading(src: &str) -> Vec<u8> {
         };
         read[span.start..span.end].fill(kind);
         read[span.start] |= BEGINS;
+        if span.escapes {
+            read[span.start] |= ESCAPES;
+        }
     }
     for (r, (a, b)) in read.iter_mut().zip(src.bytes().zip(plain.iter())) {
         if a != *b {
@@ -477,6 +483,13 @@ mod tests {
             // misreading flips: the U+00A0 in the string after it would be
             // stripped where it was kept.
             "select {a,b}.E'\\'', 'x\u{a0}y'",
+            // An `E` that begins a word makes the string after it take
+            // backslash escapes, whether or not one moves its end: `}'` is a
+            // plain string and `E'` is not, `d'` is plain and `e'` is not,
+            // `}e'` takes escapes and `xe'` does not.
+            r"select {E}'a\tb'",
+            r"select t.{d,e}'a\tb'",
+            r"select {x,y}e'a\tb'",
         ] {
             assert!(matches!(expand(sql), Ok(Cow::Borrowed(_))), "{sql:?}");
         }
@@ -517,14 +530,14 @@ mod tests {
     }
 
     /// A statement as the engine reads it, one unit at a time: a string,
-    /// quoted name, dollar quote or comment whole, each other byte alone,
-    /// and a space as a space whatever its bytes. Each unit keeps the bytes
-    /// it was read from.
+    /// quoted name, dollar quote or comment whole, with whether a string
+    /// takes backslash escapes, each other byte alone, and a space as a space
+    /// whatever its bytes. Each unit keeps the bytes it was read from.
     #[derive(Clone, PartialEq, Debug)]
     enum Tok {
         Space,
         Code(u8),
-        Quoted(Kind, Vec<u8>),
+        Quoted(Kind, bool, Vec<u8>),
         Comment(Vec<u8>),
     }
 
@@ -543,7 +556,7 @@ mod tests {
                     }
                 }
                 Kind::LineComment | Kind::BlockComment => out.push((Tok::Comment(read), raw)),
-                kind => out.push((Tok::Quoted(kind, read), raw)),
+                kind => out.push((Tok::Quoted(kind, sp.escapes, read), raw)),
             }
         }
         out
