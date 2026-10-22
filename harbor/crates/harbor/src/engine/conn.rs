@@ -753,12 +753,13 @@ impl Stream {
         }
     }
 
-    /// Interrupt the statement and say whether it had run to its end
-    /// already: its first fetch came back as a chunk or as its end, not as
-    /// the interrupt or an error. For a stream given up before it was read.
+    /// Interrupt the statement and say whether it had run past the
+    /// interrupt already: its first fetch came back as a chunk, as its end
+    /// or as an error of its own, not as the interrupt. For a stream given
+    /// up before it was read.
     pub fn stop(&mut self) -> bool {
         self.interrupt.interrupt();
-        self.next_chunk().is_ok()
+        self.next_chunk().map_or_else(|e| !e.interrupted(), |_| true)
     }
 }
 

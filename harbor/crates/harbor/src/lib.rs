@@ -4843,6 +4843,11 @@ fn run_statement(
             return needs_reset;
         }
         Err(e) => {
+            // A group's first step failed (`Conn::execute`): what it did
+            // is the error's, as at a first fetch below.
+            if awaiting && !e.interrupted() {
+                on_slot.slot.keep();
+            }
             let _ = ready.send(Err(on_slot.refuse(conn, e.into_text())));
             return true;
         }
@@ -4920,7 +4925,11 @@ fn run_statement(
         let next = stream.next_chunk();
         // A retained statement's first fetch: a chunk or its end says it
         // ran to its end, and a cancel that fired at it stopped nothing.
-        if awaiting && next.is_ok() {
+        // So does any error but the interrupt, which is the statement's own
+        // and may follow work that was kept: a commit is durable before the
+        // checkpoint that follows it fails. The client is told that error,
+        // and the canceller that its cancel stopped nothing.
+        if awaiting && next.as_ref().map_or_else(|e| !e.interrupted(), |_| true) {
             on_slot.slot.keep();
             awaiting = false;
         }
@@ -5872,6 +5881,51 @@ mod tests {
         }
         // Both answers were given, or the test proved nothing about one.
         assert!(stopped > 0 && kept > 0, "{stopped} stopped, {kept} kept");
+    }
+
+    /// A retained statement whose first fetch fails with an error of its own
+    /// is answered that error, and its canceller false: only the interrupt
+    /// says the cancel stopped it. The slot's interrupt is aimed at another
+    /// connection, as one the engine loses is, so the statement runs on to
+    /// its error with a cancel fired at it.
+    #[test]
+    fn a_cancel_is_answered_true_only_for_the_interrupt() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::sync_channel};
+        if crate::engine::engine().is_err() { return; }
+        let mut conn = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        let elsewhere = crate::engine::conn::open(std::path::Path::new(":memory:"), &[]).unwrap();
+        conn.execute_batch("CREATE TABLE e(i BIGINT)").unwrap();
+        let state = super::SlotState::new(elsewhere.interrupt_handle());
+        let id = super::next_job_id();
+        state.begin(id, None);
+        let over = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let (state, over) = (Arc::clone(&state), Arc::clone(&over));
+            std::thread::spawn(move || {
+                while !state.run.lock().unwrap().retained {
+                    if over.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    std::thread::yield_now();
+                }
+                Some(state.cancel_and_say(id))
+            })
+        };
+        let sql = "INSERT INTO e SELECT CASE WHEN i = 30000000 THEN error('boom') ELSE i END \
+                   FROM range(30000001) t(i)";
+        let mut slot = super::OnSlot { slot: &state, done: false };
+        let (ready, result) = sync_channel(1);
+        let (body, _output) = sync_channel(1);
+        super::run_statement(&mut conn, &mut slot, sql.into(), vec![], super::Shape::Json,
+            ready, body, Instant::now());
+        drop(slot);
+        over.store(true, Ordering::SeqCst);
+        let said = canceller.join().unwrap();
+        let answer = result.recv().unwrap().map_err(|r| (r.status, r.message));
+        let (status, message) = answer.unwrap_err();
+        assert!(status == 400 && message.contains("boom"), "{status} {message}");
+        assert_eq!(said, Some(false), "the cancel was answered true for the statement's own error");
+        assert_eq!(conn.query_strings("SELECT count(*)::VARCHAR FROM e").unwrap(), ["0"]);
     }
 
     #[test]
