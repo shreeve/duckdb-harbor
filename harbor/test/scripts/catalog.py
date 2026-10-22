@@ -1052,6 +1052,12 @@ def run_race(base, work, sqlite_ok, rounds=300):
              "SELECT count(*) FROM query('SELECT * FROM duckdb_tables()')",
              "SELECT count(*) FROM gate_q",
              "SELECT count(*) FROM query_table('gate_v')",
+             # The view named only as a single-quoted string, which the
+             # engine resolves to the catalog-reading view all the same, and
+             # a function that runs catalog-reading SQL text: either would
+             # pass the gate open and crash the engine against the churn.
+             "SELECT count(*) FROM 'gate_v'",
+             "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT count(*) FROM duckdb_tables()'))",
              "SELECT count(*) FROM gate_iv",
              "SELECT count(*) FROM sqlite.gate_ov")
     failures = []

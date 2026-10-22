@@ -4985,14 +4985,17 @@ enum Gate {
 /// The gate a statement passes, from its text. `ATTACH` and `DETACH` are
 /// read as the keyword the engine acts on, through comments and an analyzed
 /// `EXPLAIN`. A statement reads the catalog when it is a `SHOW`, `DESCRIBE`,
-/// `SUMMARIZE` or `PRAGMA`, or names, in its code or as a quoted name, a
-/// catalog function or schema: `duckdb_…`, `pragma_…`, `pg_…`,
-/// `information_schema`, `sql_auto_complete` or `sqlite_query`, which reads
-/// an attached SQLite database by its name; `query` or `query_table`
-/// called, which run a statement or read a table named in a string; or a
-/// view, macro or prepared statement whose body reads it (`CatalogNames`).
-/// A name in a string or a comment does not count, and neither does a
-/// column named `query`. While the views and macros are not all learned
+/// `SUMMARIZE` or `PRAGMA`, an `EXPORT DATABASE` or a `COPY FROM DATABASE`,
+/// which read a database's catalog; or names, in its code or as a quoted or
+/// single-quoted name, a catalog function or schema: `duckdb_…`, `pragma_…`,
+/// `pg_…`, `information_schema`, `sql_auto_complete` or `sqlite_query`, which
+/// reads an attached SQLite database by its name; `json_execute_serialized_sql`,
+/// `query` or `query_table` called, which run a statement or read a table
+/// named in a string; or a view, macro or prepared statement whose body
+/// reads it (`CatalogNames`). The engine resolves a name single-quoted
+/// (`FROM 'cv'`) to the view or table of that name, so its contents are a
+/// name too; a name in a comment does not count, and neither does a column
+/// named `query`. While the views and macros are not all learned
 /// (`CatalogNames::complete`), every statement that names anything
 /// (`names_any`) reads the catalog, since any name may be one that does.
 fn catalog_gate(sql: &str) -> Gate {
@@ -5016,7 +5019,8 @@ fn gate_of(sql: &str, names: &CatalogNames) -> Gate {
 fn gate_in(sql: &str, names: &CatalogNames, complete: bool) -> Gate {
     match acting_keyword(sql).as_str() {
         "ATTACH" | "DETACH" => return Gate::Changes,
-        "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PRAGMA" => return Gate::Reads,
+        "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PRAGMA" | "EXPORT" => return Gate::Reads,
+        "COPY" if copy_from_database(sql) => return Gate::Reads,
         _ => {}
     }
     match names_in(sql, |name| catalog_word(name) || names.reads.contains(name)) {
@@ -5041,7 +5045,8 @@ const RESERVED: &[&[u8]] = &[
 ];
 
 /// Whether a statement names anything a view, a macro or a catalog
-/// function may be: a quoted name, or a word of its code that is neither
+/// function may be: a quoted or single-quoted name (the engine resolves
+/// `FROM 'cv'` to the view `cv`), or a word of its code that is neither
 /// a reserved keyword nor a number, digits and `_` after a digit.
 /// `SELECT 42` names nothing.
 fn names_any(sql: &str) -> bool {
@@ -5055,14 +5060,15 @@ fn names_any(sql: &str) -> bool {
                 let number = word[0].is_ascii_digit() && word.iter().all(|&c| c.is_ascii_digit() || c == b'_');
                 !number && !RESERVED.contains(&word.to_ascii_lowercase().as_slice())
             }),
-            wire::scan::Kind::Str => matches!(text.first(), Some(b'"' | b'`')),
+            wire::scan::Kind::Str => matches!(text.first(), Some(b'"' | b'`' | b'\'')),
             _ => false,
         }
     })
 }
 
 /// Whether a name, lowercased, is one of the engine's catalog functions or
-/// schemas, as `names_in` passes it: `query` and `query_table` count
+/// schemas, as `names_in` passes it: `json_execute_serialized_sql` runs the
+/// SQL text it is given, as `query(` does; `query` and `query_table` count
 /// called, as `query(` and `query_table(`, and a column of either name does
 /// not.
 fn catalog_word(word: &[u8]) -> bool {
@@ -5070,6 +5076,7 @@ fn catalog_word(word: &[u8]) -> bool {
         || word == b"information_schema"
         || word == b"sql_auto_complete"
         || word == b"sqlite_query"
+        || word == b"json_execute_serialized_sql"
         || word == b"query("
         || word == b"query_table("
 }
@@ -5079,10 +5086,11 @@ fn catalog_word(word: &[u8]) -> bool {
 const CALLED: [&[u8]; 2] = [b"query", b"query_table"];
 
 /// Each name a statement uses, lowercased, as the engine matches names: a
-/// word of its code, or a name quoted in `"` or `` ` ``, until `found` says
-/// it is the one looked for. Whether one was. Its spaces are the engine's
-/// (`wire::scan::plain_spaces`), and one of the `CALLED` names followed by
-/// `(`, past spaces and comments, is passed with it: `query(`.
+/// word of its code, a name quoted in `"` or `` ` ``, or a single-quoted
+/// string where the engine resolves one to a relation (`FROM 'cv'`), until
+/// `found` says it is the one looked for. Whether one was. Its spaces are
+/// the engine's (`wire::scan::plain_spaces`), and one of the `CALLED` names
+/// followed by `(`, past spaces and comments, is passed with it: `query(`.
 fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
     let plain = wire::scan::plain_spaces(sql.as_bytes());
@@ -5095,13 +5103,24 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
         }
         found(&name)
     };
+    // Whether a single-quoted string here would be a relation name: the
+    // engine resolves one right after `FROM`, `JOIN`, `TABLE`, `PIVOT`,
+    // `UNPIVOT` or a comma (`FROM 'cv'`) to the view or table it names, but
+    // reads one anywhere else (`SELECT 'cv'`) as a string value. Spaces and
+    // comments between do not change it.
+    let introduces = |w: &[u8]| matches!(w, b"from" | b"join" | b"table" | b"pivot" | b"unpivot");
+    let mut relation = false;
     for (at, span) in spans.iter().enumerate() {
         let text = &bytes[span.start..span.end];
         match span.kind {
             wire::scan::Kind::Code => {
                 let mut i = span.start;
                 while i < span.end {
-                    if !is_word(bytes[i]) {
+                    let c = bytes[i];
+                    if !is_word(c) {
+                        if !wire::scan::is_space(c) {
+                            relation = c == b',';
+                        }
                         i += 1;
                         continue;
                     }
@@ -5109,18 +5128,22 @@ fn names_in(sql: &str, mut found: impl FnMut(&[u8]) -> bool) -> bool {
                     while i < span.end && is_word(bytes[i]) {
                         i += 1;
                     }
-                    if used(&bytes[start..i], &spans[at..], i) {
+                    let word = &bytes[start..i];
+                    relation = introduces(&word.to_ascii_lowercase());
+                    if used(word, &spans[at..], i) {
                         return true;
                     }
                 }
             }
-            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) => {
+            wire::scan::Kind::Str if matches!(text.first(), Some(b'"' | b'`')) || (text.first() == Some(&b'\'') && relation) => {
                 let quote = text[0];
                 let name = text[1..].strip_suffix(&[quote]).unwrap_or(&text[1..]);
+                relation = false;
                 if used(name, &spans[at + 1..], span.end) {
                     return true;
                 }
             }
+            wire::scan::Kind::Str | wire::scan::Kind::Dollar => relation = false,
             _ => {}
         }
     }
@@ -5749,17 +5772,21 @@ fn brings_views(sql: &str) -> bool {
     match acting_keyword(sql).as_str() {
         "ATTACH" => !attaches_sqlite(sql),
         "IMPORT" => true,
-        "COPY" => {
-            let mut tokens = Vec::new();
-            names_in_order(sql, &mut tokens);
-            let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(t)) if t == w.as_bytes());
-            tokens
-                .iter()
-                .position(|t| word(Some(t), "copy"))
-                .is_some_and(|at| word(tokens.get(at + 1), "from") && word(tokens.get(at + 2), "database"))
-        }
+        "COPY" => copy_from_database(sql),
         _ => false,
     }
+}
+
+/// Whether a statement is `COPY FROM DATABASE`, which reads a database's
+/// catalog, as against a `COPY` that reads or writes rows.
+fn copy_from_database(sql: &str) -> bool {
+    let mut tokens = Vec::new();
+    names_in_order(sql, &mut tokens);
+    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(t)) if t == w.as_bytes());
+    tokens
+        .iter()
+        .position(|t| word(Some(t), "copy"))
+        .is_some_and(|at| word(tokens.get(at + 1), "from") && word(tokens.get(at + 2), "database"))
 }
 
 /// Whether an `ATTACH` attaches a SQLite file, as the engine reads the
@@ -7003,6 +7030,12 @@ mod tests {
             "PRAGMA show_tables",
             "SELECT library_version FROM pragma_version()",
             "SELECT * FROM sqlite_query('a', 'SELECT 1')",
+            "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))",
+            "EXPORT DATABASE a TO '/x/out' (FORMAT csv)",
+            "export database '/x/out'",
+            "COPY FROM DATABASE a TO b",
+            "FROM 'duckdb_tables'",
+            "SELECT * FROM a, 'information_schema'",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Reads, "{sql}");
         }
@@ -7015,14 +7048,19 @@ mod tests {
             "SELECT * FROM \"select\"",
             "SELECT 0x10",
             "SELECT now()",
+            "SELECT 'duckdb_tables' AS s",
+            "COPY t TO '/x/duckdb_tables.csv'",
+            "COPY t FROM '/x/pg_data.csv'",
         ] {
             assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
             // Every statement that names anything reads it while the names
             // are not all known.
             assert_eq!(gate_of(sql, &CatalogNames::default()), Gate::Reads, "{sql}");
         }
-        // One that names nothing reads nothing, known or not.
-        for sql in ["SELECT 42", "select 1 + 2 AS select", "SELECT 1 -- information_schema", "SELECT 'v', 1_000"] {
+        // One that names nothing reads nothing, known or not. A string
+        // counts as a name while the names are unknown (`names_any`), so
+        // these have none.
+        for sql in ["SELECT 42", "select 1 + 2 AS select", "SELECT 1 -- information_schema", "SELECT 1, 1_000"] {
             assert_eq!(catalog_gate(sql), Gate::Open, "{sql}");
             assert_eq!(gate_of(sql, &CatalogNames::default()), Gate::Open, "{sql}");
         }
@@ -7040,11 +7078,24 @@ mod tests {
         names.learn(b"w", "CREATE VIEW w AS SELECT * FROM \"Later\"");
         names.learn(b"later", "CREATE VIEW later AS SELECT * FROM main.V");
         names.learn(b"m", "CREATE MACRO m() AS TABLE SELECT * FROM information_schema.tables");
+        // A view's name single-quoted where the engine resolves a relation
+        // (`FROM 'v'`), and a view whose body reaches the catalog that way.
+        names.learn(b"u", "CREATE VIEW u AS SELECT * FROM 'v'");
         names.rename(b"v", b"renamed");
-        for sql in ["SELECT * FROM v", "select * from MAIN.\"V\"", "SELECT * FROM w", "FROM m()", "TABLE renamed"] {
+        for sql in [
+            "SELECT * FROM v",
+            "select * from MAIN.\"V\"",
+            "SELECT * FROM w",
+            "FROM m()",
+            "TABLE renamed",
+            "FROM 'v'",
+            "FROM 'V'",
+            "SELECT * FROM a /* c */, 'v'",
+            "FROM u",
+        ] {
             assert_eq!(gate_of(sql, &names), Gate::Reads, "{sql}");
         }
-        for sql in ["SELECT * FROM plain", "SELECT 'v'", "SELECT 1 -- v", "SELECT vv FROM t"] {
+        for sql in ["SELECT * FROM plain", "SELECT 'v'", "SELECT 'v', 1", "SELECT 1 -- v", "SELECT vv FROM t"] {
             assert_eq!(gate_of(sql, &names), Gate::Open, "{sql}");
         }
         // A statement in a string, run by query(), and a table named in one.
