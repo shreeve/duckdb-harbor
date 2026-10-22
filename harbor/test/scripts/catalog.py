@@ -753,7 +753,7 @@ def run_busy(base, work):
     sql(base, "DETACH IF EXISTS app")
 
 
-def run_race(base, work, sqlite_ok, rounds=200):
+def run_race(base, work, sqlite_ok, rounds=300):
     # -----------------------------------------------------------------------
     section("A relation dropped while the catalog is read is left out")
     # -----------------------------------------------------------------------
@@ -772,6 +772,21 @@ def run_race(base, work, sqlite_ok, rounds=200):
     subprocess.run(["duckdb", "-no-init", churn, "-c", "CREATE TABLE c (i INTEGER); CHECKPOINT;"],
                    check=True, stdout=subprocess.DEVNULL)
     app = os.path.join(work, "app.sqlite")
+    # Readers whose statement names no catalog function and reads the
+    # catalog all the same: through query() and query_table(), through a
+    # view an IMPORT DATABASE makes, and through a view of a DuckDB file
+    # attached under the name sqlite.
+    export, own = os.path.join(work, "export"), os.path.join(work, "own.duckdb")
+    subprocess.run(["duckdb", "-no-init", os.path.join(work, "exported.duckdb"), "-c",
+                    "CREATE VIEW gate_iv AS SELECT * FROM duckdb_tables(); "
+                    f"EXPORT DATABASE '{export}'"], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["duckdb", "-no-init", own, "-c", "CREATE VIEW gate_ov AS SELECT * FROM duckdb_tables()"],
+                   check=True, stdout=subprocess.DEVNULL)
+    for statement in ("CREATE VIEW gate_v AS SELECT * FROM duckdb_tables()",
+                      "CREATE VIEW gate_q AS SELECT * FROM query('SELECT * FROM duckdb_tables()')",
+                      f"IMPORT DATABASE '{export}'",
+                      f"ATTACH '{own}' AS sqlite (READ_ONLY)"):
+        eq(f"set up: {statement[:40]}", None, sql(base, statement))
     stop = threading.Event()
     churned = [0, 0]
 
@@ -798,7 +813,12 @@ def run_race(base, work, sqlite_ok, rounds=200):
         thread.start()
     reads = ("/catalog", "/catalog?style=lite",
              "SELECT database_name, table_name, column_name FROM duckdb_columns()",
-             "SELECT * FROM sql_auto_complete('SELECT * FROM lite_')")
+             "SELECT * FROM sql_auto_complete('SELECT * FROM lite_')",
+             "SELECT count(*) FROM query('SELECT * FROM duckdb_tables()')",
+             "SELECT count(*) FROM gate_q",
+             "SELECT count(*) FROM query_table('gate_v')",
+             "SELECT count(*) FROM gate_iv",
+             "SELECT count(*) FROM sqlite.gate_ov")
     failures = []
     for i in range(rounds):
         read = reads[i % len(reads)]
