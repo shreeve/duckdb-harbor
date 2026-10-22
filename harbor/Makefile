@@ -53,9 +53,8 @@ install: harbor
 
 # libduckdb and the duckdb CLI of one build into $(DUCKDB_LIB), where
 # harbor's runtime search finds the library and test/scripts/check.sh the
-# pair. DUCKDB_LIB_BUILD=<build> takes both from this repository's
-# engine-<build> release; unset, DuckDB's nightly channel. The script
-# refuses a library without the v2 C API.
+# pair: the DuckDB release the script pins, from DuckDB's GitHub release,
+# checksummed. The script refuses a library without the v2 C API.
 fetch-duckdb:
 	DEST=$(DUCKDB_LIB) scripts/fetch-duckdb.sh
 

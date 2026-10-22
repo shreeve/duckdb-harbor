@@ -35,7 +35,7 @@ fn str_of(s: &str) -> ffi::str_t {
 pub struct Db {
     eng: &'static Engine,
     env: ffi::environment_handle,
-    db: ffi::database_handle,
+    instance: ffi::instance_handle,
 }
 
 // The handles are only used to spawn connections (boot, one thread) and to
@@ -45,18 +45,19 @@ unsafe impl Sync for Db {}
 
 impl Drop for Db {
     fn drop(&mut self) {
+        // Both destructors take a null slot, which a failed open leaves.
         unsafe {
-            if let Some(f) = self.eng.api.close {
-                f(&mut self.db);
+            if let Some(f) = self.eng.api.instance_destroy {
+                f(&mut self.instance);
             }
-            if let Some(f) = self.eng.api.destroy_environment {
+            if let Some(f) = self.eng.api.environment_destroy {
                 f(&mut self.env);
             }
         }
     }
 }
 
-/// Open a database and the first connection on it. `options` are open-time
+/// Open a database and the first connection on it. `options` are startup
 /// config (name, setting) pairs — the ones a later SET cannot reach.
 pub fn open(path: &Path, options: &[(&str, &str)]) -> Result<Conn, Error> {
     let eng = super::engine().map_err(|message| Error { code: ffi::ERROR_API, message })?;
@@ -68,46 +69,23 @@ pub fn open(path: &Path, options: &[(&str, &str)]) -> Result<Conn, Error> {
         message: format!("{}: the database path is not UTF-8", path.display()),
     })?;
 
-    let mut env: ffi::environment_handle = std::ptr::null_mut();
-    call!(api, create_environment(&mut env));
-
-    // Options are handles; build them, open, destroy them either way.
-    let mut opts: Vec<ffi::option_handle> = Vec::with_capacity(options.len());
-    let mut build = || -> Result<(), Error> {
-        for (name, setting) in options {
-            let mut o: ffi::option_handle = std::ptr::null_mut();
-            call!(api, option_create(str_of(name), str_of(setting), &mut o));
-            opts.push(o);
-        }
-        Ok(())
+    // Dropped on any failure below, destroying whatever was made.
+    let mut db = Db { eng, env: std::ptr::null_mut(), instance: std::ptr::null_mut() };
+    call!(api, environment_create(&mut db.env));
+    let names: Vec<ffi::str_t> = options.iter().map(|(name, _)| str_of(name)).collect();
+    let settings: Vec<ffi::str_t> = options.iter().map(|(_, setting)| str_of(setting)).collect();
+    let (names_at, settings_at) = match options.is_empty() {
+        true => (std::ptr::null(), std::ptr::null()),
+        false => (names.as_ptr(), settings.as_ptr()),
     };
-    let built = build();
-
-    let mut db: ffi::database_handle = std::ptr::null_mut();
-    let opened = match built {
-        Ok(()) => (|| -> Result<(), Error> {
-            call!(
-                api,
-                open(env, str_of(path_text), opts.as_mut_ptr(), opts.len() as ffi::idx_t, &mut db)
-            );
-            Ok(())
-        })(),
-        Err(e) => Err(e),
-    };
-    for mut o in opts {
-        if let Some(f) = api.option_destroy {
-            unsafe { f(&mut o) };
-        }
-    }
-    if let Err(e) = opened {
-        if let Some(f) = api.destroy_environment {
-            unsafe { f(&mut env) };
-        }
-        return Err(e);
-    }
-
-    let shared = Arc::new(Db { eng, env, db });
-    Conn::connect(shared)
+    call!(
+        api,
+        instance_create_with_options(db.env, names_at, settings_at, options.len() as ffi::idx_t, &mut db.instance)
+    );
+    // Attached under the name its path gives it, as the default database:
+    // what `duckdb <path>` opens, and what a connection made after it binds to.
+    call!(api, instance_attach(db.instance, std::ptr::null(), &str_of(path_text), std::ptr::null_mut(), true));
+    Conn::connect(Arc::new(db))
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +103,10 @@ pub struct Conn {
     eng: &'static Engine,
     db: Arc<Db>,
     conn: ffi::connection_handle,
+    /// The connection's factory, borrowed for the connection's life: the
+    /// values, types and casts it makes see its catalog and its settings,
+    /// as the statements it runs do.
+    factory: ffi::factory_handle,
     /// The cross-thread cancellation slot. A canceller holds this lock
     /// across its connection_interrupt call, and drop holds it across
     /// disconnect — so an interrupt can never land on a freed handle.
@@ -154,11 +136,23 @@ impl Conn {
         let eng = db.eng;
         let api = &eng.api;
         let mut conn: ffi::connection_handle = std::ptr::null_mut();
-        call!(api, connect(db.db, &mut conn));
+        call!(api, connection_create(db.instance, &mut conn));
+        let mut factory: ffi::factory_handle = std::ptr::null_mut();
+        let got = (|| -> Result<(), Error> {
+            call!(api, connection_get_factory(conn, &mut factory));
+            Ok(())
+        })();
+        if let Err(e) = got {
+            if let Some(f) = api.connection_destroy {
+                unsafe { f(&mut conn) };
+            }
+            return Err(e);
+        }
         Ok(Conn {
             eng,
             db,
             conn,
+            factory,
             interrupt: Arc::new(Mutex::new(conn)),
             cache: HashMap::new(),
             cache_bytes: 0,
@@ -181,12 +175,14 @@ impl Conn {
         // The old connection is dropped with its own slot after the swap.
         // No caller can interrupt either handle during the replacement.
         std::mem::swap(&mut self.conn, &mut fresh.conn);
+        std::mem::swap(&mut self.factory, &mut fresh.factory);
         *slot = self.conn;
         *fresh.interrupt.lock().unwrap_or_else(PoisonError::into_inner) = fresh.conn;
         self.cache.clear();
         self.cache_bytes = 0;
         self.tick = 0;
-        // The types were made on the old handle; they go out with it.
+        // The types were made by the old connection's factory; they go out
+        // with it.
         fresh.types = std::mem::take(&mut self.types);
         drop(fresh);
         Ok(())
@@ -195,20 +191,21 @@ impl Conn {
     /// The VARIANT-to-JSON caster for results of this connection, made on
     /// first use. Hand it to [`encode::emit_cell`](super::encode::emit_cell).
     pub fn json(&mut self) -> Result<super::encode::Json, Error> {
-        Ok(super::encode::Json { conn: self.conn, ty: self.type_named("JSON")? })
+        Ok(super::encode::Json { factory: self.factory, ty: self.type_named("JSON")? })
     }
 
-    /// The logical type `text` names, made on this connection once and kept:
-    /// making a type costs about a millisecond, using one microseconds. The
-    /// engine refuses to make one inside an aborted transaction; nothing is
-    /// kept of a refusal, and the next call asks again.
+    /// The logical type `text` names, made by this connection's factory once
+    /// and kept: making a type costs about a millisecond, using one
+    /// microseconds. A type the catalog holds, such as JSON, is looked up in
+    /// the connection's transaction, which refuses inside an aborted one;
+    /// nothing is kept of a refusal, and the next call asks again.
     fn type_named(&mut self, text: &str) -> Result<ffi::logical_type_handle, Error> {
         if let Some(&ty) = self.types.get(text) {
             return Ok(ty);
         }
         let api = &self.eng.api;
         let mut ty: ffi::logical_type_handle = std::ptr::null_mut();
-        call!(api, connection_create_type_from_text(self.conn, str_of(text), &mut ty));
+        call!(api, factory_create_type_from_text(self.factory, &str_of(text), &mut ty));
         self.types.insert(text.to_string(), ty);
         Ok(ty)
     }
@@ -237,7 +234,9 @@ impl Conn {
         for stmt in stmts.iter() {
             // In place, no fetch thread: boot-time helpers read a handful
             // of rows and should not depend on spawn succeeding.
-            let (mut fetcher, mut held, columns) = self.open_result(stmt, &[])?;
+            let Some((mut fetcher, mut held, columns)) = self.open_result(stmt, &[], || true)? else {
+                continue;
+            };
             // `held` first, then the rest: it is a chunk already taken off
             // the result, not a chunk still to come.
             while let Some(chunk) = match held.take() {
@@ -267,20 +266,13 @@ impl Conn {
         Arc::new(Interrupt { eng: self.eng, conn: self.interrupt.clone() })
     }
 
-    /// Set one config option (GLOBAL scope on the database).
+    /// Set one config option, as `SET GLOBAL` does.
     pub fn set_option(&self, name: &str, setting: &str) -> Result<(), Error> {
         let api = &self.eng.api;
-        let mut o: ffi::option_handle = std::ptr::null_mut();
-        call!(api, option_create(str_of(name), str_of(setting), &mut o));
-        let set = (|| -> Result<(), Error> {
-            call!(api, database_option_set(self.db.db, o));
-            Ok(())
-        })();
-        if let Some(f) = api.option_destroy {
-            let mut o = o;
-            unsafe { f(&mut o) };
-        }
-        set
+        let mut config: ffi::config_handle = std::ptr::null_mut();
+        call!(api, instance_get_config(self.db.instance, &mut config));
+        call!(api, config_set_option_text(config, &str_of(name), &str_of(setting), ffi::SETTING_SCOPE_GLOBAL));
+        Ok(())
     }
 
     /// Parse a SQL string into its statements. Uncached.
@@ -341,7 +333,9 @@ impl Conn {
     /// Execute one parsed statement into a live result: the Fetcher that
     /// owns it, a chunk already taken off it, and its columns. The shared
     /// front half of `execute` (which pipelines it) and `drain` (which
-    /// consumes it in place).
+    /// consumes it in place). None when `wanted`, asked once the statement
+    /// is submitted and before any of it runs, says no: the result is
+    /// destroyed unrun.
     ///
     /// The held chunk is normally None. It is Some only for a statement
     /// that expands to a GROUP of statements — `COPY FROM DATABASE`,
@@ -354,7 +348,8 @@ impl Conn {
         &self,
         stmt: &Stmt,
         values: &[ffi::value_handle],
-    ) -> Result<(Fetcher, Option<Chunk>, Vec<(String, Type)>), Error> {
+        wanted: impl FnOnce() -> bool,
+    ) -> Result<Option<(Fetcher, Option<Chunk>, Vec<(String, Type)>)>, Error> {
         let api = &self.eng.api;
 
         // Params go in as values, positional ($1 = element 0).
@@ -374,29 +369,34 @@ impl Conn {
         // From here the Fetcher owns the result and destroys it on drop.
         let mut fetcher = Fetcher { eng: self.eng, result };
 
-        // Ask first, step only if asking failed. The ordinary statement —
-        // every SELECT, every INSERT — answers here and never steps on
-        // this thread, which matters: next_chunk carries a step budget and
-        // falls back to a blocking fetch, and moving that work off the
-        // fetch thread would serialise the first chunk against the caller.
+        // Submitting cleared any interrupt aimed at the connection before
+        // it, and nothing runs until the result is stepped: an interrupt
+        // from here on lands, and one that came before is asked about here.
+        if !wanted() {
+            return Ok(None);
+        }
+
+        // Ask first, step only when the engine says the schema waits on a
+        // step. The ordinary statement — every SELECT, every INSERT —
+        // answers here and never steps on this thread, which matters:
+        // next_chunk carries a step budget and falls back to a blocking
+        // fetch, and moving that work off the fetch thread would serialise
+        // the first chunk against the caller.
         //
-        // Deliberately keyed on the failure, not on the statement type:
-        // the set of group-expanding statements is DuckDB's to grow, and a
-        // retry that asks again after one step needs no list of them.
+        // Keyed on the engine's code, not on the statement type: the set of
+        // group-expanding statements is DuckDB's to grow.
         match result_columns(api, result) {
-            Ok(columns) => Ok((fetcher, None, columns)),
-            Err(first) => {
+            Ok(columns) => Ok(Some((fetcher, None, columns))),
+            Err(first) if first.code == ffi::ERROR_INPUT_METADATA_DEFERRED => {
                 // A step that fails carries the REAL complaint — the group's
                 // own error, the one naming the table or the file. The
-                // schema error above is only how it reached us, so it is
-                // dropped rather than reported over the top of it.
+                // deferral above is only how it reached us, so it is dropped
+                // rather than reported over the top of it.
                 let held = fetcher.next_chunk()?;
-                // Still no schema after a successful step means the first
-                // error was never about readiness. Report that one — it is
-                // the one that describes what actually went wrong.
-                let columns = result_columns(api, result).map_err(|_| first)?;
-                Ok((fetcher, held, columns))
+                let columns = result_columns(api, result)?;
+                Ok(Some((fetcher, held, columns)))
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -465,34 +465,31 @@ impl Conn {
     /// One param as an engine value, which the caller destroys.
     fn value_of(&mut self, param: &Param) -> Result<ffi::value_handle, Error> {
         let api = &self.eng.api;
-        let conn = self.conn;
+        let factory = self.factory;
         let mut out: ffi::value_handle = std::ptr::null_mut();
         match param {
             // Untyped, as DuckDB's own `EXECUTE p(NULL)` binds it: the
             // statement's inference types it, so `coalesce(?, 'x')` is 'x'.
             Param::Null => {
                 let null = self.type_named("\"NULL\"")?;
-                call!(api, value_create_null_with_connection(conn, null, &mut out));
+                call!(api, value_create_null(factory, null, &mut out));
             }
-            Param::Bool(b) => call!(api, value_create_bool_with_connection(conn, *b, &mut out)),
-            Param::I64(i) => call!(api, value_create_bigint_with_connection(conn, *i, &mut out)),
-            Param::U64(u) => call!(api, value_create_ubigint_with_connection(conn, *u, &mut out)),
-            Param::F64(f) => call!(api, value_create_double_with_connection(conn, *f, &mut out)),
-            Param::Text(s) => {
-                call!(api, value_create_varchar_with_connection(conn, str_of(s), &mut out))
-            }
+            Param::Bool(b) => call!(api, value_create_bool(factory, *b, &mut out)),
+            Param::I64(i) => call!(api, value_create_bigint(factory, *i, &mut out)),
+            Param::U64(u) => call!(api, value_create_ubigint(factory, *u, &mut out)),
+            Param::F64(f) => call!(api, value_create_double(factory, *f, &mut out)),
+            Param::Text(s) => call!(api, value_create_varchar(factory, &str_of(s), &mut out)),
             Param::Document { text, variant } => {
-                call!(api, value_create_varchar_with_connection(conn, str_of(text), &mut out));
+                call!(api, value_create_varchar(factory, &str_of(text), &mut out));
                 // The text is a document, and the engine reads text cast to
                 // VARIANT as a string; read through JSON it is the document.
-                // A cast that fails — an aborted transaction refuses every
-                // one, and the types with them — leaves the text, and the
-                // statement reports what is wrong.
+                // A cast that fails leaves the text, and the statement
+                // reports what is wrong.
                 let types = match variant {
                     true => self.type_named("JSON").and_then(|j| Ok([j, self.type_named("VARIANT")?])),
                     false => return Ok(out),
                 };
-                if let Ok(doc) = types.and_then(|t| cast_through(api, conn, out, &t)) {
+                if let Ok(doc) = types.and_then(|t| cast_through(api, factory, out, &t)) {
                     destroy_value(api, out);
                     out = doc;
                 }
@@ -503,10 +500,18 @@ impl Conn {
 
     /// Execute one parsed statement as a pipelined stream. The statement is
     /// borrowed, not consumed; the values are released once it has started.
-    pub fn execute(&self, stmt: &Stmt, bound: Bound) -> Result<Stream, Error> {
-        let opened = self.open_result(stmt, &bound.values);
+    ///
+    /// `wanted` is asked once the statement is submitted and before any of
+    /// it runs, and None says it answered no and nothing ran. An interrupt
+    /// that reaches the connection before submission is dropped by the
+    /// engine, so a caller that can be cancelled asks there, and one that
+    /// cancels after it is heard.
+    pub fn execute(&self, stmt: &Stmt, bound: Bound, wanted: impl FnOnce() -> bool) -> Result<Option<Stream>, Error> {
+        let opened = self.open_result(stmt, &bound.values, wanted);
         drop(bound);
-        let (fetcher, pending, columns) = opened?;
+        let Some((fetcher, pending, columns)) = opened? else {
+            return Ok(None);
+        };
         let (tx, rx) = mpsc::sync_channel(PREFETCH);
         let join = thread::Builder::new()
             .name("harbor-fetch".into())
@@ -515,22 +520,26 @@ impl Conn {
                 code: ffi::ERROR_API,
                 message: format!("could not spawn fetch thread: {e}"),
             })?;
-        Ok(Stream {
+        Ok(Some(Stream {
             columns,
             pending,
             rx: Some(rx),
             join: Some(join),
             interrupt: Interrupt { eng: self.eng, conn: self.interrupt.clone() },
-        })
+        }))
     }
 
-    /// Execute one parsed statement and consume it in place, no thread. For
-    /// results nobody reads — front statements, resets, side effects — the
-    /// pipeline is pure overhead: a spawn and a join to stream chunks that
-    /// will be discarded.
+    /// Execute one parsed statement and run it to its end in place, no
+    /// thread and no schema. For results nobody reads — resets, settings,
+    /// side effects — the pipeline is pure overhead: a spawn and a join to
+    /// stream chunks that will be discarded.
     pub fn drain(&self, stmt: &Stmt) -> Result<(), Error> {
-        let (mut fetcher, _held, _) = self.open_result(stmt, &[])?;
-        while fetcher.next_chunk()?.is_some() {}
+        let api = &self.eng.api;
+        let mut result: ffi::result_handle = std::ptr::null_mut();
+        call!(api, statement_execute(self.conn, stmt.raw, std::ptr::null(), std::ptr::null(), 0, &mut result));
+        let fetcher = Fetcher { eng: self.eng, result };
+        let mut changed: ffi::idx_t = 0;
+        call!(api, result_drain(fetcher.result, &mut changed));
         Ok(())
     }
 
@@ -577,7 +586,7 @@ impl Drop for Conn {
         // against the live handle first, and every later one sees null.
         let mut slot = self.interrupt.lock().unwrap_or_else(PoisonError::into_inner);
         unsafe {
-            if let Some(f) = self.eng.api.disconnect {
+            if let Some(f) = self.eng.api.connection_destroy {
                 f(&mut self.conn);
             }
         }
@@ -705,11 +714,9 @@ impl Stream {
 
     /// The error to report when encoding a cell of this stream failed with
     /// `cell`: the statement's own error when one is waiting behind it, else
-    /// `cell`. A cell cast runs in the statement's transaction, and a
-    /// statement error the fetch thread met has already aborted that, so in
-    /// a session the cast fails "transaction is aborted" while the cause sits
-    /// in the channel. The query is interrupted first, so the wait for the
-    /// fetch thread's last word is short.
+    /// `cell`, since a cell can fail because the statement already has. The
+    /// query is interrupted first, so the wait for the fetch thread's last
+    /// word is short.
     pub fn error_after(&mut self, cell: Error) -> Error {
         self.pending = None;
         self.interrupt.interrupt();
@@ -987,10 +994,10 @@ pub enum Param {
 }
 
 /// `value` cast to each type in turn, as a value of its own; `value` and the
-/// types, made on `conn`, are borrowed.
+/// types are borrowed.
 fn cast_through(
     api: &ffi::Api,
-    conn: ffi::connection_handle,
+    factory: ffi::factory_handle,
     value: ffi::value_handle,
     types: &[ffi::logical_type_handle],
 ) -> Result<ffi::value_handle, Error> {
@@ -998,7 +1005,7 @@ fn cast_through(
     for ty in types {
         let mut next: ffi::value_handle = std::ptr::null_mut();
         let cast = (|| -> Result<(), Error> {
-            call!(api, value_cast_with_connection(conn, held, *ty, &mut next));
+            call!(api, value_cast(factory, held, *ty, &mut next));
             Ok(())
         })();
         if held != value {

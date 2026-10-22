@@ -2,10 +2,8 @@ name: Set up DuckDB
 description: >
   Put a DuckDB engine where CI can run it: the library harbor dlopens and the
   duckdb CLI of the same build, which builds the test fixture, fetched by the
-  script a developer runs (scripts/fetch-duckdb.sh, the one place the sources
-  and the archive shapes are spelled). DUCKDB_LIB_BUILD in the job's
-  environment picks the build: a name takes both from this repository's
-  engine-<build> release, `latest` or empty from DuckDB's nightly channel.
+  script a developer runs (scripts/fetch-duckdb.sh, the one place the
+  release, the archive shapes and their checksums are spelled).
 runs:
   using: composite
   steps:

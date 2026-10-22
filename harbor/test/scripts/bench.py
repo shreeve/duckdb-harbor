@@ -30,6 +30,7 @@ earns its place by catching something:
     strings  the JSON-escape scan path
     mixed    several columns per row, the row-framing overhead
     temporal the date/timestamp formatting path
+    variant  the VARIANT-to-JSON cast, which the engine does, not the encoder
     heavy    compute-bound: one row out, the worker pool does everything
 
 The spread column (max/min within a shape's samples) is the honesty check: a
@@ -56,6 +57,7 @@ SHAPES = [
     ("strings", "SELECT 'x' || i::VARCHAR AS s FROM range(1000000) t(i)"),
     ("mixed", "SELECT i, i*2, i::VARCHAR FROM range(2000000) t(i)"),
     ("temporal", "SELECT TIMESTAMP '2020-01-01' + INTERVAL (i) SECOND AS ts FROM range(1000000) t(i)"),
+    ("variant", "SELECT {'i': i, 's': i::VARCHAR}::VARIANT AS v FROM range(500000) t(i)"),
     ("heavy", "SELECT count(DISTINCT i) FROM range(100000000) t(i)"),
 ]
 

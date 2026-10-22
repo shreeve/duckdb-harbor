@@ -1,6 +1,6 @@
 //! The v2 layer, end to end against a real engine — one binary, three
-//! concerns. `smoke` proves the generated FFI raw: env -> open -> connect ->
-//! parse -> execute -> fetch -> view, teardown in reverse, every fallible
+//! concerns. `smoke` proves the generated FFI raw: env -> instance -> attach ->
+//! connect -> parse -> execute -> fetch -> view, teardown in reverse, every fallible
 //! call checked. `conn` proves the connection layer: open, clone, cache,
 //! batch, params, and cross-thread cancellation. `wire` pins the encoder's
 //! bytes: real queries through the whole v2 path against the wire contract.
@@ -51,15 +51,7 @@ mod smoke {
         let Some(eng) = v2_engine() else { return };
         eprintln!("v2: {} ({} v2 symbols) at {}", eng.version, eng.symbols, eng.path.display());
 
-        let mut env: ffi::environment_handle = std::ptr::null_mut();
-        ok!(eng, create_environment(&mut env));
-
-        let memory = ffi::str_t { ptr: std::ptr::null(), len: 0 };
-        let mut db: ffi::database_handle = std::ptr::null_mut();
-        ok!(eng, open(env, memory, std::ptr::null_mut(), 0, &mut db));
-
-        let mut conn: ffi::connection_handle = std::ptr::null_mut();
-        ok!(eng, connect(db, &mut conn));
+        let (env, db, conn) = memory(eng);
 
         let sql = c"SELECT 21 * 2 AS answer, 'harbor' AS who";
         let mut iter: ffi::statement_iterator_handle = std::ptr::null_mut();
@@ -113,13 +105,7 @@ mod smoke {
     fn errors_carry_code_and_text() {
         let Some(eng) = v2_engine() else { return };
 
-        let mut env: ffi::environment_handle = std::ptr::null_mut();
-        ok!(eng, create_environment(&mut env));
-        let memory = ffi::str_t { ptr: std::ptr::null(), len: 0 };
-        let mut db: ffi::database_handle = std::ptr::null_mut();
-        ok!(eng, open(env, memory, std::ptr::null_mut(), 0, &mut db));
-        let mut conn: ffi::connection_handle = std::ptr::null_mut();
-        ok!(eng, connect(db, &mut conn));
+        let (mut env, mut db, mut conn) = memory(eng);
 
         let mut iter: ffi::statement_iterator_handle = std::ptr::null_mut();
         let mut err: ffi::error_info_handle = std::ptr::null_mut();
@@ -143,10 +129,23 @@ mod smoke {
         let mut iter = iter;
         unsafe {
             (eng.api.statement_iterator_destroy.unwrap())(&mut iter);
-            (eng.api.disconnect.unwrap())(&mut conn);
-            (eng.api.close.unwrap())(&mut db);
-            (eng.api.destroy_environment.unwrap())(&mut env);
+            (eng.api.connection_destroy.unwrap())(&mut conn);
+            (eng.api.instance_destroy.unwrap())(&mut db);
+            (eng.api.environment_destroy.unwrap())(&mut env);
         }
+    }
+
+    /// An in-memory database, attached as the default, and a connection to it.
+    fn memory(eng: &Engine) -> (ffi::environment_handle, ffi::instance_handle, ffi::connection_handle) {
+        let mut env: ffi::environment_handle = std::ptr::null_mut();
+        ok!(eng, environment_create(&mut env));
+        let mut db: ffi::instance_handle = std::ptr::null_mut();
+        ok!(eng, instance_create(env, &mut db));
+        let memory = ffi::str_t { ptr: std::ptr::null(), len: 0 };
+        ok!(eng, instance_attach(db, std::ptr::null(), &memory, std::ptr::null_mut(), true));
+        let mut conn: ffi::connection_handle = std::ptr::null_mut();
+        ok!(eng, connection_create(db, &mut conn));
+        (env, db, conn)
     }
 
     #[test]
@@ -156,7 +155,7 @@ mod smoke {
     }
 
     /// Teardown in reverse creation order; every destroy checked, since the
-    /// ownership contract (environment refuses while a database lives, etc.)
+    /// ownership contract (an environment refuses while an instance lives, etc.)
     /// is part of what this suite proves.
     #[allow(clippy::too_many_arguments)]
     fn ok_destroy(
@@ -166,7 +165,7 @@ mod smoke {
         mut stmt: ffi::sql_statement_handle,
         mut iter: ffi::statement_iterator_handle,
         mut conn: ffi::connection_handle,
-        mut db: ffi::database_handle,
+        mut db: ffi::instance_handle,
         mut env: ffi::environment_handle,
     ) {
         unsafe {
@@ -174,9 +173,9 @@ mod smoke {
             assert_eq!((eng.api.result_destroy.unwrap())(&mut result), ffi::ERROR_NONE);
             assert_eq!((eng.api.sql_statement_destroy.unwrap())(&mut stmt), ffi::ERROR_NONE);
             assert_eq!((eng.api.statement_iterator_destroy.unwrap())(&mut iter), ffi::ERROR_NONE);
-            assert_eq!((eng.api.disconnect.unwrap())(&mut conn), ffi::ERROR_NONE);
-            assert_eq!((eng.api.close.unwrap())(&mut db), ffi::ERROR_NONE);
-            assert_eq!((eng.api.destroy_environment.unwrap())(&mut env), ffi::ERROR_NONE);
+            assert_eq!((eng.api.connection_destroy.unwrap())(&mut conn), ffi::ERROR_NONE);
+            assert_eq!((eng.api.instance_destroy.unwrap())(&mut db), ffi::ERROR_NONE);
+            assert_eq!((eng.api.environment_destroy.unwrap())(&mut env), ffi::ERROR_NONE);
             // The slots must be nulled by the engine — that's spec, not courtesy.
             assert!(env.is_null() && db.is_null() && conn.is_null());
         }
@@ -208,7 +207,7 @@ mod conn {
             // As the server does: a document aimed at a VARIANT is marked.
             let mut params = params.to_vec();
             let bound = c.bind(stmt, &mut params)?;
-            let mut stream = c.execute(stmt, bound)?;
+            let mut stream = c.execute(stmt, bound, || true)?.expect("wanted");
             // Encode through the shared cell encoder so this test exercises
             // the same path the server will.
             let columns = std::mem::take(&mut stream.columns);
@@ -321,7 +320,7 @@ mod conn {
         assert!(c.execute_batch("SELECT no_such_column FROM t").is_err());
         let stmts = c.statements(insert).unwrap();
         let bound = c.bind(&stmts[0], &mut [doc(r#"{"a":1}"#)]).unwrap();
-        let err = c.execute(&stmts[0], bound).err().expect("aborted").to_string();
+        let err = c.execute(&stmts[0], bound, || true).err().expect("aborted").to_string();
         assert!(err.contains("aborted"), "{err}");
         c.execute_batch("ROLLBACK").unwrap();
 
@@ -512,6 +511,34 @@ mod conn {
         assert_eq!(rows(&mut c, "SELECT 1", &[]).unwrap(), ["1"]);
     }
 
+    /// The engine drops an interrupt that reaches a connection before its
+    /// statement is submitted, so `execute` asks once submission is done:
+    /// a statement unwanted there is dropped with nothing run, and
+    /// an interrupt fired from there on lands.
+    #[test]
+    fn a_statement_cancelled_before_it_runs_does_nothing() {
+        let Some(_) = v2_engine() else { return };
+        let mut c = conn::open(Path::new(":memory:"), &[]).expect("open");
+        c.execute_batch("CREATE TABLE t(i INTEGER)").unwrap();
+        let stmts = c.statements("INSERT INTO t VALUES (1)").unwrap();
+        let bound = c.bind(&stmts[0], &mut []).unwrap();
+        assert!(c.execute(&stmts[0], bound, || false).unwrap().is_none());
+        assert_eq!(rows(&mut c, "SELECT count(*) FROM t", &[]).unwrap(), ["0"]);
+
+        let handle = c.interrupt_handle();
+        let stmts = c.statements("SELECT count(*) FROM range(10000000000)").unwrap();
+        let bound = c.bind(&stmts[0], &mut []).unwrap();
+        let mut stream = c
+            .execute(&stmts[0], bound, || {
+                handle.interrupt();
+                true
+            })
+            .unwrap()
+            .expect("wanted");
+        let err = std::iter::from_fn(|| stream.next_chunk().transpose()).find_map(Result::err);
+        assert_eq!(err.map(|e| e.code), Some(ffi::ERROR_RUNTIME_INTERRUPT));
+    }
+
     #[test]
     fn a_dropped_conn_defuses_its_interrupt_handle() {
         let Some(_) = v2_engine() else { return };
@@ -645,19 +672,17 @@ mod wire {
         }
 
         let mut env: ffi::environment_handle = std::ptr::null_mut();
-        ok!(create_environment(&mut env));
-        let mut db: ffi::database_handle = std::ptr::null_mut();
-        ok!(open(
-            env,
-            ffi::str_t { ptr: std::ptr::null(), len: 0 },
-            std::ptr::null_mut(),
-            0,
-            &mut db
-        ));
+        ok!(environment_create(&mut env));
+        let mut db: ffi::instance_handle = std::ptr::null_mut();
+        ok!(instance_create(env, &mut db));
+        let memory = ffi::str_t { ptr: std::ptr::null(), len: 0 };
+        ok!(instance_attach(db, std::ptr::null(), &memory, std::ptr::null_mut(), true));
         let mut conn: ffi::connection_handle = std::ptr::null_mut();
-        ok!(connect(db, &mut conn));
-        let mut json = encode::Json { conn, ty: std::ptr::null_mut() };
-        ok!(connection_create_type_from_text(conn, ffi::str_t { ptr: c"JSON".as_ptr(), len: 4 }, &mut json.ty));
+        ok!(connection_create(db, &mut conn));
+        let mut json = encode::Json { factory: std::ptr::null_mut(), ty: std::ptr::null_mut() };
+        ok!(connection_get_factory(conn, &mut json.factory));
+        let text = ffi::str_t { ptr: c"JSON".as_ptr(), len: 4 };
+        ok!(factory_create_type_from_text(json.factory, &text, &mut json.ty));
 
         let sql_c = std::ffi::CString::new(sql).unwrap();
         let mut iter: ffi::statement_iterator_handle = std::ptr::null_mut();
@@ -718,9 +743,9 @@ mod wire {
         unsafe { (api.logical_type_destroy.unwrap())(&mut json.ty) };
         unsafe {
             (api.statement_iterator_destroy.unwrap())(&mut iter);
-            (api.disconnect.unwrap())(&mut conn);
-            (api.close.unwrap())(&mut db);
-            (api.destroy_environment.unwrap())(&mut env);
+            (api.connection_destroy.unwrap())(&mut conn);
+            (api.instance_destroy.unwrap())(&mut db);
+            (api.environment_destroy.unwrap())(&mut env);
         }
         Ok(lines)
     }
@@ -962,8 +987,9 @@ mod wire {
         // cast by the engine, and the schema says so.
         row(eng, "SELECT 42::VARIANT, {'a': 1}::VARIANT", r#""42","{\"a\":1}""#);
         // JSON text tells the number from the string, which display text
-        // could not; a JSON document round-trips byte for byte.
-        row(eng, "SELECT '42'::VARIANT, '{\"n\":42,\"s\":\"42\",\"l\":[1,null]}'::JSON::VARIANT", r#""\"42\"","{\"n\":42,\"s\":\"42\",\"l\":[1,null]}""#);
+        // could not; a JSON document comes back whole, its object's keys in
+        // the sorted order the engine stores them in.
+        row(eng, "SELECT '42'::VARIANT, '{\"n\":42,\"s\":\"42\",\"l\":[1,null]}'::JSON::VARIANT", r#""\"42\"","{\"l\":[1,null],\"n\":42,\"s\":\"42\"}""#);
         // JSON has no NaN or Infinity: inside a VARIANT, at any depth, they
         // go out as the strings a DOUBLE column sends, so the text parses.
         row(

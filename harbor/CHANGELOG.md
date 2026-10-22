@@ -4,6 +4,55 @@ Harbor release tags use `vX.Y.Z`. Entries are ordered by release date,
 newest first. Separately tagged DuckDB engine mirrors are build artifacts, not
 Harbor releases, and are not included here.
 
+## 2.0.0 — 2026-10-21
+
+- **Harbor runs on DuckDB v2.0.0.** The engine is DuckDB's own 2.0.0
+  release, d54cbbe3df, which every release archive carries, in place of the
+  v2.0.0-alpha42289 build harbor was pinned to while the v2 C API was being
+  reworked. A database opens as 2.0.0 opens one: an instance made with the
+  startup options (`--sealed`, `--unsigned`, `--block-size`), the file
+  attached to it as the default database, and connections made from the
+  instance; values, types and casts go through each connection's factory,
+  so they see its settings as its statements do. The bindings are
+  regenerated from the 2.0.0 spec, still pure FFI resolved at runtime, with
+  nothing linked and no shim. The loader refuses an engine without the
+  2.0.0 API, the alpha builds among them, and `make fetch-duckdb`, CI and
+  the release builds take the engine and its CLI from DuckDB's GitHub
+  release, each archive checked against a recorded SHA-256. The NDJSON
+  protocol is unchanged: a corpus of 34 requests over every type, VARIANT
+  in every shape, params and mid-stream errors answers byte for byte as
+  0.46.0 does, but for the engine's version string and two setting
+  descriptions.
+- **A VARIANT column is cast to JSON a chunk at a time.** Each cell took
+  three engine calls, a cast among them that waited on the connection's
+  lock while the fetch thread worked; the engine casts the whole vector in
+  one. Streaming 500,000 small documents takes 151 ms, where it took
+  2,351 ms, and the bytes are the same.
+- **A cancel that arrives as a statement starts is no longer lost.** The
+  engine drops an interrupt that reaches a connection before its statement
+  is submitted, so a `DELETE /sql/queries/<id>` landing in that window was
+  answered `{"cancelled":true}` while the statement ran on. The server asks
+  again once the statement is submitted and before any of it runs, and a
+  cancel found there stops it with nothing run.
+- **A name in backticks is a name.** DuckDB 2.0.0 quotes an identifier in
+  backticks as it does in double quotes, and harbor's lexer reads it the
+  same way, so brace expansion leaves a backticked name alone, and a string
+  after one holding a quote: `` SELECT 1 AS `it's`, '{a,b}' AS y `` keeps
+  its string, where the expansion would have rewritten it. The REPL's
+  splitter, validator and highlighter, and DuckTable's Query view, read the
+  same lexer. A digit separator joins a number only between two digits, as
+  the 2.0.0 tokenizer has it.
+- **What DuckDB 2.0.0 changes that a client can see.** Measured against
+  alpha42289: a VARIANT object comes back with its keys in sorted order
+  (`{"n":1,"l":2}` is read back as `{"l":2,"n":1}`); a SQL NULL VARIANT is
+  written to a backup as the null marker, no longer as the JSON text `null`
+  (duckdb#25873); a quoted name alone is no statement (`"t"` is refused,
+  `FROM "t"` reads the table); a literal right after a number no longer
+  parses as its alias; and a compute-bound query runs
+  about 14% slower in the engine itself (a 100-million-row
+  `count(DISTINCT)`, 1.21 s on the alpha CLI and 1.38 s on 2.0.0's, and
+  the same through harbor).
+
 ## 0.46.0 — 2026-10-11
 
 - **`harbor <file>` opens anything DuckDB reads.** A CSV, TSV, Parquet file

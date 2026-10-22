@@ -36,10 +36,6 @@ jobs:
   full:
     name: full suite
     runs-on: ubuntu-latest
-    env:
-      # The libduckdb build by name (`alpha42289`), or `latest` or empty for
-      # the channel's current build (see scripts/fetch-duckdb.sh).
-      DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

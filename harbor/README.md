@@ -479,22 +479,16 @@ mydata>
 `~/.duckdb`, then build and install `harbor` into `~/.local/bin`. No step
 needs root.
 
-`make fetch-duckdb` installs the engine and the `duckdb` CLI of one build.
-`DUCKDB_LIB_BUILD` names the build. `latest`, the default, is DuckDB's nightly
-channel for the 2.0 branch: the latest green build, which moves by design and
-cannot be asked for an older one. Anything else is a DuckDB build by name —
-`DUCKDB_LIB_BUILD=alpha42289 make fetch-duckdb` for `v2.0.0-alpha42289` — and
-both binaries come from this repository's `engine-<build>` release, checked
-against its published checksums, with nothing taken from the channel; each
-must say it is the build asked for. An engine release is where a fixed build
-lives when the channel moves to one harbor cannot load. Either way the script
-refuses a library that lacks the v2 C API harbor binds, before it installs
-anything.
+`make fetch-duckdb` installs the engine and the `duckdb` CLI of one build:
+the DuckDB release harbor binds, DuckDB v2.0.0, taken from DuckDB's own GitHub
+release (`duckdb-shared-libs-<platform>` and `duckdb-cli-<platform>`). Each
+archive is checked against the SHA-256 the script records for it, and each
+binary must say it is that release. The script refuses a library that lacks
+the v2 C API harbor binds, before it installs anything.
 
-The repository variable of the same name sets the build for CI and the release
-builds, and each release archive bundles the engine it was built and tested
-with. Fetch the build the variable names to test locally against the same
-engine.
+CI and the release builds fetch through the same script, and each release
+archive bundles the engine it was built and tested with, so a local fetch
+tests against the same engine.
 
 No toolchain? One command installs the latest release — it picks the right
 archive for the platform, verifies its sha256 against the published checksums,
@@ -1234,12 +1228,14 @@ native client, developed in this repository beside harbor.
 ## Known limitations
 
 **`VARIANT` arrives as JSON text, `GEOMETRY` as display text.** Neither has a
-committed vector layout in the v2 C API, so each cell crosses as one value. A
-`VARIANT` is cast to JSON on the way out, so `42` and `'42'` stay apart and a
-document that entered as JSON leaves as the same JSON; the column says
+committed vector layout in the v2 C API. A `VARIANT` column is cast to JSON by
+the engine on the way out, a chunk at a time, so `42` and `'42'` stay apart and
+a document that entered as JSON leaves as the same document, each object's
+keys in the sorted order the engine stores them in; the column says
 `"lossless": false, "encoding": "json"` because JSON has no `DATE` or
 `TIMESTAMP` of its own (those arrive as strings). A `GEOMETRY` goes out as the
-engine's own text rendering under `"encoding": "varchar-cast"`. A cell that
+engine's own text rendering under `"encoding": "varchar-cast"`, a cell at a
+time. A cell that
 cannot be rendered fails the stream with an error rather than arriving as
 `null`.
 
@@ -1247,9 +1243,10 @@ cannot be rendered fails the stream with an error rather than arriving as
 that always enters as JSON can be stored as `VARIANT` for the engine's typed
 field access, and still be handled as JSON by everything outside: harbor
 delivers it as JSON text, and `harbor backup` writes it as JSON text. The
-trip JSON → `VARIANT` → JSON is exact for real documents — any string, any
-Unicode, key order, `1` versus `1.0`, `"42"` versus `42`, integers up to 64
-bits, nested nulls — with these known edges, all measured on the engine:
+trip JSON → `VARIANT` → JSON keeps what real documents carry — any string,
+any Unicode, `1` versus `1.0`, `"42"` versus `42`, integers up to 64 bits,
+nested nulls — and gives each object's keys back in sorted order, with these
+known edges, all measured on the engine:
 
 - *Text written into a `VARIANT` needs `::JSON`.* A plain string written
   into a `VARIANT` column, whether a literal, an `UPDATE`, or a string
@@ -1359,10 +1356,10 @@ serves the v2 C API:
 
 A library without the v2 C API is passed over for the next, and the working
 directory is never searched. Harbor binds DuckDB's v2 C API, so DuckDB 2.0 is
-the engine floor; one harbor build has run against every v2-API engine it has
-met, and CI runs the suite, and the release archives are built, against the
-build the repository's `DUCKDB_LIB_BUILD` names. Treat that as tested
-compatibility, not a promise that an arbitrary future DuckDB ABI will work.
+the engine floor. CI runs the suite, and the release archives are built,
+against the DuckDB release `scripts/fetch-duckdb.sh` pins. Treat that as
+tested compatibility, not a promise that an arbitrary future DuckDB ABI will
+work.
 Your database files need no such care: a file created by a 1.5-era DuckDB opens
 as-is, because 2.0's storage layer reads it. A machine with no engine at all
 still runs the client half; only serving needs the library, and the error says
@@ -1389,8 +1386,7 @@ The server implements its protocol shapes directly rather than depending on
 compile error. Nothing links `libduckdb` — the engine loads on demand — so no
 DuckDB source tree, library, or header is required to build: `make harbor`
 works on a bare machine, and `make fetch-duckdb` fetches the duckdb CLI plus
-a library (honoring `DUCKDB_LIB_BUILD`, under
-[Get it running](#get-it-running)). The crate ships pregenerated bindings, so
+a library (under [Get it running](#get-it-running)). The crate ships pregenerated bindings, so
 there is no bindgen.
 
 `make unit` runs the Rust tests and `make test` runs them with the integration

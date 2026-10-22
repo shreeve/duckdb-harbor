@@ -5,8 +5,7 @@
 # nightly, kept out of the PR event so it never shows as a skipped check.
 #
 # The engine and its CLI come from the composite action
-# (.github/actions/duckdb), of the build the repository variable
-# DUCKDB_LIB_BUILD names (see scripts/fetch-duckdb.sh).
+# (.github/actions/duckdb): the DuckDB release scripts/fetch-duckdb.sh pins.
 #
 # rust-cache saves only from main, where FullSuite.yml saves under the same
 # shared key, and a PR restores what main built: a cache saved from a PR
@@ -31,10 +30,6 @@ jobs:
   quick:
     name: quick gate
     runs-on: ubuntu-latest
-    env:
-      # The libduckdb build by name (`alpha42289`), or `latest` or empty for
-      # the channel's current build (see scripts/fetch-duckdb.sh).
-      DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -57,8 +52,6 @@ jobs:
   unit:
     name: unit tests
     runs-on: ubuntu-latest
-    env:
-      DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -81,7 +74,6 @@ jobs:
     name: windows
     runs-on: windows-2025
     env:
-      DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
       DUCKDB_LIB: ${{ github.workspace }}/.duckdb-engine
     steps:
       - uses: actions/checkout@v5

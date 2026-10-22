@@ -42,17 +42,12 @@ jobs:
       - uses: actions/checkout@v5
 
       # The engine comes through the same script a developer and the test
-      # workflows run, by the same repository variable: a named build from
-      # this repository's engine-<build> release, checksummed, or `latest`
-      # from DuckDB's nightly channel. The archive is what pins an engine to
-      # a release. The script refuses a library without the v2 C API this
+      # workflows run: the DuckDB release it pins, from DuckDB's own GitHub
+      # release, checksummed. The archive is what pins an engine to a
+      # release. The script refuses a library without the v2 C API this
       # harbor binds, so no runner packages an engine harbor refuses.
       - name: Fetch DuckDB engine
         shell: bash
-        env:
-          # The libduckdb build by name (`alpha42289`), or `latest` or empty for
-          # the channel's current build (see scripts/fetch-duckdb.sh).
-          DUCKDB_LIB_BUILD: ${{ vars.DUCKDB_LIB_BUILD }}
         run: DEST="$DUCKDB_LIB" DUCKDB_PLATFORM=${{ matrix.duck_plat }} scripts/fetch-duckdb.sh
 
       # Nothing links the engine — harbor dlopens it at runtime (bin/../lib
@@ -133,7 +128,7 @@ jobs:
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" --title "harbor $GITHUB_REF_NAME" \
               --latest \
-              --notes "Self-contained harbor releases, version-locked to one DuckDB v2 nightly. Unix archives carry libduckdb and install.sh; Windows archives carry duckdb.dll beside the binary. Linux archives need glibc 2.39 or newer (Ubuntu 24.04, Debian 13). Extract and run in place."
+              --notes "Self-contained harbor releases, version-locked to one DuckDB release. Unix archives carry libduckdb and install.sh; Windows archives carry duckdb.dll beside the binary. Linux archives need glibc 2.39 or newer (Ubuntu 24.04, Debian 13). Extract and run in place."
           gh release upload "$GITHUB_REF_NAME" *.tar.gz *.zip \
             "harbor-$GITHUB_REF_NAME-checksums.txt" \
             --clobber --repo "$GITHUB_REPOSITORY"

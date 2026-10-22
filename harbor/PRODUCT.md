@@ -234,13 +234,12 @@ per-session work is `USE` or `ATTACH` as plain SQL on a lease.
 
 ## The engine is upstream DuckDB 2.0 — no fork
 
-The engine is DuckDB's own 2.0 line, unmodified: `libduckdb` plus the
+The engine is DuckDB's own 2.0 release, unmodified: `libduckdb` plus the
 `duckdb` CLI, as DuckDB publishes them. Nothing is forked, nothing is patched,
 and nothing is built here. `make fetch-duckdb`, CI and the release workflow
-all fetch through one script: from DuckDB's nightly channel, or, for a build
-`DUCKDB_LIB_BUILD` names, whole from this repository's `engine-<build>`
-release, where a fixed build stays available after the channel has moved on.
-A release archive bundles the engine it was built and tested with. The
+all fetch through one script, from DuckDB's own GitHub release of the version
+it pins, checked against the checksums it records. A release archive bundles
+the engine it was built and tested with. The
 floor is DuckDB 2.0 by construction: harbor binds the v2 C API, whose symbols
 older engines do not export, and passes over a library without them. Database
 files are a different matter — a file created by a 1.5-era DuckDB opens
