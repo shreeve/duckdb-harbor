@@ -1301,6 +1301,9 @@ struct Running {
     /// channel is dropped, which is what `stop` does after draining.
     leases: Vec<JoinHandle<Option<Connection>>>,
     reaper: Option<JoinHandle<()>>,
+    /// Learns the names again while they are not all known
+    /// (`learn_while_unknown`).
+    learner: Option<JoinHandle<()>>,
     /// The saturation-proof lane: answers /ready and the control plane when
     /// every worker is busy, and relays sessions' statements. See probe_worker.
     probe: Option<JoinHandle<()>>,
@@ -1447,6 +1450,7 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
         workers: Vec::new(),
         leases: Vec::new(),
         reaper: None,
+        learner: None,
         probe: None,
         answering: Vec::new(),
         addr: addr.clone(),
@@ -1465,8 +1469,8 @@ pub fn start(listen: Listen, workers: usize, log: bool) -> Result<String, String
 }
 
 /// Every thread of a server, into `r` as each starts: the workers, an
-/// executor per lease connection, the reaper, the threads that answer
-/// cancels and the probe lane.
+/// executor per lease connection, the reaper, the learner, the threads that
+/// answer cancels and the probe lane.
 fn spawn_threads(
     r: &mut Running,
     conns: Vec<Connection>,
@@ -1554,6 +1558,9 @@ fn spawn_threads(
     // is relayed to the session's own connection, and work that needs a
     // worker gets an immediate honest 503 — shedding load instead of
     // queueing it invisibly.
+    let stop = Arc::clone(&r.stop);
+    r.learner = Some(thread::Builder::new().name("harbor-learner".to_string()).spawn(move || learn_while_unknown(stop))?);
+
     static SERVING: AtomicU64 = AtomicU64::new(1);
     r.answering = spawn_answering(SERVING.fetch_add(1, Ordering::SeqCst))?;
 
@@ -1734,6 +1741,18 @@ fn stop_with(mut running: std::sync::MutexGuard<'_, Option<Running>>) -> Result<
     if let Some(h) = r.reaper {
         // Prompt: the reaper sleeps in short ticks and checks the stop flag.
         let _ = h.join();
+    }
+    if let Some(h) = r.learner {
+        // It looks at the stop flag between short sleeps; a listing it runs
+        // waits at most a SQLite file's own wait, and one waiting longer is
+        // let go of.
+        let started = Instant::now();
+        while !h.is_finished() && started.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if h.is_finished() {
+            let _ = h.join();
+        }
     }
     if let Some(h) = r.probe {
         // Same bounded patience as the workers: joined if it made it out of
@@ -5436,6 +5455,11 @@ const PROBE: &str = "harbor_probe_";
 /// shared for the listing: statements run beside it, and only an ATTACH or
 /// DETACH waits.
 pub(crate) fn learn_again(alone: Alone) {
+    learn_again_waiting(alone, PROBE_BUSY_MS);
+}
+
+/// `learn_again`, each SQLite file asked waiting `busy_ms` on a lock.
+fn learn_again_waiting(alone: Alone, busy_ms: u32) {
     if CATALOG_NAMES.read().unwrap_or_else(PoisonError::into_inner).complete {
         return;
     }
@@ -5446,7 +5470,7 @@ pub(crate) fn learn_again(alone: Alone) {
             return;
         }
         *busy_at = None;
-        let busy = busy_sqlite(conn);
+        let busy = busy_sqlite(conn, busy_ms);
         if busy.is_none() {
             UNREAD_BESIDE.store(false, Ordering::SeqCst);
         }
@@ -5470,6 +5494,51 @@ pub(crate) fn learn_again(alone: Alone) {
     let _learning = Learning::begin();
     let _reading = alone.share();
     learn_on_learner();
+}
+
+/// How often harbor asks again on its own while the names are not all
+/// known (`learn_while_unknown`), at first and while a SQLite file does not
+/// read, and the longest it waits between asking after listings that
+/// failed.
+const LEARN_EVERY: Duration = Duration::from_secs(1);
+const LEARN_LONGEST: Duration = Duration::from_secs(30);
+
+/// How long harbor's own asking keeps new shares of the gate out while it
+/// waits for the gate alone, before it gives up for the turn.
+const LEARN_PATIENCE: Duration = Duration::from_millis(20);
+
+/// Learn again on harbor's own, until `stop`, each [`LEARN_EVERY`] while
+/// the names are not all known, so they are known again soon after a
+/// SQLite file that did not read reads again, without waiting for a
+/// client's ATTACH, DETACH or `/catalog`. Asked as `learn_again` asks, each
+/// SQLite file without waiting on its lock, once the gate is free for it
+/// within [`LEARN_PATIENCE`]; after a listing that failed, asked half as
+/// often each time, up to [`LEARN_LONGEST`].
+fn learn_while_unknown(stop: Arc<AtomicBool>) {
+    let mut every = LEARN_EVERY;
+    let mut asked = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(100));
+        if names_complete() {
+            every = LEARN_EVERY;
+            continue;
+        }
+        if asked.elapsed() < every {
+            continue;
+        }
+        asked = Instant::now();
+        let Some(alone) = hold_alone(None, Some(LEARN_PATIENCE), || true) else { continue };
+        learn_again_waiting(alone, 0);
+        let busy = LEARNER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|(_, busy_at)| busy_at.is_some_and(|at| at.elapsed() < ASK_AGAIN));
+        every = match names_complete() || busy {
+            true => LEARN_EVERY,
+            false => (every * 2).min(LEARN_LONGEST),
+        };
+    }
 }
 
 /// How long an ATTACH or DETACH that waits while the names are not all
@@ -5559,8 +5628,8 @@ fn learn_on_learner() {
 
 /// An attached SQLite file that does not read for the moment, and why: each
 /// asked as `reads_alone` asks it, on an attachment of its own that waits
-/// [`PROBE_BUSY_MS`] on a lock, under the gate held alone.
-fn busy_sqlite(conn: &mut Connection) -> Option<String> {
+/// `busy_ms` on a lock, under the gate held alone.
+fn busy_sqlite(conn: &mut Connection, busy_ms: u32) -> Option<String> {
     let paths = match conn.query_strings(
         "SELECT path FROM duckdb_databases() WHERE type = 'sqlite' AND path IS NOT NULL AND path NOT IN ('', ':memory:')",
     ) {
@@ -5571,7 +5640,7 @@ fn busy_sqlite(conn: &mut Connection) -> Option<String> {
     paths.iter().find_map(|path| {
         let probe = format!("{PROBE}{}", next_job_id());
         let name = wire::open::quote_ident(&probe);
-        let attach = format!("ATTACH {} AS {name} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {PROBE_BUSY_MS}, HIDDEN)", quote(path));
+        let attach = format!("ATTACH {} AS {name} (TYPE sqlite, READ_ONLY, BUSY_TIMEOUT {busy_ms}, HIDDEN)", quote(path));
         let read = conn.execute_batch(&attach).and_then(|()| {
             let read = conn.query_strings(&format!(
                 "SELECT count(*)::VARCHAR FROM sqlite_query({}, 'SELECT count(*) FROM sqlite_master')",
