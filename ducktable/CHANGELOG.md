@@ -3,6 +3,17 @@
 DuckTable release tags use `ducktable-vX.Y.Z`. Entries are ordered by release
 date, newest first.
 
+## 2.0.2 — 2026-11-09
+
+- **Animations run at the display's full rate on M5 Macs.** DuckTable draws
+  with gpui-kit 0.9.0 and its GPUI snapshot (`gpui-pre` 0.3.11), which
+  carries Zed's fix for base M5 Macs, where every frame was held for about
+  33 ms. The kit's other changes come along: a selected cell has a border
+  of its own, a column resizes from where the drag started, a smooth-scrolling
+  wheel stops at the edge, editor popups paint above dialogs, and Tab and
+  ⇧Tab can leave a focused grid.
+- **Sparkle 2.10.1.** The updater moves to the latest stable release.
+
 ## 2.0.1 — 2026-10-22
 
 - **Detach lets go of a catalog Harbor lists with an error.** Harbor 2.0.1

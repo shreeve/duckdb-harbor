@@ -82,7 +82,7 @@ bundle carries as `SUPublicEDKey`. The tools land in
 `.ducktable-cache/sparkle/<version>/bin` after any `scripts/macos-app.sh` run.
 
 ```sh
-bin=.ducktable-cache/sparkle/2.10.0/bin
+bin=.ducktable-cache/sparkle/2.10.1/bin
 $bin/generate_keys --account ducktable -p                       # prints the public key; it must equal assets/sparkle-public-key.txt
 $bin/generate_keys --account ducktable -x /tmp/ducktable-key    # exports the private key for a backup
 $bin/generate_keys --account ducktable -f /tmp/ducktable-key    # imports it on another Mac
