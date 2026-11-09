@@ -2,7 +2,7 @@
 
 Read this first. It says what the repo is, how its owner works, how the
 pieces fit, how to build, test and release, and what is open. Everything
-here was true on 2026-10-11 at harbor v0.46.0 and DuckTable v0.24.1; the
+here was true on 2026-11-09 at harbor v2.0.2 and DuckTable v2.0.2; the
 changelogs and git history are the record after that.
 
 ## What this is
@@ -517,12 +517,10 @@ and DuckTable 0.23.0 record.
 
 ## Open items
 
-- **Installed:** `live` runs harbor 2.0.0 (upgraded 2026-10-21 with
-  `harbor update --restart`, after a `backup`); this Mac runs 2.0.1, and
-  the local medlabs server keeps the code it started with until it
-  restarts. DuckTable 2.0.1 is released. A login item written before 2.0.1
-  runs at launchd's Background priority until `harbor medlabs autostart
-  restart` rewrites it.
+- **Installed:** `live` and this Mac run harbor 2.0.2 and DuckDB 2.0.0, and
+  a server keeps the code it started with until it restarts. DuckTable 2.0.2
+  is released. A login item written before 2.0.1 runs at launchd's
+  Background priority until `harbor medlabs autostart restart` rewrites it.
 - **Left from the port to DuckDB 2.0.0:** harbor tracks DuckDB's official
   releases. The `engine-alpha42289` release stays as history, and the
   `DUCKDB_LIB_BUILD` repository variable is read by nothing; removing the
