@@ -3462,7 +3462,9 @@ impl GridDelegate {
         // of a column fitted to it, and never resizes one.
         let mark = if self.sortable { 2. * header_advance + 4. } else { 0. };
         let header = name_len as f32 * header_advance + mark;
-        px((content.max(header) + PANE_INSET + 16.).clamp(60. * zoom, 460. * zoom))
+        // Whole pixels: the header row and the body add up fractional widths
+        // differently, which leaves some dividers a device pixel apart.
+        px((content.max(header) + PANE_INSET + 16.).clamp(60. * zoom, 460. * zoom).ceil())
     }
 
     /// Rebuild the display columns from the schema minus the hidden set
